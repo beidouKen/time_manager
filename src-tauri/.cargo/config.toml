@@ -1,0 +1,4 @@
+[build]
+# Project is at an ASCII-only path, so RC.EXE works correctly.
+# Uncomment the line below only if you move this project to a path with non-ASCII characters.
+# target-dir = "C:/rust_target/time_manager"

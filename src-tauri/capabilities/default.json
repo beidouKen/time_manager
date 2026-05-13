@@ -1,0 +1,13 @@
+{
+  "$schema": "https://schemas.tauri.app/v2/schema/capabilities.json",
+  "identifier": "default",
+  "description": "Capability granted to the main application window",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "sql:allow-execute",
+    "sql:allow-select",
+    "sql:allow-load",
+    "sql:allow-close"
+  ]
+}
