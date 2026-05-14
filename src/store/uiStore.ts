@@ -15,7 +15,7 @@ interface UiState {
   editingBlockId: string | null;
 
   // Sidebar
-  activePage: "today" | "settings";
+  activePage: "today" | "chat" | "settings";
 }
 
 interface UiActions {

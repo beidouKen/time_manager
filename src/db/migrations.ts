@@ -53,6 +53,47 @@ const MIGRATIONS: Migration[] = [
       `CREATE INDEX IF NOT EXISTS idx_time_blocks_date ON time_blocks(date(start_time))`,
     ],
   },
+  {
+    version: 3,
+    statements: [
+      `CREATE TABLE IF NOT EXISTS agent_action_logs (
+        id TEXT PRIMARY KEY,
+        user_input TEXT NOT NULL,
+        detected_intent TEXT,
+        tool_name TEXT,
+        tool_args_json TEXT,
+        tool_result_json TEXT,
+        status TEXT NOT NULL DEFAULT 'pending'
+          CHECK(status IN ('pending','executing','success','failed','cancelled')),
+        error_message TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )`,
+      `CREATE TABLE IF NOT EXISTS conversation_messages (
+        id TEXT PRIMARY KEY,
+        role TEXT NOT NULL CHECK(role IN ('user','assistant','system')),
+        content TEXT NOT NULL,
+        metadata_json TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )`,
+      `CREATE INDEX IF NOT EXISTS idx_conversation_messages_created
+        ON conversation_messages(created_at)`,
+      `CREATE TABLE IF NOT EXISTS pending_confirmations (
+        id TEXT PRIMARY KEY,
+        action_type TEXT NOT NULL,
+        tool_name TEXT NOT NULL,
+        tool_args_json TEXT NOT NULL,
+        description TEXT,
+        risk_level TEXT NOT NULL DEFAULT 'medium'
+          CHECK(risk_level IN ('low','medium','high')),
+        status TEXT NOT NULL DEFAULT 'pending'
+          CHECK(status IN ('pending','confirmed','rejected','expired')),
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        expires_at TEXT
+      )`,
+      `CREATE INDEX IF NOT EXISTS idx_pending_confirmations_status
+        ON pending_confirmations(status)`,
+    ],
+  },
 ];
 
 export async function runMigrations(): Promise<void> {
