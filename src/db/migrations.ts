@@ -94,6 +94,52 @@ const MIGRATIONS: Migration[] = [
         ON pending_confirmations(status)`,
     ],
   },
+  {
+    // V2: 重建 time_blocks 表，扩展 status CHECK 约束（新增 'delayed'），
+    // 并新增 8 个执行时间戳字段。SQLite 不支持直接修改 CHECK 约束，使用重建模式。
+    // PRAGMA foreign_keys = OFF/ON 包裹整个重建过程，避免 DROP TABLE 时外键报错。
+    version: 4,
+    statements: [
+      `PRAGMA foreign_keys = OFF`,
+      `CREATE TABLE time_blocks_new (
+        id TEXT PRIMARY KEY,
+        task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+        title TEXT NOT NULL,
+        start_time TEXT NOT NULL,
+        end_time TEXT NOT NULL,
+        type TEXT NOT NULL DEFAULT 'task'
+          CHECK(type IN ('task','event','break','routine')),
+        status TEXT NOT NULL DEFAULT 'scheduled'
+          CHECK(status IN ('scheduled','in_progress','done','skipped','cancelled','delayed')),
+        is_locked INTEGER NOT NULL DEFAULT 0,
+        source TEXT NOT NULL DEFAULT 'manual'
+          CHECK(source IN ('manual','system')),
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        deleted_at TEXT,
+        reminder_sent_at TEXT,
+        start_prompt_sent_at TEXT,
+        end_prompt_sent_at TEXT,
+        started_at TEXT,
+        completed_at TEXT,
+        skipped_at TEXT,
+        delayed_at TEXT,
+        feedback_note TEXT
+      )`,
+      `INSERT INTO time_blocks_new
+        SELECT id, task_id, title, start_time, end_time,
+               type, status, is_locked, source,
+               created_at, updated_at, deleted_at,
+               NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+        FROM time_blocks`,
+      `DROP TABLE time_blocks`,
+      `ALTER TABLE time_blocks_new RENAME TO time_blocks`,
+      `CREATE INDEX idx_time_blocks_task_id ON time_blocks(task_id)`,
+      `CREATE INDEX idx_time_blocks_start ON time_blocks(start_time)`,
+      `CREATE INDEX idx_time_blocks_date ON time_blocks(date(start_time))`,
+      `PRAGMA foreign_keys = ON`,
+    ],
+  },
 ];
 
 export async function runMigrations(): Promise<void> {
@@ -116,7 +162,7 @@ export async function runMigrations(): Promise<void> {
   );
   const currentVersion = rows[0]?.version ?? 0;
 
-  // Apply pending migrations
+  // Apply pending migrations in order
   for (const migration of MIGRATIONS) {
     if (migration.version > currentVersion) {
       for (const stmt of migration.statements) {

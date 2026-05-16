@@ -69,4 +69,20 @@ export class TaskService {
       excludeDeleted: true,
     });
   }
+
+  /**
+   * V2：统计某个 Task 在指定时间点之后还有多少个活跃 TimeBlock。
+   * 用于 HeartbeatService 判断完成/跳过/延迟一个 TimeBlock 后，Task 是否还有后续安排。
+   * "活跃"定义：start_time > afterTime，status 为 scheduled 或 in_progress，未软删除。
+   */
+  async getFutureActiveBlocksCount(taskId: string, afterTime: Date): Promise<number> {
+    const afterTimeStr = afterTime.toISOString();
+    const blocks = await this.blockRepo.findByTaskId(taskId);
+    return blocks.filter(
+      (b) =>
+        !b.deleted_at &&
+        (b.status === "scheduled" || b.status === "in_progress") &&
+        b.start_time > afterTimeStr
+    ).length;
+  }
 }

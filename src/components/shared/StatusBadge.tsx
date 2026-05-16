@@ -23,6 +23,7 @@ const BLOCK_STATUS_CONFIG: Record<TimeBlockStatus, { label: string; className: s
   done: { label: "已完成", className: "bg-green-100 text-green-700" },
   skipped: { label: "已跳过", className: "bg-gray-100 text-gray-500" },
   cancelled: { label: "已取消", className: "bg-red-100 text-red-500" },
+  delayed: { label: "已延迟", className: "bg-orange-100 text-orange-600" },
 };
 
 const BLOCK_TYPE_CONFIG: Record<TimeBlockType, { label: string; dotClass: string }> = {
