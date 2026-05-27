@@ -56,7 +56,13 @@ interface TimeBlockCardProps {
 }
 
 export function TimeBlockCard({ block, dayStart }: TimeBlockCardProps) {
-  const { updateBlockStatus, deleteBlock, moveBackToTask } = useTimeBlockStore();
+  const {
+    deleteBlock,
+    moveBackToTask,
+    completeBlockWithLinkage,
+    skipBlockWithLinkage,
+    delayBlockWithLinkage,
+  } = useTimeBlockStore();
   const { loadTasks } = useTaskStore();
   const { openTimeBlockForm } = useUiStore();
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
@@ -81,7 +87,8 @@ export function TimeBlockCard({ block, dayStart }: TimeBlockCardProps) {
 
   const handleMarkDone = async () => {
     try {
-      await updateBlockStatus(block.id, "done");
+      await completeBlockWithLinkage(block.id);
+      await loadTasks();
       toast.success("已标记完成");
     } catch (e) {
       toast.error(String(e));
@@ -90,7 +97,8 @@ export function TimeBlockCard({ block, dayStart }: TimeBlockCardProps) {
 
   const handleMarkSkipped = async () => {
     try {
-      await updateBlockStatus(block.id, "skipped");
+      await skipBlockWithLinkage(block.id);
+      await loadTasks();
       toast.success("已跳过");
     } catch (e) {
       toast.error(String(e));
@@ -99,7 +107,8 @@ export function TimeBlockCard({ block, dayStart }: TimeBlockCardProps) {
 
   const handleMarkDelayed = async () => {
     try {
-      await updateBlockStatus(block.id, "delayed");
+      await delayBlockWithLinkage(block.id);
+      await loadTasks();
       toast.success("已标记为延迟，可稍后重新安排");
     } catch (e) {
       toast.error(String(e));

@@ -2,14 +2,54 @@ import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
 import { HeartbeatService } from "@/services/HeartbeatService";
 import { TimeBlockService } from "@/services/TimeBlockService";
+import { ActionLogService } from "@/services/ActionLogService";
 import { DEFAULT_HEARTBEAT_SETTINGS } from "@/types/heartbeat.types";
 import type { HeartbeatSettings } from "@/types/heartbeat.types";
 import type { TimeBlock } from "@/types/timeblock.types";
 
+// 模块级单例，避免每次 action 重复 new
 const timeBlockService = new TimeBlockService();
 const heartbeatService = new HeartbeatService();
+const actionLogService = new ActionLogService();
 
-// ─── 状态定义 ─────────────────────────────────────────────────────────────────
+// ─── 日志辅助 ──────────────────────────────────────────────────────────────
+
+/**
+ * 为 Heartbeat UI 触发的操作写入 agent_action_logs。
+ *
+ * detected_intent 使用 heartbeat_* 前缀字符串（不进入 IntentType 枚举），
+ * user_input 使用 "[heartbeat:action] blockTitle" 格式便于日志检索。
+ */
+async function logHeartbeatAction(
+  action: string,
+  block: TimeBlock,
+  success: boolean,
+  errorMsg?: string
+): Promise<void> {
+  try {
+    const intentStr = `heartbeat_${action}`;
+    const userInput = `[heartbeat:${action}] ${block.title}`;
+    const log = await actionLogService.logRequest(userInput, intentStr);
+    await actionLogService.logToolExecution(log.id, intentStr, {
+      blockId: block.id,
+      taskId: block.task_id ?? null,
+    });
+    if (success) {
+      await actionLogService.logSuccess(log.id, {
+        blockId: block.id,
+        action,
+        taskId: block.task_id ?? null,
+      });
+    } else {
+      await actionLogService.logFailure(log.id, errorMsg ?? "操作失败");
+    }
+  } catch (e) {
+    // 日志写入失败不应阻断主流程
+    console.warn("[Heartbeat] 日志写入失败:", e);
+  }
+}
+
+// ─── 状态定义 ─────────────────────────────────────────────────────────────
 
 interface HeartbeatSettingsState extends HeartbeatSettings {}
 
@@ -24,16 +64,11 @@ interface HeartbeatRuntimeState {
 }
 
 interface HeartbeatActions {
-  // 设置
   updateSettings: (patch: Partial<HeartbeatSettings>) => void;
-  // Timer 管理
   startHeartbeat: () => void;
   stopHeartbeat: () => void;
-  // 主检查循环
   tick: () => Promise<void>;
-  // 反馈对话框
   closeFeedbackDialog: () => void;
-  // 执行操作（调用 HeartbeatService，完成后刷新调用方负责 Store 刷新）
   startBlock: (blockId: string) => Promise<void>;
   completeBlock: (blockId: string, feedbackNote?: string) => Promise<void>;
   skipBlock: (blockId: string, feedbackNote?: string) => Promise<void>;
@@ -42,16 +77,15 @@ interface HeartbeatActions {
 
 type HeartbeatState = HeartbeatSettingsState & HeartbeatRuntimeState & HeartbeatActions;
 
-// ─── Store 定义 ───────────────────────────────────────────────────────────────
+// ─── Store 定义 ───────────────────────────────────────────────────────────
 
-// 仅持久化设置字段，运行时状态不存 localStorage
 export const useHeartbeatStore = create<HeartbeatState>()(
   persist(
     (set, get) => ({
       // 设置（持久化）
       ...DEFAULT_HEARTBEAT_SETTINGS,
 
-      // 运行时状态（不持久化，persist partialize 排除）
+      // 运行时状态（不持久化）
       currentFocusBlock: null,
       upcomingReminderBlock: null,
       startPromptBlock: null,
@@ -60,27 +94,21 @@ export const useHeartbeatStore = create<HeartbeatState>()(
       lastTickAt: null,
       _intervalId: null,
 
-      // ─── 设置管理 ──────────────────────────────────────────────────────────
+      // ─── 设置管理 ────────────────────────────────────────────────────────
 
       updateSettings: (patch) => {
         set(patch);
       },
 
-      // ─── Timer 管理 ────────────────────────────────────────────────────────
+      // ─── Timer 管理 ──────────────────────────────────────────────────────
 
       startHeartbeat: () => {
         const { _intervalId, heartbeatIntervalSeconds, tick } = get();
-
-        // 防止重复创建 interval
         if (_intervalId !== null) return;
-
-        // 立即执行一次
         tick();
-
         const id = setInterval(() => {
           tick();
         }, heartbeatIntervalSeconds * 1000);
-
         set({ _intervalId: id });
       },
 
@@ -98,7 +126,7 @@ export const useHeartbeatStore = create<HeartbeatState>()(
         }
       },
 
-      // ─── 主检查循环 ────────────────────────────────────────────────────────
+      // ─── 主检查循环 ──────────────────────────────────────────────────────
 
       tick: async () => {
         const {
@@ -123,7 +151,6 @@ export const useHeartbeatStore = create<HeartbeatState>()(
             autoFeedbackPromptEnabled,
           });
 
-          // 更新运行时状态
           set({
             currentFocusBlock: evaluation.currentFocusBlock,
             upcomingReminderBlock: evaluation.upcomingReminderBlock,
@@ -132,20 +159,16 @@ export const useHeartbeatStore = create<HeartbeatState>()(
             lastTickAt: now.toISOString(),
           });
 
-          // 写入开始前提醒防重复时间戳
           if (evaluation.upcomingReminderBlock) {
             await heartbeatService.markReminderSent(evaluation.upcomingReminderBlock.id);
           }
 
-          // 写入开始提示防重复时间戳
           if (evaluation.startPromptBlock) {
             await heartbeatService.markStartPromptSent(evaluation.startPromptBlock.id);
           }
 
-          // 写入结束反馈防重复时间戳，并弹出对话框
           if (evaluation.pendingFeedbackBlock && autoFeedbackPromptEnabled) {
             await heartbeatService.markEndPromptSent(evaluation.pendingFeedbackBlock.id);
-            // 若对话框已开启则不重复触发
             if (!isFeedbackDialogOpen) {
               set({ isFeedbackDialogOpen: true });
             }
@@ -155,42 +178,101 @@ export const useHeartbeatStore = create<HeartbeatState>()(
         }
       },
 
-      // ─── 反馈对话框 ────────────────────────────────────────────────────────
+      // ─── 反馈对话框 ──────────────────────────────────────────────────────
 
       closeFeedbackDialog: () => {
         set({ isFeedbackDialogOpen: false, pendingFeedbackBlock: null });
       },
 
-      // ─── 执行操作 ──────────────────────────────────────────────────────────
+      // ─── 执行操作（含 ActionLog 记录） ───────────────────────────────────
 
       startBlock: async (blockId) => {
-        await heartbeatService.startBlock(blockId);
-        // 立即触发一次 tick，刷新 Heartbeat 状态
+        // 优先从运行时状态取 block 信息，用于日志记录
+        const block: TimeBlock =
+          get().currentFocusBlock?.id === blockId
+            ? get().currentFocusBlock!
+            : ({ id: blockId, title: blockId, task_id: null } as unknown as TimeBlock);
+
+        let success = true;
+        let errorMsg: string | undefined;
+        try {
+          await heartbeatService.startBlock(blockId);
+        } catch (e) {
+          success = false;
+          errorMsg = String(e);
+          throw e;
+        } finally {
+          await logHeartbeatAction("start_block", block, success, errorMsg);
+        }
         await get().tick();
       },
 
       completeBlock: async (blockId, feedbackNote) => {
-        await heartbeatService.completeBlock(blockId, feedbackNote);
-        set({ isFeedbackDialogOpen: false, pendingFeedbackBlock: null });
+        const block: TimeBlock =
+          (get().currentFocusBlock?.id === blockId ? get().currentFocusBlock : null) ??
+          (get().pendingFeedbackBlock?.id === blockId ? get().pendingFeedbackBlock : null) ??
+          ({ id: blockId, title: blockId, task_id: null } as unknown as TimeBlock);
+
+        let success = true;
+        let errorMsg: string | undefined;
+        try {
+          await heartbeatService.completeBlock(blockId, feedbackNote);
+          set({ isFeedbackDialogOpen: false, pendingFeedbackBlock: null });
+        } catch (e) {
+          success = false;
+          errorMsg = String(e);
+          throw e;
+        } finally {
+          await logHeartbeatAction("complete_block", block, success, errorMsg);
+        }
         await get().tick();
       },
 
       skipBlock: async (blockId, feedbackNote) => {
-        await heartbeatService.skipBlock(blockId, feedbackNote);
-        set({ isFeedbackDialogOpen: false, pendingFeedbackBlock: null });
+        const block: TimeBlock =
+          (get().currentFocusBlock?.id === blockId ? get().currentFocusBlock : null) ??
+          (get().pendingFeedbackBlock?.id === blockId ? get().pendingFeedbackBlock : null) ??
+          ({ id: blockId, title: blockId, task_id: null } as unknown as TimeBlock);
+
+        let success = true;
+        let errorMsg: string | undefined;
+        try {
+          await heartbeatService.skipBlock(blockId, feedbackNote);
+          set({ isFeedbackDialogOpen: false, pendingFeedbackBlock: null });
+        } catch (e) {
+          success = false;
+          errorMsg = String(e);
+          throw e;
+        } finally {
+          await logHeartbeatAction("skip_block", block, success, errorMsg);
+        }
         await get().tick();
       },
 
       delayBlock: async (blockId, feedbackNote) => {
-        await heartbeatService.delayBlock(blockId, feedbackNote);
-        set({ isFeedbackDialogOpen: false, pendingFeedbackBlock: null });
+        const block: TimeBlock =
+          (get().currentFocusBlock?.id === blockId ? get().currentFocusBlock : null) ??
+          (get().pendingFeedbackBlock?.id === blockId ? get().pendingFeedbackBlock : null) ??
+          ({ id: blockId, title: blockId, task_id: null } as unknown as TimeBlock);
+
+        let success = true;
+        let errorMsg: string | undefined;
+        try {
+          await heartbeatService.delayBlock(blockId, feedbackNote);
+          set({ isFeedbackDialogOpen: false, pendingFeedbackBlock: null });
+        } catch (e) {
+          success = false;
+          errorMsg = String(e);
+          throw e;
+        } finally {
+          await logHeartbeatAction("delay_block", block, success, errorMsg);
+        }
         await get().tick();
       },
     }),
     {
       name: "heartbeat-settings",
       storage: createJSONStorage(() => localStorage),
-      // 只持久化设置字段，运行时状态不需要持久化
       partialize: (state) => ({
         heartbeatEnabled: state.heartbeatEnabled,
         reminderBeforeMinutes: state.reminderBeforeMinutes,

@@ -1,8 +1,40 @@
+import Database from "@tauri-apps/plugin-sql";
 import { getDb } from "./client";
 
-interface Migration {
+interface MigrationBase {
   version: number;
+}
+
+interface StatementMigration extends MigrationBase {
   statements: string[];
+  run?: never;
+}
+
+interface FunctionMigration extends MigrationBase {
+  statements?: never;
+  run: (db: Database) => Promise<void>;
+}
+
+type Migration = StatementMigration | FunctionMigration;
+
+async function tableExists(db: Database, table: string): Promise<boolean> {
+  const rows = await db.select<{ cnt: number }[]>(
+    `SELECT COUNT(*) as cnt FROM sqlite_master WHERE type='table' AND name=$1`,
+    [table],
+  );
+  return (rows[0]?.cnt ?? 0) > 0;
+}
+
+async function tableHasColumn(
+  db: Database,
+  table: string,
+  column: string,
+): Promise<boolean> {
+  if (!(await tableExists(db, table))) return false;
+  const cols = await db.select<{ name: string }[]>(
+    `PRAGMA table_info(${table})`,
+  );
+  return cols.some((c) => c.name === column);
 }
 
 const MIGRATIONS: Migration[] = [
@@ -95,13 +127,27 @@ const MIGRATIONS: Migration[] = [
     ],
   },
   {
-    // V2: 重建 time_blocks 表，扩展 status CHECK 约束（新增 'delayed'），
-    // 并新增 8 个执行时间戳字段。SQLite 不支持直接修改 CHECK 约束，使用重建模式。
-    // PRAGMA foreign_keys = OFF/ON 包裹整个重建过程，避免 DROP TABLE 时外键报错。
+    // 重建 time_blocks 表：扩展 status CHECK（新增 'delayed'）+ 8 个执行时间戳字段。
+    // 使用编程式 migration 处理所有部分失败重试场景：
+    //   A. time_blocks 已有新列 → 跳过（清理残留临时表）
+    //   B. time_blocks 不存在但 time_blocks_new 存在 → 直接 RENAME
+    //   C. 两表都存在 → 正常重建流程
+    //   D. 两表都不存在 → 从零创建
     version: 4,
-    statements: [
-      `PRAGMA foreign_keys = OFF`,
-      `CREATE TABLE time_blocks_new (
+    async run(db) {
+      const tbExists = await tableExists(db, "time_blocks");
+      const tbNewExists = await tableExists(db, "time_blocks_new");
+      const alreadyMigrated = tbExists
+        && await tableHasColumn(db, "time_blocks", "delayed_at");
+
+      if (alreadyMigrated) {
+        if (tbNewExists) await db.execute(`DROP TABLE time_blocks_new`);
+        return;
+      }
+
+      await db.execute(`PRAGMA foreign_keys = OFF`);
+
+      const NEW_TABLE_DDL = `CREATE TABLE IF NOT EXISTS time_blocks_new (
         id TEXT PRIMARY KEY,
         task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
         title TEXT NOT NULL,
@@ -125,30 +171,54 @@ const MIGRATIONS: Migration[] = [
         skipped_at TEXT,
         delayed_at TEXT,
         feedback_note TEXT
-      )`,
-      `INSERT INTO time_blocks_new
-        SELECT id, task_id, title, start_time, end_time,
-               type, status, is_locked, source,
-               created_at, updated_at, deleted_at,
-               NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
-        FROM time_blocks`,
-      `DROP TABLE time_blocks`,
-      `ALTER TABLE time_blocks_new RENAME TO time_blocks`,
-      `CREATE INDEX idx_time_blocks_task_id ON time_blocks(task_id)`,
-      `CREATE INDEX idx_time_blocks_start ON time_blocks(start_time)`,
-      `CREATE INDEX idx_time_blocks_date ON time_blocks(date(start_time))`,
-      `PRAGMA foreign_keys = ON`,
-    ],
+      )`;
+
+      if (!tbExists && tbNewExists) {
+        // 部分失败恢复：time_blocks 已 DROP，time_blocks_new 残留 → 直接 RENAME
+        await db.execute(
+          `ALTER TABLE time_blocks_new RENAME TO time_blocks`,
+        );
+      } else if (tbExists) {
+        // 正常重建：time_blocks 存在且 schema 需要更新
+        await db.execute(`DROP TABLE IF EXISTS time_blocks_new`);
+        await db.execute(NEW_TABLE_DDL);
+        await db.execute(`INSERT INTO time_blocks_new
+          SELECT id, task_id, title, start_time, end_time,
+                 type, status, is_locked, source,
+                 created_at, updated_at, deleted_at,
+                 NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+          FROM time_blocks`);
+        await db.execute(`DROP TABLE time_blocks`);
+        await db.execute(
+          `ALTER TABLE time_blocks_new RENAME TO time_blocks`,
+        );
+      } else {
+        // 两表都不存在（极端情况）→ 直接创建最终表
+        await db.execute(NEW_TABLE_DDL.replace(
+          "time_blocks_new",
+          "time_blocks",
+        ));
+      }
+
+      await db.execute(
+        `CREATE INDEX IF NOT EXISTS idx_time_blocks_task_id ON time_blocks(task_id)`,
+      );
+      await db.execute(
+        `CREATE INDEX IF NOT EXISTS idx_time_blocks_start ON time_blocks(start_time)`,
+      );
+      await db.execute(
+        `CREATE INDEX IF NOT EXISTS idx_time_blocks_date ON time_blocks(date(start_time))`,
+      );
+      await db.execute(`PRAGMA foreign_keys = ON`);
+    },
   },
 ];
 
 export async function runMigrations(): Promise<void> {
   const db = await getDb();
 
-  // Enable foreign keys
   await db.execute("PRAGMA foreign_keys = ON");
 
-  // Create schema version tracker
   await db.execute(`
     CREATE TABLE IF NOT EXISTS schema_version (
       version INTEGER PRIMARY KEY,
@@ -156,21 +226,23 @@ export async function runMigrations(): Promise<void> {
     )
   `);
 
-  // Get current version
-  const rows = await db.select<{ version: number | null }[]>(
-    "SELECT MAX(version) as version FROM schema_version"
+  const rows = await db.select<{ version: number }[]>(
+    "SELECT COALESCE(MAX(version), 0) as version FROM schema_version",
   );
-  const currentVersion = rows[0]?.version ?? 0;
+  const currentVersion = Number(rows[0]?.version) || 0;
 
-  // Apply pending migrations in order
   for (const migration of MIGRATIONS) {
     if (migration.version > currentVersion) {
-      for (const stmt of migration.statements) {
-        await db.execute(stmt);
+      if (migration.run) {
+        await migration.run(db);
+      } else {
+        for (const stmt of migration.statements) {
+          await db.execute(stmt);
+        }
       }
       await db.execute(
-        "INSERT INTO schema_version (version) VALUES ($1)",
-        [migration.version]
+        "INSERT OR IGNORE INTO schema_version (version) VALUES ($1)",
+        [migration.version],
       );
     }
   }

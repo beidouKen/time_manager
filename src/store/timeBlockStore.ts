@@ -1,11 +1,46 @@
 import { create } from "zustand";
 import { TimeBlockService } from "@/services/TimeBlockService";
 import { ScheduleService } from "@/services/ScheduleService";
+import { HeartbeatService } from "@/services/HeartbeatService";
+import { ActionLogService } from "@/services/ActionLogService";
 import type { TimeBlock, CreateTimeBlockInput, UpdateTimeBlockInput } from "@/types/timeblock.types";
 import { startOfDay } from "date-fns";
 
+// 模块级单例，避免每次 render 重复 new
 const timeBlockService = new TimeBlockService();
 const scheduleService = new ScheduleService();
+const heartbeatService = new HeartbeatService();
+const actionLogService = new ActionLogService();
+
+// ─── 日志辅助（TimeBlock 菜单操作） ──────────────────────────────────────────
+
+async function logTimelineAction(
+  action: string,
+  block: TimeBlock,
+  success: boolean,
+  errorMsg?: string
+): Promise<void> {
+  try {
+    const intentStr = `timeline_${action}`;
+    const userInput = `[timeline:${action}] ${block.title}`;
+    const log = await actionLogService.logRequest(userInput, intentStr);
+    await actionLogService.logToolExecution(log.id, intentStr, {
+      blockId: block.id,
+      taskId: block.task_id ?? null,
+    });
+    if (success) {
+      await actionLogService.logSuccess(log.id, {
+        blockId: block.id,
+        action,
+        taskId: block.task_id ?? null,
+      });
+    } else {
+      await actionLogService.logFailure(log.id, errorMsg ?? "操作失败");
+    }
+  } catch (e) {
+    console.warn("[Timeline] 日志写入失败:", e);
+  }
+}
 
 interface TimeBlockState {
   blocks: TimeBlock[];
@@ -24,6 +59,14 @@ interface TimeBlockActions {
   moveBackToTask: (blockId: string) => Promise<{ taskId: string; taskStatusUpdatedTo: string }>;
   refreshBlocks: () => Promise<void>;
   clearError: () => void;
+  /**
+   * V2.5：从 TimeBlockCard 菜单触发的联动操作。
+   * 通过 HeartbeatService 执行状态转换 + Task 状态联动，并写入 ActionLog。
+   * 这三个方法与 Heartbeat UI 路径行为完全一致。
+   */
+  completeBlockWithLinkage: (blockId: string) => Promise<void>;
+  skipBlockWithLinkage: (blockId: string) => Promise<void>;
+  delayBlockWithLinkage: (blockId: string) => Promise<void>;
 }
 
 export const useTimeBlockStore = create<TimeBlockState & TimeBlockActions>(
@@ -93,5 +136,85 @@ export const useTimeBlockStore = create<TimeBlockState & TimeBlockActions>(
     },
 
     clearError: () => set({ error: null }),
+
+    // ─── V2.5 联动操作（Task 联动 + ActionLog） ──────────────────────────────
+
+    completeBlockWithLinkage: async (blockId) => {
+      set({ error: null });
+      const block = get().blocks.find((b) => b.id === blockId);
+      if (!block) {
+        set({ error: "时间块不存在" });
+        return;
+      }
+      let success = true;
+      let errorMsg: string | undefined;
+      try {
+        await heartbeatService.completeBlock(blockId);
+        set((s) => ({
+          blocks: s.blocks.map((b) =>
+            b.id === blockId ? { ...b, status: "done" as const } : b
+          ),
+        }));
+      } catch (e) {
+        success = false;
+        errorMsg = String(e);
+        set({ error: errorMsg });
+        throw e;
+      } finally {
+        await logTimelineAction("complete_block", block, success, errorMsg);
+      }
+    },
+
+    skipBlockWithLinkage: async (blockId) => {
+      set({ error: null });
+      const block = get().blocks.find((b) => b.id === blockId);
+      if (!block) {
+        set({ error: "时间块不存在" });
+        return;
+      }
+      let success = true;
+      let errorMsg: string | undefined;
+      try {
+        await heartbeatService.skipBlock(blockId);
+        set((s) => ({
+          blocks: s.blocks.map((b) =>
+            b.id === blockId ? { ...b, status: "skipped" as const } : b
+          ),
+        }));
+      } catch (e) {
+        success = false;
+        errorMsg = String(e);
+        set({ error: errorMsg });
+        throw e;
+      } finally {
+        await logTimelineAction("skip_block", block, success, errorMsg);
+      }
+    },
+
+    delayBlockWithLinkage: async (blockId) => {
+      set({ error: null });
+      const block = get().blocks.find((b) => b.id === blockId);
+      if (!block) {
+        set({ error: "时间块不存在" });
+        return;
+      }
+      let success = true;
+      let errorMsg: string | undefined;
+      try {
+        await heartbeatService.delayBlock(blockId);
+        set((s) => ({
+          blocks: s.blocks.map((b) =>
+            b.id === blockId ? { ...b, status: "delayed" as const } : b
+          ),
+        }));
+      } catch (e) {
+        success = false;
+        errorMsg = String(e);
+        set({ error: errorMsg });
+        throw e;
+      } finally {
+        await logTimelineAction("delay_block", block, success, errorMsg);
+      }
+    },
   })
 );

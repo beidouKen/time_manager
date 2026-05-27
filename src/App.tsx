@@ -6,11 +6,11 @@ type DbState = "loading" | "ready" | "error";
 
 export default function App() {
   const [dbState, setDbState] = useState<DbState>("loading");
-  const [dbError, setDbError] = useState<string | null>(null);
+  const [dbError, setDbError] = useState<string | null>(null); //两种类型，一种没错无输出，另一种直接输出错误
 
   useEffect(() => {
     runMigrations()
-      .then(() => setDbState("ready"))
+      .then(() => setDbState("ready")) //成功条件是runMigration()函数必须返回的Promise必须是 “成功解决”
       .catch((e) => {
         console.error("Database migration failed:", e);
         setDbError(String(e));
