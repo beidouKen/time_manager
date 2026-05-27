@@ -8,15 +8,22 @@ import type {
   AgentActionPlan,
   AgentCommand,
   AgentToolResult,
+  AgentTrace,
   ChatMessageMetadata,
   IntentType,
   ParsedIntent,
+  PlanOption,
+  PlanProposal,
   RiskLevel,
 } from "@/agent/types";
 import { CONFIRMATION_POLICY, toLegacyRiskLevel } from "@/agent/types";
+import type { FreeSlot } from "@/agent/tools/schedule/getFreeSlotsTool";
+import { formatTime } from "@/lib/dateUtils";
+import type { TimeBlock } from "@/types/timeblock.types";
 import { ActionLogService } from "@/services/ActionLogService";
 import { ConfirmationService } from "@/services/ConfirmationService";
 import { TaskService } from "@/services/TaskService";
+import { TimeBlockService } from "@/services/TimeBlockService";
 
 import { CreateTaskTool } from "@/agent/tools/task/createTaskTool";
 import { UpdateTaskTool } from "@/agent/tools/task/updateTaskTool";
@@ -47,6 +54,40 @@ export interface AgentResponse {
   actionLogId?: string;
   /** V2.5：完整 metadata，供 chatStore 写入 conversation_messages.metadata_json */
   metadata?: ChatMessageMetadata;
+}
+
+interface PlanConflictInfo {
+  toolName: string;
+  start_time: string;
+  end_time: string;
+  excludeId?: string;
+  message: string;
+  conflictingBlocks?: Array<{
+    id: string;
+    title: string;
+    start_time: string;
+    end_time: string;
+  }>;
+}
+
+interface ExecutePlanOptionResult {
+  success: boolean;
+  message: string;
+  actionLogIds?: string[];
+  metadata?: ChatMessageMetadata;
+  conflictInfo?: PlanConflictInfo;
+}
+
+interface PlanPrecheckResult {
+  ok: boolean;
+  message?: string;
+  conflictInfo?: PlanConflictInfo;
+}
+
+interface SinglePlanAction {
+  toolName: string;
+  params: Record<string, unknown>;
+  summary?: string;
 }
 
 // ─── Intent → Tool 映射表（snake_case，与 IntentType 和 Tool.name 三处一致） ──
@@ -86,6 +127,7 @@ export class AgentService {
   private logService: ActionLogService;
   private confirmService: ConfirmationService;
   private taskService: TaskService;
+  private timeBlockService: TimeBlockService;
 
   // V3：LLM 相关组件
   private llmPlanner: LLMPlanner;
@@ -100,6 +142,7 @@ export class AgentService {
     this.logService = new ActionLogService();
     this.confirmService = new ConfirmationService();
     this.taskService = new TaskService();
+    this.timeBlockService = new TimeBlockService();
 
     // V3：初始化 LLM 组件（通过 LLMClient 接口隔离，不直接依赖 fetch）
     const llmClient = new DeepSeekClient();
@@ -129,58 +172,54 @@ export class AgentService {
     this.router.register(new ExplainScheduleTool());
   }
 
-  // ─── 主入口：处理用户输入（V3 扩展版） ─────────────────────────────────────
+  // ─── 主入口：处理用户输入（V3.5 LLM-first，无 fallback） ───────────────────
 
   async processInput(
     userInput: string,
     context?: ProcessInputContext
   ): Promise<AgentResponse> {
-    // Step 1：检查 LLM Agent 是否可用
     const llmEnabled =
       (import.meta.env.VITE_LLM_AGENT_ENABLED as string | undefined) === "true";
     const apiKey = (import.meta.env.VITE_DEEPSEEK_API_KEY as string | undefined) ?? "";
 
-    if (llmEnabled) {
-      // Step 2：API key 缺失时提示用户，但仍可 fallback
-      if (!apiKey) {
-        // 记录日志
-        const log = await this.logService.logRequest(userInput, "unknown");
-        await this.logService.logFailure(log.id, "API key 未配置");
-
-        // 提示用户，同时 fallback 到规则解析继续处理
-        const ruleResponse = await this.processWithRules(userInput);
-        if (ruleResponse.metadata) {
-          ruleResponse.metadata.llmResponseType = undefined;
-        }
-        // 在消息前加入 API key 缺失提示
-        ruleResponse.message =
-          "⚠️ 尚未配置 DeepSeek API Key（请在 .env 文件中设置 VITE_DEEPSEEK_API_KEY），已使用规则解析。\n\n" +
-          ruleResponse.message;
-        return ruleResponse;
-      }
-
-      // Step 3：尝试 LLM 路径
-      try {
-        const llmResult = await this.processWithLLM(userInput, context);
-        if (llmResult !== null) {
-          return llmResult;
-        }
-        // llmResult=null 表示需要 fallback
-      } catch (e) {
-        console.warn("[AgentService] LLM 路径异常，fallback 到规则解析：", e);
-      }
+    // LLM 未启用：返回配置错误，不走规则链路
+    if (!llmEnabled) {
+      const log = await this.logService.logRequest(userInput, "unknown");
+      await this.logService.logFailure(log.id, "LLM Agent 未启用");
+      const trace: AgentTrace = { planner: "llm", mode: "error", errorKind: "disabled" };
+      return {
+        message:
+          "⚠️ LLM Agent 未启用。请在 .env 文件中设置 VITE_LLM_AGENT_ENABLED=true 后重启服务。",
+        intent: { intent: "unknown", confidence: 0, args: {}, rawInput: userInput },
+        actionLogId: log.id,
+        metadata: { intent: "unknown", actionLogId: log.id, resultType: "failure", source: "llm", agentTrace: trace },
+      };
     }
 
-    // Step 4：规则 IntentParser（fallback 或 LLM 未启用）
-    return this.processWithRules(userInput);
+    // API Key 未配置：返回配置错误，不走规则链路
+    if (!apiKey) {
+      const log = await this.logService.logRequest(userInput, "unknown");
+      await this.logService.logFailure(log.id, "API Key 未配置");
+      const trace: AgentTrace = { planner: "llm", mode: "error", errorKind: "api_key_missing" };
+      return {
+        message:
+          "⚠️ 尚未配置 DeepSeek API Key。请在 .env 文件中设置 VITE_DEEPSEEK_API_KEY 后重启服务。",
+        intent: { intent: "unknown", confidence: 0, args: {}, rawInput: userInput },
+        actionLogId: log.id,
+        metadata: { intent: "unknown", actionLogId: log.id, resultType: "failure", source: "llm", agentTrace: trace },
+      };
+    }
+
+    // LLM 路径：直接返回，不捕获异常降级到规则链路
+    return this.processWithLLM(userInput, context);
   }
 
-  // ─── LLM 路径 ────────────────────────────────────────────────────────────
+  // ─── LLM 路径（V3.5：不再返回 null，所有结果写入 AgentTrace） ─────────────
 
   private async processWithLLM(
     userInput: string,
     context?: ProcessInputContext
-  ): Promise<AgentResponse | null> {
+  ): Promise<AgentResponse> {
     // 构造上下文
     const llmContext = await this.contextBuilder.build(
       context?.recentMessages ?? [],
@@ -188,68 +227,74 @@ export class AgentService {
       this.lastOperatedTimeBlockId
     );
 
-    // 调用 LLMPlanner
+    // 调用 LLMPlanner（内部已处理所有异常，不会抛出）
     const planResult = await this.llmPlanner.plan(userInput, llmContext);
     const modelName = planResult.modelName;
 
     switch (planResult.type) {
       case "api_key_missing": {
         const log = await this.logService.logRequest(userInput, "unknown");
-        await this.logService.logFailure(log.id, planResult.errorMessage ?? "API key 缺失");
+        await this.logService.logFailure(log.id, planResult.errorMessage ?? "API Key 缺失");
+        const trace: AgentTrace = { planner: "llm", mode: "error", model: modelName, errorKind: "api_key_missing" };
         return {
-          message:
-            "⚠️ 尚未配置 DeepSeek API Key，请在 .env 文件中设置 VITE_DEEPSEEK_API_KEY。",
+          message: "⚠️ DeepSeek API Key 未配置，请在 .env 中设置 VITE_DEEPSEEK_API_KEY。",
           intent: { intent: "unknown", confidence: 0, args: {}, rawInput: userInput },
           actionLogId: log.id,
-          metadata: {
-            intent: "unknown",
-            actionLogId: log.id,
-            resultType: "failure",
-            source: "llm",
-            llmModel: modelName,
-          },
+          metadata: { intent: "unknown", actionLogId: log.id, resultType: "failure", source: "llm", llmModel: modelName, agentTrace: trace },
         };
       }
 
       case "network_error": {
-        // 网络错误：提示用户，fallback 到规则解析
-        console.warn("[AgentService] LLM 网络错误，fallback：", planResult.errorMessage);
-        const ruleResponse = await this.processWithRules(userInput);
-        if (ruleResponse.metadata) {
-          ruleResponse.metadata.llmModel = modelName;
-        }
-        ruleResponse.message =
-          "⚠️ 网络请求失败，已切换为规则解析。\n\n" + ruleResponse.message;
-        return ruleResponse;
+        console.warn("[AgentService] LLM 网络错误：", planResult.errorMessage);
+        const log = await this.logService.logRequest(userInput, "unknown");
+        await this.logService.logFailure(log.id, planResult.errorMessage ?? "网络错误");
+        const trace: AgentTrace = { planner: "llm", mode: "error", model: modelName, errorKind: "network_error" };
+        return {
+          message: `⚠️ LLM 网络请求失败，请检查网络连接后重试。${planResult.errorMessage ? `\n详情：${planResult.errorMessage}` : ""}`,
+          intent: { intent: "unknown", confidence: 0, args: {}, rawInput: userInput },
+          actionLogId: log.id,
+          metadata: { intent: "unknown", actionLogId: log.id, resultType: "failure", source: "llm", llmModel: modelName, agentTrace: trace },
+        };
       }
 
-      case "parse_error":
+      case "parse_error": {
+        console.warn("[AgentService] LLM 输出解析失败：", planResult.errorMessage);
+        const log = await this.logService.logRequest(userInput, "unknown");
+        await this.logService.logFailure(log.id, planResult.errorMessage ?? "解析失败");
+        const trace: AgentTrace = { planner: "llm", mode: "error", model: modelName, errorKind: "parse_error" };
+        return {
+          message: `⚠️ 模型返回格式错误，无法解析响应。请稍后重试。${planResult.errorMessage ? `\n详情：${planResult.errorMessage}` : ""}`,
+          intent: { intent: "unknown", confidence: 0, args: {}, rawInput: userInput },
+          actionLogId: log.id,
+          metadata: { intent: "unknown", actionLogId: log.id, resultType: "failure", source: "llm", llmModel: modelName, agentTrace: trace },
+        };
+      }
+
       case "fallback": {
-        // 解析失败或其他可 fallback 的错误：返回 null 触发规则解析
-        console.warn(
-          `[AgentService] LLM ${planResult.type}，fallback：`,
-          planResult.errorMessage
-        );
-        return null;
+        console.warn("[AgentService] LLM fallback：", planResult.errorMessage);
+        const log = await this.logService.logRequest(userInput, "unknown");
+        await this.logService.logFailure(log.id, planResult.errorMessage ?? "fallback");
+        const trace: AgentTrace = { planner: "llm", mode: "error", model: modelName, errorKind: "fallback" };
+        return {
+          message: `⚠️ LLM 处理失败。${planResult.errorMessage ? `\n详情：${planResult.errorMessage}` : ""}`,
+          intent: { intent: "unknown", confidence: 0, args: {}, rawInput: userInput },
+          actionLogId: log.id,
+          metadata: { intent: "unknown", actionLogId: log.id, resultType: "failure", source: "llm", llmModel: modelName, agentTrace: trace },
+        };
       }
 
       case "clarification": {
         const log = await this.logService.logRequest(userInput, "unknown");
         await this.logService.logFailure(log.id, "LLM 追问：信息不足");
-        const question =
-          planResult.clarifyingQuestion ?? "请提供更多信息以便我理解你的需求。";
+        const question = planResult.clarifyingQuestion ?? "请提供更多信息以便我理解你的需求。";
+        const trace: AgentTrace = { planner: "llm", mode: "clarification", model: modelName };
         return {
           message: question,
           intent: { intent: "unknown", confidence: 0, args: {}, rawInput: userInput },
           actionLogId: log.id,
           metadata: {
-            intent: "unknown",
-            actionLogId: log.id,
-            resultType: "failure",
-            source: "llm",
-            llmModel: modelName,
-            confidence: planResult.confidence,
-            llmResponseType: "clarification",
+            intent: "unknown", actionLogId: log.id, resultType: "failure", source: "llm",
+            llmModel: modelName, confidence: planResult.confidence, llmResponseType: "clarification", agentTrace: trace,
           },
         };
       }
@@ -257,18 +302,14 @@ export class AgentService {
       case "chitchat": {
         const log = await this.logService.logRequest(userInput, "unknown");
         await this.logService.logFailure(log.id, "LLM 闲聊响应");
+        const trace: AgentTrace = { planner: "llm", mode: "chitchat", model: modelName };
         return {
           message: planResult.replyMessage ?? "好的。",
           intent: { intent: "unknown", confidence: 0, args: {}, rawInput: userInput },
           actionLogId: log.id,
           metadata: {
-            intent: "unknown",
-            actionLogId: log.id,
-            resultType: "failure",
-            source: "llm",
-            llmModel: modelName,
-            confidence: planResult.confidence,
-            llmResponseType: "chitchat",
+            intent: "unknown", actionLogId: log.id, resultType: "failure", source: "llm",
+            llmModel: modelName, confidence: planResult.confidence, llmResponseType: "chitchat", agentTrace: trace,
           },
         };
       }
@@ -276,26 +317,20 @@ export class AgentService {
       case "unsupported": {
         const log = await this.logService.logRequest(userInput, "unknown");
         await this.logService.logFailure(log.id, "LLM 判断：超出能力范围");
+        const trace: AgentTrace = { planner: "llm", mode: "unsupported", model: modelName };
         return {
-          message:
-            planResult.replyMessage ??
-            "抱歉，该功能超出了 Time Manager 当前的能力范围，无法执行。",
+          message: planResult.replyMessage ?? "抱歉，该功能超出了 Time Manager 当前的能力范围，无法执行。",
           intent: { intent: "unknown", confidence: 0, args: {}, rawInput: userInput },
           actionLogId: log.id,
           metadata: {
-            intent: "unknown",
-            actionLogId: log.id,
-            resultType: "failure",
-            source: "llm",
-            llmModel: modelName,
-            confidence: planResult.confidence,
-            llmResponseType: "unsupported",
+            intent: "unknown", actionLogId: log.id, resultType: "failure", source: "llm",
+            llmModel: modelName, confidence: planResult.confidence, llmResponseType: "unsupported", agentTrace: trace,
           },
         };
       }
 
       case "tool_plan": {
-        // LLM 生成了工具计划，交给通用执行流程
+        const trace: AgentTrace = { planner: "llm", mode: "tool_plan", model: modelName, toolName: planResult.toolName };
         return this.executeToolPlan(
           userInput,
           planResult.intent!,
@@ -309,18 +344,34 @@ export class AgentService {
             llmModel: modelName,
             confidence: planResult.confidence,
             llmResponseType: "tool_plan",
+            agentTrace: trace,
           }
         );
       }
 
-      default:
-        return null;
+      default: {
+        // 防御性分支，理论上不可达
+        const log = await this.logService.logRequest(userInput, "unknown");
+        await this.logService.logFailure(log.id, "LLM 未知响应类型");
+        const trace: AgentTrace = { planner: "llm", mode: "error", model: modelName, errorKind: "fallback" };
+        return {
+          message: "⚠️ LLM 返回了未知的响应类型，请稍后重试。",
+          intent: { intent: "unknown", confidence: 0, args: {}, rawInput: userInput },
+          actionLogId: log.id,
+          metadata: { intent: "unknown", actionLogId: log.id, resultType: "failure", source: "llm", llmModel: modelName, agentTrace: trace },
+        };
+      }
     }
   }
 
-  // ─── 规则路径（原有逻辑保持不变） ──────────────────────────────────────────
+  // ─── 规则路径（已弃用，仅保留供 dev-only 调试；V3.5 Chat 主链路不再调用） ──
 
-  private async processWithRules(userInput: string): Promise<AgentResponse> {
+  /**
+   * @deprecated V3.5 后 Chat 主链路不再调用此方法。
+   * 保留供开发调试使用，未来可删除或仅在 dev 模式下暴露。
+   * 标记为 protected 而非 private，以避免 noUnusedLocals 编译错误。
+   */
+  protected async processWithRules(userInput: string): Promise<AgentResponse> {
     // Step 1：解析意图
     const parsed = this.parser.parse(userInput);
 
@@ -749,6 +800,362 @@ export class AgentService {
         return "重新排列今天的计划（未完成的时间块将被重新安排）";
       default:
         return intent.intent;
+    }
+  }
+
+  // ─── V3.5-B：Delay / Feedback 重排方案提议 ────────────────────────────────
+
+  /**
+   * 为已延迟的 TimeBlock 查找今日空闲时段，构造重排方案。
+   * 用于 DelayChoiceDialog「今天做」路径。
+   */
+  async proposeReschedule(block: TimeBlock): Promise<PlanProposal> {
+    const today = new Date().toISOString().split("T")[0];
+    const durationMs =
+      new Date(block.end_time).getTime() - new Date(block.start_time).getTime();
+
+    const slotsResult = await this.router.execute("get_free_slots", {
+      date: today,
+      minDurationMinutes: 30,
+    });
+
+    const rawSlots = (slotsResult.data as FreeSlot[] | undefined) ?? [];
+    if (rawSlots.length === 0) {
+      return {
+        mode: "propose",
+        options: [],
+        question: "今天暂无空闲时段，建议选择「之后做」。",
+      };
+    }
+
+    const options: PlanOption[] = rawSlots.slice(0, 5).map((slot) => {
+      const slotStart = new Date(slot.start);
+      const slotEnd = new Date(
+        Math.min(slotStart.getTime() + durationMs, new Date(slot.end).getTime())
+      );
+      return {
+        label: `${formatTime(slotStart)} – ${formatTime(slotEnd)}（${Math.round(
+          (slotEnd.getTime() - slotStart.getTime()) / 60000
+        )} 分钟）`,
+        toolName: "update_time_block",
+        params: {
+          timeBlockId: block.id,
+          start_time: slotStart.toISOString(),
+          end_time: slotEnd.toISOString(),
+        },
+        summary: `将「${block.title}」重新安排到 ${formatTime(slotStart)}`,
+      };
+    });
+
+    return { mode: "propose", options, question: "选择今天的新时段：" };
+  }
+
+  /**
+   * 为结束反馈构造操作方案。
+   * - mode="extend"：提议延长当前时间块（30 / 60 / 90 分钟）
+   * - mode="split"：提议创建剩余任务
+   */
+  async proposeEndFeedback(
+    block: TimeBlock,
+    mode: "extend" | "split"
+  ): Promise<PlanProposal> {
+    if (mode === "extend") {
+      const options: PlanOption[] = [30, 60, 90].map((ext) => {
+        const newEnd = new Date(
+          new Date(block.end_time).getTime() + ext * 60000
+        );
+        return {
+          label: `延长 ${ext} 分钟（到 ${formatTime(newEnd)}）`,
+          toolName: "update_time_block",
+          params: { timeBlockId: block.id, end_time: newEnd.toISOString() },
+          summary: `将「${block.title}」延长 ${ext} 分钟至 ${formatTime(newEnd)}`,
+        };
+      });
+      return { mode: "propose", options, question: "选择延长时间：" };
+    }
+
+    // split: 创建剩余任务
+    return {
+      mode: "propose",
+      options: [
+        {
+          label: `创建「${block.title}（剩余）」任务`,
+          toolName: "create_task",
+          params: { title: `${block.title}（剩余）`, priority: "medium" },
+          summary: `创建「${block.title}（剩余）」任务`,
+        },
+      ],
+      question: "将剩余工作保存为新任务：",
+    };
+  }
+
+  /**
+   * 执行用户从 PlanProposal 中选择的方案选项。
+   * update_time_block 操作前先检测时间冲突。
+   */
+  async executePlanOption(option: PlanOption): Promise<ExecutePlanOptionResult> {
+    // 写操作：先检冲突
+    const actionLogIds: string[] = [];
+    const confirmedLogId = await this.logProposalEvent("proposal_confirmed", option);
+    if (confirmedLogId) actionLogIds.push(confirmedLogId);
+
+    const normalized = this.normalizePlanOption(option);
+    if (!normalized.ok) {
+      const result = { success: false, message: normalized.message };
+      const failedLogId = await this.logProposalEvent(
+        "proposal_action_failed",
+        option,
+        result
+      );
+      if (failedLogId) actionLogIds.push(failedLogId);
+      return { ...result, actionLogIds };
+    }
+
+    const actionOption = normalized.option;
+    const precheck = await this.precheckPlanAction(actionOption);
+    if (!precheck.ok) {
+      const result = {
+        success: false,
+        message: precheck.message ?? "Plan option precheck failed",
+      };
+      const eventName = precheck.conflictInfo
+        ? "proposal_conflict_blocked"
+        : "proposal_action_failed";
+      const blockedLogId = await this.logProposalEvent(
+        eventName,
+        actionOption,
+        result,
+        precheck.conflictInfo
+      );
+      if (blockedLogId) actionLogIds.push(blockedLogId);
+      return { ...result, actionLogIds, conflictInfo: precheck.conflictInfo };
+    }
+
+    const result = await this.router.execute(actionOption.toolName, actionOption.params);
+    const eventName = result.success
+      ? "proposal_action_executed"
+      : "proposal_action_failed";
+    const actionLogId = await this.logProposalEvent(eventName, actionOption, result);
+    if (actionLogId) actionLogIds.push(actionLogId);
+
+    if (result.success) {
+      this.trackLastEntities(actionOption.toolName, result);
+    }
+
+    return {
+      success: result.success,
+      message: result.message,
+      actionLogIds,
+      metadata: {
+        toolName: actionOption.toolName,
+        relatedTaskId: result.relatedTaskId,
+        relatedTimeBlockId: result.relatedTimeBlockId,
+        resultType: result.success ? "success" : "failure",
+        source: "system",
+      },
+    };
+  }
+
+  private normalizePlanOption(
+    option: PlanOption
+  ): { ok: true; option: PlanOption } | { ok: false; message: string } {
+    const maybeActions = (option as PlanOption & { actions?: SinglePlanAction[] }).actions;
+    if (!Array.isArray(maybeActions) || maybeActions.length === 0) {
+      return { ok: true, option };
+    }
+
+    if (maybeActions.length > 1) {
+      return {
+        ok: false,
+        message:
+          "该方案包含多个写操作，当前版本暂不支持自动执行，请拆分或手动确认。",
+      };
+    }
+
+    const [action] = maybeActions;
+    return {
+      ok: true,
+      option: {
+        ...option,
+        toolName: action.toolName,
+        params: action.params,
+        summary: action.summary ?? option.summary,
+      },
+    };
+  }
+
+  private async precheckPlanAction(option: PlanOption): Promise<PlanPrecheckResult> {
+    switch (option.toolName) {
+      case "create_time_block":
+      case "schedule_task":
+      case "bind_task_to_time_block":
+        return this.precheckTimeRangeAction(option, undefined);
+      case "update_time_block":
+        return this.precheckUpdateTimeBlockAction(option);
+      default:
+        return { ok: true };
+    }
+  }
+
+  private async precheckTimeRangeAction(
+    option: PlanOption,
+    excludeId: string | undefined
+  ): Promise<PlanPrecheckResult> {
+    const startTime = option.params.start_time as string | undefined;
+    const endTime = option.params.end_time as string | undefined;
+
+    if (!startTime || !endTime) {
+      return {
+        ok: false,
+        message: "缺少完整的开始时间和结束时间，已阻止执行。",
+      };
+    }
+
+    return this.detectPlanConflict(option.toolName, startTime, endTime, excludeId);
+  }
+
+  private async precheckUpdateTimeBlockAction(
+    option: PlanOption
+  ): Promise<PlanPrecheckResult> {
+    const params = option.params;
+    const startParam = params.start_time as string | undefined;
+    const endParam = params.end_time as string | undefined;
+
+    if (!startParam && !endParam) return { ok: true };
+
+    const timeBlockId = (params.timeBlockId ?? params.blockId) as string | undefined;
+    if (!timeBlockId) {
+      return { ok: false, message: "缺少时间块 ID，已阻止执行。" };
+    }
+
+    const existing = await this.timeBlockService.getBlockById(timeBlockId);
+    if (!existing) {
+      return { ok: false, message: "时间块不存在，已阻止执行。" };
+    }
+
+    const startTime = startParam ?? existing.start_time;
+    let endTime = endParam ?? existing.end_time;
+
+    if (startParam && !endParam) {
+      const durationMs =
+        new Date(existing.end_time).getTime() -
+        new Date(existing.start_time).getTime();
+      if (!Number.isFinite(durationMs) || durationMs <= 0) {
+        return {
+          ok: false,
+          message: "无法根据原时间块推导结束时间，已阻止执行。",
+        };
+      }
+      endTime = new Date(new Date(startParam).getTime() + durationMs).toISOString();
+    }
+
+    return this.detectPlanConflict(option.toolName, startTime, endTime, timeBlockId);
+  }
+
+  private async detectPlanConflict(
+    toolName: string,
+    startTime: string,
+    endTime: string,
+    excludeId: string | undefined
+  ): Promise<PlanPrecheckResult> {
+    const start = new Date(startTime);
+    const end = new Date(endTime);
+    if (
+      Number.isNaN(start.getTime()) ||
+      Number.isNaN(end.getTime()) ||
+      end <= start
+    ) {
+      return {
+        ok: false,
+        message: "时间区间无效，已阻止执行。",
+      };
+    }
+
+    const conflictResult = await this.router.execute("detect_conflicts", {
+      start_time: startTime,
+      end_time: endTime,
+      excludeId,
+    });
+
+    if (!conflictResult.success) {
+      return {
+        ok: false,
+        message: conflictResult.message,
+      };
+    }
+
+    const data = conflictResult.data as
+      | { hasConflict: boolean; conflictingBlocks?: TimeBlock[] }
+      | undefined;
+
+    if (!data?.hasConflict) return { ok: true };
+
+    const conflictInfo: PlanConflictInfo = {
+      toolName,
+      start_time: startTime,
+      end_time: endTime,
+      excludeId,
+      message: conflictResult.message,
+      conflictingBlocks: data.conflictingBlocks?.map((block) => ({
+        id: block.id,
+        title: block.title,
+        start_time: block.start_time,
+        end_time: block.end_time,
+      })),
+    };
+
+    return {
+      ok: false,
+      message: conflictResult.message,
+      conflictInfo,
+    };
+  }
+
+  private async logProposalEvent(
+    eventName:
+      | "proposal_confirmed"
+      | "proposal_action_executed"
+      | "proposal_action_failed"
+      | "proposal_conflict_blocked",
+    option: PlanOption,
+    result?: unknown,
+    conflictInfo?: PlanConflictInfo
+  ): Promise<string | undefined> {
+    const timestamp = new Date().toISOString();
+    const optionId = option.id ?? option.label ?? option.summary;
+    const optionTitle = option.title ?? option.label ?? option.summary;
+    const payload = {
+      optionId,
+      optionTitle,
+      toolName: option.toolName,
+      params: option.params,
+      result: result ?? null,
+      conflictInfo: conflictInfo ?? null,
+      timestamp,
+    };
+
+    try {
+      const log = await this.logService.logRequest(
+        `[proposal:${eventName}] ${optionTitle}`,
+        eventName
+      );
+      await this.logService.logToolExecution(log.id, option.toolName, payload);
+      if (
+        eventName === "proposal_action_failed" ||
+        eventName === "proposal_conflict_blocked"
+      ) {
+        const message =
+          typeof result === "object" && result !== null && "message" in result
+            ? String((result as { message?: unknown }).message)
+            : eventName;
+        await this.logService.logFailure(log.id, message);
+      } else {
+        await this.logService.logSuccess(log.id, payload);
+      }
+      return log.id;
+    } catch (e) {
+      console.warn("[AgentService] Failed to write proposal audit log:", e);
+      return undefined;
     }
   }
 }

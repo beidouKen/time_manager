@@ -35,6 +35,13 @@ export const LLMIntentSchema = z.enum([
 
 export type LLMIntent = z.infer<typeof LLMIntentSchema>;
 
+const NormalizedLLMIntentSchema = z.preprocess((value) => {
+  if (typeof value !== "string") {
+    return value;
+  }
+  return LLMIntentSchema.safeParse(value).success ? value : "unknown";
+}, LLMIntentSchema);
+
 /**
  * LLM 输出的顶层结构 schema。
  *
@@ -51,9 +58,13 @@ export type LLMIntent = z.infer<typeof LLMIntentSchema>;
  */
 export const LLMResponseSchema = z.object({
   type: z.enum(["tool_plan", "clarification", "chitchat", "unsupported"]),
-  intent: LLMIntentSchema.default("unknown"),
+  intent: NormalizedLLMIntentSchema.default("unknown"),
   toolName: z.string().nullable().default(null),
-  params: z.record(z.unknown()).default({}),
+  params: z
+    .record(z.unknown())
+    .nullable()
+    .default({})
+    .transform((value) => value ?? {}),
   requiresConfirmation: z.boolean().default(false),
   riskLevel: z.enum(["safe", "confirm", "destructive"]).default("safe"),
   summary: z.string().default(""),

@@ -23,7 +23,7 @@ const TOOL_DESCRIPTIONS = `
 - update_time_block | 修改时间块 | timeBlockId(必填), title?, start_time?, end_time?
 - delete_time_block | 删除时间块[危险] | timeBlockId(必填)
 - list_time_blocks | 列出时间块 | date?(YYYY-MM-DD)
-- bind_task_to_time_block | 绑定任务到时间块 | taskId(必填), timeBlockId(必填)
+- bind_task_to_time_block | 绑定任务到时间块 | taskId(必填), title?, start_time(ISO必填), end_time(ISO必填)
 - schedule_task | 安排任务到时间轴 | taskId?, title(必填), start_time(ISO必填), end_time(ISO必填)
 - reschedule_day | 重新安排今日计划[危险] | date(YYYY-MM-DD必填)
 - detect_conflicts | 检测时间冲突 | date?(YYYY-MM-DD)
@@ -70,6 +70,9 @@ const SAFETY_RULES = `
 4. 有多个候选对象时（如"这个任务"无法唯一定位）必须返回 type=clarification
 5. 用户请求文件操作、代码执行、Shell、打开程序等系统操作时返回 type=unsupported
 6. 不要把 API Key 或任何敏感信息输出到响应中
+7. 不得假装执行工具——所有写操作必须通过 type=tool_plan 返回，由系统执行
+8. 不得编造不存在的任务或日程——只能引用上下文中已列出的 ID；无法定位时返回 type=clarification
+9. 高风险操作（delete_task、delete_time_block、reschedule_day）必须设 requiresConfirmation=true，且 riskLevel=destructive
 `.trim();
 
 /**

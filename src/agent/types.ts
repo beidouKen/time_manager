@@ -219,4 +219,83 @@ export interface ChatMessageMetadata {
   confidence?: number;
   /** LLM 返回的响应类型 */
   llmResponseType?: "tool_plan" | "clarification" | "chitchat" | "unsupported";
+  // V3.5 新增
+  /** Agent 执行追踪（LLM 路径写入，用于调试与 UI 展示） */
+  agentTrace?: AgentTrace;
+}
+
+// ─── V3.5 AgentTrace ────────────────────────────────────────────────────────
+
+/**
+ * 记录单次 LLM Agent 执行的追踪信息，写入 ChatMessage metadata。
+ * - mode: LLM 返回的响应类型，或 error 表示各类错误
+ * - errorKind: 仅 mode=error 时填充，标识具体错误原因
+ */
+export interface AgentTrace {
+  planner: "llm";
+  mode: "tool_plan" | "clarification" | "chitchat" | "unsupported" | "error";
+  model?: string;
+  toolName?: string;
+  errorKind?:
+    | "disabled"
+    | "api_key_missing"
+    | "network_error"
+    | "http_error"
+    | "parse_error"
+    | "fallback";
+}
+
+// ─── V3.5 AgentMessage ──────────────────────────────────────────────────────
+
+/** LLM 上下文中的单条消息，供 contextBuilder / LLMPlanner 使用。 */
+export interface AgentMessage {
+  role: "user" | "assistant" | "system";
+  content: string;
+}
+
+// ─── V3.5 AgentEvent ────────────────────────────────────────────────────────
+
+export type AgentEventType =
+  | "plan_proposed"
+  | "plan_confirmed"
+  | "plan_rejected"
+  | "tool_executed"
+  | "error";
+
+export interface AgentEvent {
+  type: AgentEventType;
+  timestamp: string;
+  trace?: AgentTrace;
+  payload?: unknown;
+}
+
+// ─── V3.5 PlanProposal（Delay / Feedback Agent 化的选项提议） ───────────────
+
+export type AgentPlanMode = "immediate" | "propose" | "clarify";
+
+/** 单个可选执行方案。 */
+export interface PlanOption {
+  id?: string;
+  title?: string;
+  label: string;
+  toolName: string;
+  params: Record<string, unknown>;
+  summary: string;
+  actions?: Array<{
+    toolName: string;
+    params: Record<string, unknown>;
+    summary?: string;
+  }>;
+}
+
+/**
+ * Agent 向用户提议的多选执行方案。
+ * - mode=propose: 展示选项列表，等待用户选择
+ * - mode=immediate: 直接执行，无需选择
+ * - mode=clarify: 需要用户补充信息
+ */
+export interface PlanProposal {
+  mode: AgentPlanMode;
+  options: PlanOption[];
+  question?: string;
 }

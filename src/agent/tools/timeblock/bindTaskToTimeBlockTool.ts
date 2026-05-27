@@ -5,7 +5,7 @@ import type { ScheduleTaskInput } from "@/services/ScheduleService";
 
 export class BindTaskToTimeBlockTool extends BaseTool {
   name = "bind_task_to_time_block";
-  description = "将一个任务绑定到一个时间块（排期）";
+  description = "Schedule a task into a time block";
   requiresConfirmation = false;
   riskLevel = "low" as const;
 
@@ -21,18 +21,17 @@ export class BindTaskToTimeBlockTool extends BaseTool {
       const input: ScheduleTaskInput = {
         taskId: args.taskId as string,
         title: args.title as string,
-        startTime: args.startTime as string,
-        endTime: args.endTime as string,
+        startTime: (args.start_time ?? args.startTime) as string,
+        endTime: (args.end_time ?? args.endTime) as string,
       };
 
-      if (!input.taskId) return this.failure("缺少任务 ID");
+      if (!input.taskId) return this.failure("Missing task ID");
       if (!input.startTime || !input.endTime)
-        return this.failure("缺少开始或结束时间");
+        return this.failure("Missing start or end time");
 
-      const block =
-        await this.scheduleService.scheduleTaskToTimeBlock(input);
+      const block = await this.scheduleService.scheduleTaskToTimeBlock(input);
       return this.success(
-        `已将任务安排到 ${block.start_time} - ${block.end_time}`,
+        `Scheduled task from ${block.start_time} to ${block.end_time}`,
         block
       );
     } catch (e) {

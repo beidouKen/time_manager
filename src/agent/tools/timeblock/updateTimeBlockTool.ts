@@ -5,7 +5,7 @@ import type { UpdateTimeBlockInput } from "@/types/timeblock.types";
 
 export class UpdateTimeBlockTool extends BaseTool {
   name = "update_time_block";
-  description = "更新一个时间块的信息";
+  description = "Update a time block";
   requiresConfirmation = false;
   riskLevel = "low" as const;
 
@@ -18,8 +18,8 @@ export class UpdateTimeBlockTool extends BaseTool {
 
   async execute(args: Record<string, unknown>): Promise<ToolResult> {
     try {
-      const blockId = args.blockId as string;
-      if (!blockId) return this.failure("缺少时间块 ID");
+      const timeBlockId = (args.timeBlockId ?? args.blockId) as string | undefined;
+      if (!timeBlockId) return this.failure("Missing time block ID");
 
       const patch: UpdateTimeBlockInput = {};
       if (args.title !== undefined) patch.title = args.title as string;
@@ -30,8 +30,8 @@ export class UpdateTimeBlockTool extends BaseTool {
       if (args.status !== undefined)
         patch.status = args.status as "scheduled" | "in_progress" | "done" | "skipped" | "cancelled";
 
-      const block = await this.timeBlockService.updateTimeBlock(blockId, patch);
-      return this.success(`已更新时间块「${block.title}」`, block);
+      const block = await this.timeBlockService.updateTimeBlock(timeBlockId, patch);
+      return this.success(`Updated time block "${block.title}"`, block);
     } catch (e) {
       return this.failure(String(e));
     }

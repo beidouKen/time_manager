@@ -4,7 +4,7 @@ import { TimeBlockService } from "@/services/TimeBlockService";
 
 export class DeleteTimeBlockTool extends BaseTool {
   name = "delete_time_block";
-  description = "删除一个时间块（软删除）";
+  description = "Delete a time block";
   requiresConfirmation = true;
   riskLevel = "medium" as const;
 
@@ -17,14 +17,14 @@ export class DeleteTimeBlockTool extends BaseTool {
 
   async execute(args: Record<string, unknown>): Promise<ToolResult> {
     try {
-      const blockId = args.blockId as string;
-      if (!blockId) return this.failure("缺少时间块 ID");
+      const timeBlockId = (args.timeBlockId ?? args.blockId) as string | undefined;
+      if (!timeBlockId) return this.failure("Missing time block ID");
 
-      const block = await this.timeBlockService.getBlockById(blockId);
-      if (!block) return this.failure("时间块不存在");
+      const block = await this.timeBlockService.getBlockById(timeBlockId);
+      if (!block) return this.failure("Time block not found");
 
-      await this.timeBlockService.deleteTimeBlock(blockId);
-      return this.success(`已删除时间块「${block.title}」`);
+      await this.timeBlockService.deleteTimeBlock(timeBlockId);
+      return this.success(`Deleted time block "${block.title}"`);
     } catch (e) {
       return this.failure(String(e));
     }

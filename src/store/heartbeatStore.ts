@@ -61,6 +61,11 @@ interface HeartbeatRuntimeState {
   isFeedbackDialogOpen: boolean;
   lastTickAt: string | null;
   _intervalId: ReturnType<typeof setInterval> | null;
+  // V3.5-B: 反馈弹窗临时静默（用于「暂不处理」/关闭后防骚扰）
+  feedbackSnoozeUntil: string | null;
+  // V3.5-B: Delay 选择弹窗
+  isDelayDialogOpen: boolean;
+  delayTargetBlock: TimeBlock | null;
 }
 
 interface HeartbeatActions {
@@ -73,6 +78,9 @@ interface HeartbeatActions {
   completeBlock: (blockId: string, feedbackNote?: string) => Promise<void>;
   skipBlock: (blockId: string, feedbackNote?: string) => Promise<void>;
   delayBlock: (blockId: string, feedbackNote?: string) => Promise<void>;
+  // V3.5-B: Delay 弹窗控制
+  openDelayDialog: (block: TimeBlock) => void;
+  closeDelayDialog: () => void;
 }
 
 type HeartbeatState = HeartbeatSettingsState & HeartbeatRuntimeState & HeartbeatActions;
@@ -93,6 +101,9 @@ export const useHeartbeatStore = create<HeartbeatState>()(
       isFeedbackDialogOpen: false,
       lastTickAt: null,
       _intervalId: null,
+      feedbackSnoozeUntil: null,
+      isDelayDialogOpen: false,
+      delayTargetBlock: null,
 
       // ─── 设置管理 ────────────────────────────────────────────────────────
 
@@ -122,6 +133,9 @@ export const useHeartbeatStore = create<HeartbeatState>()(
             upcomingReminderBlock: null,
             startPromptBlock: null,
             pendingFeedbackBlock: null,
+            feedbackSnoozeUntil: null,
+            isDelayDialogOpen: false,
+            delayTargetBlock: null,
           });
         }
       },
@@ -167,9 +181,12 @@ export const useHeartbeatStore = create<HeartbeatState>()(
             await heartbeatService.markStartPromptSent(evaluation.startPromptBlock.id);
           }
 
+          // V3.5-B: 不再自动写 end_prompt_sent_at（由用户明确操作后写入）
+          // 使用内存 snooze 防止每次 tick 都弹出
           if (evaluation.pendingFeedbackBlock && autoFeedbackPromptEnabled) {
-            await heartbeatService.markEndPromptSent(evaluation.pendingFeedbackBlock.id);
-            if (!isFeedbackDialogOpen) {
+            const snoozeUntil = get().feedbackSnoozeUntil;
+            const isSnoozed = snoozeUntil && new Date(snoozeUntil) > now;
+            if (!isFeedbackDialogOpen && !isSnoozed) {
               set({ isFeedbackDialogOpen: true });
             }
           }
@@ -181,7 +198,9 @@ export const useHeartbeatStore = create<HeartbeatState>()(
       // ─── 反馈对话框 ──────────────────────────────────────────────────────
 
       closeFeedbackDialog: () => {
-        set({ isFeedbackDialogOpen: false, pendingFeedbackBlock: null });
+        // V3.5-B: 关闭弹窗但不写 end_prompt_sent_at，10 分钟后允许再次弹出
+        const snoozeUntil = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+        set({ isFeedbackDialogOpen: false, pendingFeedbackBlock: null, feedbackSnoozeUntil: snoozeUntil });
       },
 
       // ─── 执行操作（含 ActionLog 记录） ───────────────────────────────────
@@ -259,7 +278,7 @@ export const useHeartbeatStore = create<HeartbeatState>()(
         let errorMsg: string | undefined;
         try {
           await heartbeatService.delayBlock(blockId, feedbackNote);
-          set({ isFeedbackDialogOpen: false, pendingFeedbackBlock: null });
+          set({ isFeedbackDialogOpen: false, pendingFeedbackBlock: null, feedbackSnoozeUntil: null });
         } catch (e) {
           success = false;
           errorMsg = String(e);
@@ -268,6 +287,15 @@ export const useHeartbeatStore = create<HeartbeatState>()(
           await logHeartbeatAction("delay_block", block, success, errorMsg);
         }
         await get().tick();
+      },
+
+      // V3.5-B: Delay 选择弹窗
+      openDelayDialog: (block: TimeBlock) => {
+        set({ isDelayDialogOpen: true, delayTargetBlock: block });
+      },
+
+      closeDelayDialog: () => {
+        set({ isDelayDialogOpen: false, delayTargetBlock: null });
       },
     }),
     {

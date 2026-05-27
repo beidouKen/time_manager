@@ -13,6 +13,7 @@ import { toast } from "sonner";
 import { useTimeBlockStore } from "@/store/timeBlockStore";
 import { useTaskStore } from "@/store/taskStore";
 import { useUiStore } from "@/store/uiStore";
+import { useHeartbeatStore } from "@/store/heartbeatStore";
 import { BlockStatusBadge, BlockTypeDot } from "@/components/shared/StatusBadge";
 import { ConfirmDialog } from "@/components/shared/ConfirmDialog";
 import { getBlockTopPx, getBlockHeightPx, formatTime, getBlockDurationMinutes } from "@/lib/dateUtils";
@@ -61,10 +62,10 @@ export function TimeBlockCard({ block, dayStart }: TimeBlockCardProps) {
     moveBackToTask,
     completeBlockWithLinkage,
     skipBlockWithLinkage,
-    delayBlockWithLinkage,
   } = useTimeBlockStore();
   const { loadTasks } = useTaskStore();
   const { openTimeBlockForm } = useUiStore();
+  const { openDelayDialog } = useHeartbeatStore();
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
   const [confirmMoveBackOpen, setConfirmMoveBackOpen] = useState(false);
 
@@ -105,14 +106,9 @@ export function TimeBlockCard({ block, dayStart }: TimeBlockCardProps) {
     }
   };
 
-  const handleMarkDelayed = async () => {
-    try {
-      await delayBlockWithLinkage(block.id);
-      await loadTasks();
-      toast.success("已标记为延迟，可稍后重新安排");
-    } catch (e) {
-      toast.error(String(e));
-    }
+  const handleMarkDelayed = () => {
+    // V3.5-B: 打开 DelayChoiceDialog 而非直接标记
+    openDelayDialog(block);
   };
 
   const handleDelete = async () => {

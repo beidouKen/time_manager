@@ -99,6 +99,12 @@ export const useChatStore = create<ChatState & ChatActions>((set, _get) => ({
   sendMessage: async (content: string) => {
     set({ isProcessing: true, error: null });
 
+    // V3.5 fix: 先取历史消息（不含当前输入），再 append userMsg
+    // 这样 recentMessages 只包含历史，当前输入仅通过 userInput 传入 AgentService
+    const recentMessages = _get()
+      .messages.slice(-6)
+      .map((m) => ({ role: m.role, content: m.content }));
+
     const userMsg: ChatMessage = {
       id: crypto.randomUUID(),
       role: "user",
@@ -111,17 +117,8 @@ export const useChatStore = create<ChatState & ChatActions>((set, _get) => ({
     await conversationRepo.create({ role: "user", content });
 
     try {
-      // V3：将最近消息作为上下文传给 AgentService，用于 LLM 指代消解
-      // 注意：传入的是追加 userMsg 之前的消息列表（不含当前消息，避免重复）
-      // 当前用户消息由 AgentService 直接作为 userInput 处理
-      const currentMessages = _get().messages;
-      const recentMessages = currentMessages
-        .slice(-6)
-        .map((m) => ({ role: m.role, content: m.content }));
 
-      const response: AgentResponse = await agentService.processInput(content, {
-        recentMessages,
-      });
+      const response: AgentResponse = await agentService.processInput(content, { recentMessages });
 
       const assistantMsg: ChatMessage = {
         id: crypto.randomUUID(),

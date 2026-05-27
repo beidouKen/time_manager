@@ -21,7 +21,7 @@ import { buildSystemPrompt, formatContextBlock } from "@/agent/llm/prompts";
 import { parseLLMResponse } from "@/agent/llm/schemas";
 import type { LLMResponse } from "@/agent/llm/schemas";
 import { CONFIRMATION_POLICY } from "@/agent/types";
-import type { IntentType, RiskLevel } from "@/agent/types";
+import type { AgentActionPlan, IntentType, RiskLevel } from "@/agent/types";
 import type { ToolRouter } from "@/agent/ToolRouter";
 
 // ─── 结果类型 ────────────────────────────────────────────────────────────────
@@ -64,6 +64,27 @@ export interface LLMPlanResult {
   modelName?: string;
 }
 
+// ─── 适配函数：将 LLMPlanResult 映射为 AgentActionPlan 雏形 ─────────────────
+
+/**
+ * 将成功的 LLMPlanResult（type=tool_plan）映射为 AgentActionPlan。
+ * 非 tool_plan 类型返回 null。
+ */
+export function toAgentActionPlan(result: LLMPlanResult): AgentActionPlan | null {
+  if (result.type !== "tool_plan") return null;
+  return {
+    id: crypto.randomUUID(),
+    commandId: "",
+    intent: result.intent!,
+    toolName: result.toolName!,
+    params: result.params ?? {},
+    requiresConfirmation: result.requiresConfirmation ?? false,
+    riskLevel: result.riskLevel ?? "safe",
+    summary: result.summary ?? "",
+    createdAt: new Date().toISOString(),
+  };
+}
+
 // ─── 危险操作列表（代码层强制确认，不信任 LLM 输出） ───────────────────────
 
 const FORCED_CONFIRMATION_INTENTS: Set<string> = new Set([
@@ -99,13 +120,11 @@ export class LLMPlanner {
 
     const messages = [
       { role: "system" as const, content: systemPrompt },
-      // 历史对话（最近 N 条，已在 contextBuilder 中截取）
-      ...context.recentMessages
-        .slice(0, -1) // 最后一条是当前用户消息，单独处理
-        .map((m) => ({
-          role: m.role as "user" | "assistant" | "system",
-          content: m.content,
-        })),
+      // 历史对话：由 chatStore 在调用前已截取，不含当前用户消息（V3.5 fix）
+      ...context.recentMessages.map((m) => ({
+        role: m.role as "user" | "assistant" | "system",
+        content: m.content,
+      })),
       // 当前用户消息，前置上下文块
       {
         role: "user" as const,
@@ -131,14 +150,14 @@ export class LLMPlanner {
           };
         }
         if (e.kind === "network_error") {
-          console.warn("[LLMPlanner] 网络错误，将 fallback 到规则解析：", e.message);
+          console.warn("[LLMPlanner] 网络错误：", e.message);
           return {
             type: "network_error",
             errorMessage: e.message,
             modelName,
           };
         }
-        console.warn("[LLMPlanner] HTTP 错误，将 fallback 到规则解析：", e.message);
+        console.warn("[LLMPlanner] HTTP 错误：", e.message);
         return {
           type: "fallback",
           errorMessage: e.message,
@@ -156,7 +175,7 @@ export class LLMPlanner {
     // 解析 + schema 校验
     const parseResult = parseLLMResponse(rawContent);
     if (!parseResult.success) {
-      console.warn("[LLMPlanner] LLM 输出解析失败，将 fallback：", parseResult.error);
+      console.warn("[LLMPlanner] LLM 输出解析失败：", parseResult.error);
       return {
         type: "parse_error",
         errorMessage: parseResult.error,
@@ -245,6 +264,14 @@ export class LLMPlanner {
 
     // 3. intent 映射（将 LLMIntent 转为 IntentType）
     const intent = resp.intent as IntentType;
+    if (intent === "unknown") {
+      return {
+        type: "fallback",
+        errorMessage: "LLM 返回 tool_plan 但 intent 不是有效工具意图",
+        rawLLMResponse: resp,
+        modelName,
+      };
+    }
 
     // 4. 安全覆盖：确认策略以 CONFIRMATION_POLICY 为准，不信任 LLM 的 requiresConfirmation
     const policyRisk: RiskLevel = CONFIRMATION_POLICY[intent] ?? "safe";
@@ -271,3 +298,4 @@ export class LLMPlanner {
     };
   }
 }
+

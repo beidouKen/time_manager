@@ -3,12 +3,22 @@ import { TodoList } from "@/components/todo/TodoList";
 import { TodayTimeline } from "@/components/timeline/TodayTimeline";
 import { HeartbeatPanel } from "@/components/heartbeat/HeartbeatPanel";
 import { ExecutionFeedbackDialog } from "@/components/heartbeat/ExecutionFeedbackDialog";
+import { DelayChoiceDialog } from "@/components/heartbeat/DelayChoiceDialog";
 import { useTimeBlockStore } from "@/store/timeBlockStore";
 import { useHeartbeatStore } from "@/store/heartbeatStore";
+import { useTaskStore } from "@/store/taskStore";
 
 export function TodayPage() {
-  const { setCurrentDate } = useTimeBlockStore();
-  const { heartbeatEnabled, startHeartbeat, stopHeartbeat } = useHeartbeatStore();
+  const { setCurrentDate, refreshBlocks, delayBlockWithLinkage } = useTimeBlockStore();
+  const { loadTasks } = useTaskStore();
+  const {
+    heartbeatEnabled,
+    startHeartbeat,
+    stopHeartbeat,
+    isDelayDialogOpen,
+    delayTargetBlock,
+    closeDelayDialog,
+  } = useHeartbeatStore();
 
   useEffect(() => {
     setCurrentDate(new Date());
@@ -39,6 +49,17 @@ export function TodayPage() {
 
       {/* Global feedback dialog */}
       <ExecutionFeedbackDialog />
+      <DelayChoiceDialog
+        open={isDelayDialogOpen}
+        block={delayTargetBlock}
+        onClose={closeDelayDialog}
+        onDelayLater={async (blockId) => {
+          await delayBlockWithLinkage(blockId);
+        }}
+        onSuccess={async () => {
+          await Promise.all([refreshBlocks(), loadTasks()]);
+        }}
+      />
     </div>
   );
 }
