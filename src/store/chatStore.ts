@@ -4,6 +4,9 @@ import type { AgentResponse } from "@/agent/AgentService";
 import type { ChatMessageMetadata } from "@/agent/types";
 import { SqliteConversationRepository } from "@/repositories/sqlite/SqliteConversationRepository";
 import type { ConversationMessage } from "@/types/agent.types";
+import { useTaskStore } from "@/store/taskStore";
+import { useTimeBlockStore } from "@/store/timeBlockStore";
+import { useUiStore } from "@/store/uiStore";
 
 const agentService = new AgentService();
 const conversationRepo = new SqliteConversationRepository();
@@ -53,6 +56,39 @@ function buildMetadataJson(response: AgentResponse): string | undefined {
     return JSON.stringify({ confirmationId: response.confirmationId });
   }
   return undefined;
+}
+
+function formatLocalDateKey(date: Date): string {
+  const year = date.getFullYear();
+  const month = `${date.getMonth() + 1}`.padStart(2, "0");
+  const day = `${date.getDate()}`.padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function parseDateKey(dateKey: string): Date {
+  const [year, month, day] = dateKey.split("-").map(Number);
+  return new Date(year, month - 1, day);
+}
+
+async function applyRefreshHints(response: AgentResponse): Promise<void> {
+  const hints = response.refreshHints;
+  if (!hints) return;
+
+  const refreshes: Array<Promise<void>> = [];
+  if (hints.tasks) {
+    refreshes.push(useTaskStore.getState().loadTasks());
+  }
+  if (hints.timeline) {
+    refreshes.push(
+      hints.timelineDate
+        ? useTimeBlockStore
+            .getState()
+            .loadBlocksForDate(parseDateKey(hints.timelineDate))
+        : useTimeBlockStore.getState().refreshBlocks()
+    );
+  }
+
+  await Promise.all(refreshes);
 }
 
 /**
@@ -118,7 +154,19 @@ export const useChatStore = create<ChatState & ChatActions>((set, _get) => ({
 
     try {
 
-      const response: AgentResponse = await agentService.processInput(content, { recentMessages });
+      const currentTimelineDate = formatLocalDateKey(
+        useTimeBlockStore.getState().currentDate
+      );
+      const timezone =
+        Intl.DateTimeFormat().resolvedOptions().timeZone || "Asia/Shanghai";
+
+      const response: AgentResponse = await agentService.processInput(content, {
+        recentMessages,
+        timezone,
+        currentTimelineDate,
+        selectedDate: currentTimelineDate,
+        currentScreen: useUiStore.getState().activePage,
+      });
 
       const assistantMsg: ChatMessage = {
         id: crypto.randomUUID(),
@@ -140,6 +188,8 @@ export const useChatStore = create<ChatState & ChatActions>((set, _get) => ({
         content: response.message,
         metadata_json: buildMetadataJson(response),
       });
+
+      await applyRefreshHints(response);
     } catch (e) {
       const errorMsg: ChatMessage = {
         id: crypto.randomUUID(),
@@ -177,6 +227,8 @@ export const useChatStore = create<ChatState & ChatActions>((set, _get) => ({
         content: response.message,
         metadata_json: buildMetadataJson(response),
       });
+
+      await applyRefreshHints(response);
     } catch (e) {
       set({ isProcessing: false, error: String(e) });
     }

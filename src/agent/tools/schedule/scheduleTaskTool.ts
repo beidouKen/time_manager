@@ -29,6 +29,10 @@ export class ScheduleTaskTool extends BaseTool {
       const title = args.title as string;
       const startTime = args.start_time as string;
       const endTime = args.end_time as string;
+      const duration = (args.estimated_duration_minutes ?? args.duration) as
+        | number
+        | undefined;
+      const category = args.category as string | undefined;
 
       if (!startTime || !endTime) {
         return this.failure("缺少开始或结束时间");
@@ -51,7 +55,11 @@ export class ScheduleTaskTool extends BaseTool {
       }
 
       // No existing task - create task then schedule
-      const newTask = await this.taskService.createTask({ title });
+      const newTask = await this.taskService.createTask({
+        title,
+        estimated_duration_minutes: duration,
+        category,
+      });
       const block = await this.scheduleService.scheduleTaskToTimeBlock({
         taskId: newTask.id,
         title,

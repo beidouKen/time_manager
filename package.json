@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "test": "vitest run",
     "preview": "vite preview",
     "tauri": "tauri"
   },
@@ -32,16 +33,19 @@
     "zustand": "^5.0.3"
   },
   "pnpm": {
-    "onlyBuiltDependencies": ["esbuild"]
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.0.6",
+    "@tauri-apps/cli": "^2",
     "@types/react": "^19.0.8",
     "@types/react-dom": "^19.0.3",
-    "@tauri-apps/cli": "^2",
     "@vitejs/plugin-react": "^4.3.4",
     "tailwindcss": "^4.0.6",
     "typescript": "^5.7.3",
-    "vite": "^6.1.1"
+    "vite": "^6.1.1",
+    "vitest": "^4.1.7"
   }
 }

@@ -89,6 +89,73 @@ export interface AgentToolResult {
   confirmationId?: string;
 }
 
+// ─── V3.6.1 Agent Experience Pipeline Types ───────────────────────────────
+
+export type SemanticUserGoal =
+  | "greeting"
+  | "ask_assistant_identity"
+  | "ask_current_time"
+  | "create_and_schedule_task"
+  | "query_schedule"
+  | "general_chat"
+  | "unsupported_intent";
+
+export interface SemanticFrame {
+  userGoal: SemanticUserGoal;
+  objectReferences: Array<{
+    type: "task" | "time_block" | "recent" | "unknown";
+    sourceText: string;
+    keyword?: string;
+  }>;
+  timeExpressions: Array<{
+    sourceText: string;
+    normalized?: "start_now" | string;
+  }>;
+  durationExpressions: Array<{
+    sourceText: string;
+    minutes: number;
+  }>;
+  constraints: Record<string, unknown>;
+  userTone?: string;
+  urgency?: "low" | "normal" | "high";
+  missingInfo: string[];
+  confidence: number;
+  extractedTitle?: string;
+  category?: string;
+}
+
+export interface AgentExperienceContext {
+  currentDatetime: string;
+  timezone: string;
+  currentTimelineDate?: string;
+  selectedDate?: string;
+  currentScreen?: string;
+  recentMessages: Array<{ role: string; content: string }>;
+  lastCreatedTaskId: string | null;
+  lastMentionedTaskIds: string[];
+  lastScheduledTimeBlockIds: string[];
+  lastToolResults: AgentToolResult[];
+}
+
+export interface AgentRefreshHints {
+  tasks?: boolean;
+  timeline?: boolean;
+  timelineDate?: string;
+}
+
+export interface ExperienceActionPlan {
+  id: string;
+  kind: "direct_response" | "tool" | "query_schedule" | "chat";
+  userGoal: SemanticUserGoal;
+  toolName?: string;
+  params: Record<string, unknown>;
+  requiresConfirmation: boolean;
+  riskLevel: RiskLevel;
+  summary: string;
+  refreshHints?: AgentRefreshHints;
+  createdAt: string;
+}
+
 // ─── ToolDefinition（保持向后兼容，所有 17 个 Tool 实现此接口） ─────────
 
 export interface ToolDefinition {
@@ -232,8 +299,15 @@ export interface ChatMessageMetadata {
  * - errorKind: 仅 mode=error 时填充，标识具体错误原因
  */
 export interface AgentTrace {
-  planner: "llm";
-  mode: "tool_plan" | "clarification" | "chitchat" | "unsupported" | "error";
+  planner: "llm" | "experience";
+  mode:
+    | "tool_plan"
+    | "clarification"
+    | "chitchat"
+    | "unsupported"
+    | "error"
+    | "direct_response"
+    | "query_schedule";
   model?: string;
   toolName?: string;
   errorKind?:
@@ -243,6 +317,12 @@ export interface AgentTrace {
     | "http_error"
     | "parse_error"
     | "fallback";
+  rawInput?: string;
+  contextSnapshot?: AgentExperienceContext;
+  semanticFrame?: SemanticFrame;
+  actionPlan?: ExperienceActionPlan;
+  toolResults?: AgentToolResult[];
+  finalResponse?: string;
 }
 
 // ─── V3.5 AgentMessage ──────────────────────────────────────────────────────

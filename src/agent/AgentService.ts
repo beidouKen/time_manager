@@ -4,17 +4,31 @@ import { DeepSeekClient } from "@/agent/llm/DeepSeekClient";
 import { ContextBuilder } from "@/agent/llm/contextBuilder";
 import type { RecentMessage } from "@/agent/llm/contextBuilder";
 import { LLMPlanner } from "@/agent/LLMPlanner";
+import { ActionPlanner } from "@/agent/experience/ActionPlanner";
+import {
+  ConversationContextBuilder,
+  type ConversationMemorySnapshot,
+} from "@/agent/experience/ConversationContextBuilder";
+import {
+  ResponseComposer,
+  type ResponseKind,
+} from "@/agent/experience/ResponseComposer";
+import { SemanticFrameParser } from "@/agent/experience/SemanticFrameParser";
 import type {
   AgentActionPlan,
   AgentCommand,
+  AgentExperienceContext,
+  AgentRefreshHints,
   AgentToolResult,
   AgentTrace,
   ChatMessageMetadata,
+  ExperienceActionPlan,
   IntentType,
   ParsedIntent,
   PlanOption,
   PlanProposal,
   RiskLevel,
+  SemanticFrame,
 } from "@/agent/types";
 import { CONFIRMATION_POLICY, toLegacyRiskLevel } from "@/agent/types";
 import type { FreeSlot } from "@/agent/tools/schedule/getFreeSlotsTool";
@@ -22,6 +36,7 @@ import { formatTime } from "@/lib/dateUtils";
 import type { TimeBlock } from "@/types/timeblock.types";
 import { ActionLogService } from "@/services/ActionLogService";
 import { ConfirmationService } from "@/services/ConfirmationService";
+import { ScheduleService } from "@/services/ScheduleService";
 import { TaskService } from "@/services/TaskService";
 import { TimeBlockService } from "@/services/TimeBlockService";
 
@@ -50,6 +65,7 @@ export interface AgentResponse {
   intent: ParsedIntent;
   toolResult?: AgentToolResult;
   confirmationId?: string;
+  refreshHints?: AgentRefreshHints;
   /** V2.5：action_log 记录 ID，供 chatStore 写入 metadata */
   actionLogId?: string;
   /** V2.5：完整 metadata，供 chatStore 写入 conversation_messages.metadata_json */
@@ -117,6 +133,30 @@ const INTENT_TO_TOOL: Record<string, string> = {
 export interface ProcessInputContext {
   /** chatStore 传入的最近消息，用于 LLM 指代消解 */
   recentMessages?: RecentMessage[];
+  timezone?: string;
+  currentTimelineDate?: string;
+  selectedDate?: string;
+  currentScreen?: string;
+}
+
+interface ActionLogPort {
+  logRequest(userInput: string, detectedIntent?: string): Promise<{ id: string }>;
+  logToolExecution(
+    logId: string,
+    toolName: string,
+    toolArgs: Record<string, unknown>
+  ): Promise<unknown>;
+  logSuccess(logId: string, result: unknown): Promise<unknown>;
+  logFailure(logId: string, errorMessage: string): Promise<unknown>;
+  logCancelled(logId: string): Promise<unknown>;
+}
+
+interface AgentServiceOptions {
+  taskService?: TaskService;
+  timeBlockService?: TimeBlockService;
+  scheduleService?: ScheduleService;
+  logService?: ActionLogPort;
+  confirmService?: ConfirmationService;
 }
 
 // ─── AgentService ───────────────────────────────────────────────────────────
@@ -124,52 +164,68 @@ export interface ProcessInputContext {
 export class AgentService {
   private parser: IntentParser;
   private router: ToolRouter;
-  private logService: ActionLogService;
+  private logService: ActionLogPort;
   private confirmService: ConfirmationService;
   private taskService: TaskService;
   private timeBlockService: TimeBlockService;
+  private scheduleService: ScheduleService;
 
   // V3：LLM 相关组件
   private llmPlanner: LLMPlanner;
   private contextBuilder: ContextBuilder;
+  private experienceContextBuilder: ConversationContextBuilder;
+  private semanticFrameParser: SemanticFrameParser;
+  private actionPlanner: ActionPlanner;
+  private responseComposer: ResponseComposer;
 
   private lastOperatedTaskId: string | null = null;
   private lastOperatedTimeBlockId: string | null = null;
+  private lastCreatedTaskId: string | null = null;
+  private lastMentionedTaskIds: string[] = [];
+  private lastScheduledTimeBlockIds: string[] = [];
+  private lastToolResults: AgentToolResult[] = [];
 
-  constructor() {
+  constructor(options: AgentServiceOptions = {}) {
     this.parser = new IntentParser();
     this.router = new ToolRouter();
-    this.logService = new ActionLogService();
-    this.confirmService = new ConfirmationService();
-    this.taskService = new TaskService();
-    this.timeBlockService = new TimeBlockService();
+    this.logService = options.logService ?? new ActionLogService();
+    this.confirmService = options.confirmService ?? new ConfirmationService();
+    this.taskService = options.taskService ?? new TaskService();
+    this.timeBlockService = options.timeBlockService ?? new TimeBlockService();
+    this.scheduleService = options.scheduleService ?? new ScheduleService();
 
     // V3：初始化 LLM 组件（通过 LLMClient 接口隔离，不直接依赖 fetch）
     const llmClient = new DeepSeekClient();
     this.llmPlanner = new LLMPlanner(llmClient, this.router);
-    this.contextBuilder = new ContextBuilder();
+    this.contextBuilder = new ContextBuilder(this.taskService, this.timeBlockService);
+    this.experienceContextBuilder = new ConversationContextBuilder();
+    this.semanticFrameParser = new SemanticFrameParser();
+    this.actionPlanner = new ActionPlanner(this.taskService);
+    this.responseComposer = new ResponseComposer();
 
     this.registerTools();
   }
 
   private registerTools(): void {
-    this.router.register(new CreateTaskTool());
-    this.router.register(new UpdateTaskTool());
-    this.router.register(new DeleteTaskTool());
-    this.router.register(new ListTasksTool());
-    this.router.register(new MarkTaskCompletedTool());
-    this.router.register(new CreateTimeBlockTool());
-    this.router.register(new UpdateTimeBlockTool());
-    this.router.register(new DeleteTimeBlockTool());
-    this.router.register(new ListTimeBlocksTool());
-    this.router.register(new BindTaskToTimeBlockTool());
-    this.router.register(new ScheduleTaskTool());
-    this.router.register(new RescheduleDayTool());
-    this.router.register(new DetectConflictsTool());
-    this.router.register(new GetFreeSlotsTool());
-    this.router.register(new GetTodayPlanTool());
-    this.router.register(new ExplainTaskTool());
-    this.router.register(new ExplainScheduleTool());
+    this.router.register(new CreateTaskTool(this.taskService));
+    this.router.register(new UpdateTaskTool(this.taskService));
+    this.router.register(new DeleteTaskTool(this.taskService));
+    this.router.register(new ListTasksTool(this.taskService));
+    this.router.register(new MarkTaskCompletedTool(this.taskService));
+    this.router.register(new CreateTimeBlockTool(this.timeBlockService));
+    this.router.register(new UpdateTimeBlockTool(this.timeBlockService));
+    this.router.register(new DeleteTimeBlockTool(this.timeBlockService));
+    this.router.register(new ListTimeBlocksTool(this.timeBlockService));
+    this.router.register(new BindTaskToTimeBlockTool(this.scheduleService));
+    this.router.register(
+      new ScheduleTaskTool(this.taskService, this.timeBlockService, this.scheduleService)
+    );
+    this.router.register(new RescheduleDayTool(this.timeBlockService, this.taskService));
+    this.router.register(new DetectConflictsTool(this.scheduleService));
+    this.router.register(new GetFreeSlotsTool(this.timeBlockService));
+    this.router.register(new GetTodayPlanTool(this.timeBlockService, this.taskService));
+    this.router.register(new ExplainTaskTool(this.taskService, this.timeBlockService));
+    this.router.register(new ExplainScheduleTool(this.timeBlockService));
   }
 
   // ─── 主入口：处理用户输入（V3.5 LLM-first，无 fallback） ───────────────────
@@ -178,9 +234,27 @@ export class AgentService {
     userInput: string,
     context?: ProcessInputContext
   ): Promise<AgentResponse> {
+    const experienceContext = this.experienceContextBuilder.build(
+      context,
+      this.getConversationMemorySnapshot()
+    );
+    const semanticFrame = this.semanticFrameParser.parse(userInput);
+
     const llmEnabled =
       (import.meta.env.VITE_LLM_AGENT_ENABLED as string | undefined) === "true";
     const apiKey = (import.meta.env.VITE_DEEPSEEK_API_KEY as string | undefined) ?? "";
+
+    if (
+      semanticFrame.userGoal !== "general_chat" ||
+      !llmEnabled ||
+      !apiKey
+    ) {
+      return this.processWithExperiencePipeline(
+        userInput,
+        experienceContext,
+        semanticFrame
+      );
+    }
 
     // LLM 未启用：返回配置错误，不走规则链路
     if (!llmEnabled) {
@@ -216,6 +290,166 @@ export class AgentService {
 
   // ─── LLM 路径（V3.5：不再返回 null，所有结果写入 AgentTrace） ─────────────
 
+  private async processWithExperiencePipeline(
+    userInput: string,
+    context: AgentExperienceContext,
+    semanticFrame: SemanticFrame
+  ): Promise<AgentResponse> {
+    const actionPlan = await this.actionPlanner.plan(semanticFrame, context);
+    const toolResults: AgentToolResult[] = [];
+    let queryBlocks: TimeBlock[] | undefined;
+    let actionLogId: string | undefined;
+
+    const log = await this.logService.logRequest(userInput, semanticFrame.userGoal);
+    actionLogId = log.id;
+
+    if (actionPlan.kind === "tool" && actionPlan.toolName) {
+      await this.logService.logToolExecution(
+        log.id,
+        actionPlan.toolName,
+        actionPlan.params
+      );
+      const result = await this.router.execute(
+        actionPlan.toolName,
+        actionPlan.params
+      );
+      toolResults.push(result);
+
+      if (result.success) {
+        await this.logService.logSuccess(log.id, result.data);
+        this.trackLastEntities(actionPlan.toolName, result);
+        this.updateExperienceMemory(semanticFrame, actionPlan, result);
+      } else {
+        await this.logService.logFailure(log.id, result.error ?? result.message);
+      }
+    } else if (actionPlan.kind === "query_schedule") {
+      const taskId = actionPlan.params.taskId as string | null | undefined;
+
+      if (taskId) {
+        const blocks = await this.timeBlockService.getBlocksByTaskId(taskId);
+        queryBlocks = blocks
+          .filter((block) => !block.deleted_at)
+          .sort((a, b) => a.start_time.localeCompare(b.start_time));
+        this.rememberMentionedTask(taskId);
+      } else {
+        queryBlocks = [];
+      }
+
+      const queryResult: AgentToolResult = {
+        success: Boolean(taskId && queryBlocks.length > 0),
+        message: "query schedule",
+        data: queryBlocks,
+        relatedTaskId: taskId ?? undefined,
+        relatedTimeBlockId: queryBlocks[0]?.id,
+      };
+      toolResults.push(queryResult);
+      await this.logService.logSuccess(log.id, {
+        taskId: taskId ?? null,
+        timeBlocks: queryBlocks,
+      });
+    } else {
+      await this.logService.logSuccess(log.id, {
+        kind: actionPlan.kind,
+        userGoal: semanticFrame.userGoal,
+      });
+    }
+
+    const finalResponse = this.responseComposer.compose({
+      context,
+      frame: semanticFrame,
+      plan: actionPlan,
+      toolResults,
+      queryBlocks,
+    });
+
+    const traceMode =
+      actionPlan.kind === "direct_response"
+        ? "direct_response"
+        : actionPlan.kind === "query_schedule"
+          ? "query_schedule"
+          : actionPlan.kind === "chat"
+            ? "chitchat"
+            : "tool_plan";
+
+    const trace: AgentTrace = {
+      planner: "experience",
+      mode: traceMode,
+      toolName: actionPlan.toolName,
+      rawInput: userInput,
+      contextSnapshot: context,
+      semanticFrame,
+      actionPlan,
+      toolResults,
+      finalResponse,
+    };
+
+    const primaryResult = toolResults[0];
+    const mappedIntent: IntentType =
+      semanticFrame.userGoal === "create_and_schedule_task"
+        ? "schedule_task"
+        : "unknown";
+
+    const metadata: ChatMessageMetadata = {
+      intent: semanticFrame.userGoal,
+      toolName: actionPlan.toolName,
+      actionLogId,
+      relatedTaskId:
+        primaryResult?.relatedTaskId ??
+        (actionPlan.params.taskId as string | undefined),
+      relatedTimeBlockId: primaryResult?.relatedTimeBlockId,
+      resultType: primaryResult && !primaryResult.success ? "failure" : "success",
+      source: "llm",
+      confidence: semanticFrame.confidence,
+      llmResponseType: traceMode === "chitchat" ? "chitchat" : "tool_plan",
+      agentTrace: trace,
+    };
+
+    return {
+      message: finalResponse,
+      intent: {
+        intent: mappedIntent,
+        confidence: semanticFrame.confidence,
+        args: actionPlan.params,
+        rawInput: userInput,
+      },
+      toolResult: primaryResult,
+      actionLogId,
+      refreshHints: actionPlan.refreshHints,
+      metadata,
+    };
+  }
+
+  private composeBoundaryMessage(
+    userInput: string,
+    context: ProcessInputContext | undefined,
+    responseKind: ResponseKind,
+    toolResults: AgentToolResult[] = []
+  ): string {
+    const experienceContext = this.experienceContextBuilder.build(
+      context,
+      this.getConversationMemorySnapshot()
+    );
+    const semanticFrame = this.semanticFrameParser.parse(userInput);
+    const plan: ExperienceActionPlan = {
+      id: crypto.randomUUID(),
+      kind: "direct_response",
+      userGoal: semanticFrame.userGoal,
+      params: { currentDatetime: experienceContext.currentDatetime },
+      requiresConfirmation: false,
+      riskLevel: "safe",
+      summary: responseKind,
+      createdAt: new Date().toISOString(),
+    };
+
+    return this.responseComposer.compose({
+      context: experienceContext,
+      frame: semanticFrame,
+      plan,
+      toolResults,
+      responseKind,
+    });
+  }
+
   private async processWithLLM(
     userInput: string,
     context?: ProcessInputContext
@@ -237,7 +471,7 @@ export class AgentService {
         await this.logService.logFailure(log.id, planResult.errorMessage ?? "API Key 缺失");
         const trace: AgentTrace = { planner: "llm", mode: "error", model: modelName, errorKind: "api_key_missing" };
         return {
-          message: "⚠️ DeepSeek API Key 未配置，请在 .env 中设置 VITE_DEEPSEEK_API_KEY。",
+          message: this.composeBoundaryMessage(userInput, context, "unsupported_intent"),
           intent: { intent: "unknown", confidence: 0, args: {}, rawInput: userInput },
           actionLogId: log.id,
           metadata: { intent: "unknown", actionLogId: log.id, resultType: "failure", source: "llm", llmModel: modelName, agentTrace: trace },
@@ -250,7 +484,7 @@ export class AgentService {
         await this.logService.logFailure(log.id, planResult.errorMessage ?? "网络错误");
         const trace: AgentTrace = { planner: "llm", mode: "error", model: modelName, errorKind: "network_error" };
         return {
-          message: `⚠️ LLM 网络请求失败，请检查网络连接后重试。${planResult.errorMessage ? `\n详情：${planResult.errorMessage}` : ""}`,
+          message: this.composeBoundaryMessage(userInput, context, "unsupported_intent"),
           intent: { intent: "unknown", confidence: 0, args: {}, rawInput: userInput },
           actionLogId: log.id,
           metadata: { intent: "unknown", actionLogId: log.id, resultType: "failure", source: "llm", llmModel: modelName, agentTrace: trace },
@@ -263,7 +497,7 @@ export class AgentService {
         await this.logService.logFailure(log.id, planResult.errorMessage ?? "解析失败");
         const trace: AgentTrace = { planner: "llm", mode: "error", model: modelName, errorKind: "parse_error" };
         return {
-          message: `⚠️ 模型返回格式错误，无法解析响应。请稍后重试。${planResult.errorMessage ? `\n详情：${planResult.errorMessage}` : ""}`,
+          message: this.composeBoundaryMessage(userInput, context, "unsupported_intent"),
           intent: { intent: "unknown", confidence: 0, args: {}, rawInput: userInput },
           actionLogId: log.id,
           metadata: { intent: "unknown", actionLogId: log.id, resultType: "failure", source: "llm", llmModel: modelName, agentTrace: trace },
@@ -276,7 +510,7 @@ export class AgentService {
         await this.logService.logFailure(log.id, planResult.errorMessage ?? "fallback");
         const trace: AgentTrace = { planner: "llm", mode: "error", model: modelName, errorKind: "fallback" };
         return {
-          message: `⚠️ LLM 处理失败。${planResult.errorMessage ? `\n详情：${planResult.errorMessage}` : ""}`,
+          message: this.composeBoundaryMessage(userInput, context, "unsupported_intent"),
           intent: { intent: "unknown", confidence: 0, args: {}, rawInput: userInput },
           actionLogId: log.id,
           metadata: { intent: "unknown", actionLogId: log.id, resultType: "failure", source: "llm", llmModel: modelName, agentTrace: trace },
@@ -286,10 +520,9 @@ export class AgentService {
       case "clarification": {
         const log = await this.logService.logRequest(userInput, "unknown");
         await this.logService.logFailure(log.id, "LLM 追问：信息不足");
-        const question = planResult.clarifyingQuestion ?? "请提供更多信息以便我理解你的需求。";
         const trace: AgentTrace = { planner: "llm", mode: "clarification", model: modelName };
         return {
-          message: question,
+          message: this.composeBoundaryMessage(userInput, context, "clarification"),
           intent: { intent: "unknown", confidence: 0, args: {}, rawInput: userInput },
           actionLogId: log.id,
           metadata: {
@@ -304,7 +537,7 @@ export class AgentService {
         await this.logService.logFailure(log.id, "LLM 闲聊响应");
         const trace: AgentTrace = { planner: "llm", mode: "chitchat", model: modelName };
         return {
-          message: planResult.replyMessage ?? "好的。",
+          message: this.composeBoundaryMessage(userInput, context, "general_chat"),
           intent: { intent: "unknown", confidence: 0, args: {}, rawInput: userInput },
           actionLogId: log.id,
           metadata: {
@@ -319,7 +552,7 @@ export class AgentService {
         await this.logService.logFailure(log.id, "LLM 判断：超出能力范围");
         const trace: AgentTrace = { planner: "llm", mode: "unsupported", model: modelName };
         return {
-          message: planResult.replyMessage ?? "抱歉，该功能超出了 Time Manager 当前的能力范围，无法执行。",
+          message: this.composeBoundaryMessage(userInput, context, "unsupported_intent"),
           intent: { intent: "unknown", confidence: 0, args: {}, rawInput: userInput },
           actionLogId: log.id,
           metadata: {
@@ -355,7 +588,7 @@ export class AgentService {
         await this.logService.logFailure(log.id, "LLM 未知响应类型");
         const trace: AgentTrace = { planner: "llm", mode: "error", model: modelName, errorKind: "fallback" };
         return {
-          message: "⚠️ LLM 返回了未知的响应类型，请稍后重试。",
+          message: this.composeBoundaryMessage(userInput, context, "unsupported_intent"),
           intent: { intent: "unknown", confidence: 0, args: {}, rawInput: userInput },
           actionLogId: log.id,
           metadata: { intent: "unknown", actionLogId: log.id, resultType: "failure", source: "llm", llmModel: modelName, agentTrace: trace },
@@ -391,8 +624,7 @@ export class AgentService {
     if (parsed.intent === "unknown") {
       await this.logService.logFailure(log.id, "无法识别意图");
       return {
-        message:
-          "抱歉，我没有理解你的意思。你可以试试：\n- 创建任务\n- 查看今天安排\n- 安排任务到时间轴\n- 标记任务为完成\n- 删除任务",
+        message: this.composeBoundaryMessage(userInput, undefined, "unsupported_intent"),
         intent: parsed,
         actionLogId: log.id,
         metadata: {
@@ -409,7 +641,7 @@ export class AgentService {
     if (!toolName) {
       await this.logService.logFailure(log.id, `未映射的意图: ${parsed.intent}`);
       return {
-        message: "该功能暂未实现",
+        message: this.composeBoundaryMessage(userInput, undefined, "unsupported_intent"),
         intent: parsed,
         actionLogId: log.id,
         metadata: {
@@ -464,7 +696,7 @@ export class AgentService {
       };
 
       return {
-        message: `⚠️ 该操作需要确认：${plan.summary}\n请确认或取消。`,
+        message: this.composeBoundaryMessage(userInput, undefined, "confirmation_required"),
         intent: parsed,
         confirmationId: confirmation.id,
         actionLogId: log.id,
@@ -494,7 +726,12 @@ export class AgentService {
     };
 
     return {
-      message: result.message,
+      message: this.composeBoundaryMessage(
+        userInput,
+        undefined,
+        result.success ? "tool_success" : "tool_failure",
+        [result]
+      ),
       intent: parsed,
       toolResult: result,
       actionLogId: log.id,
@@ -544,7 +781,7 @@ export class AgentService {
       };
 
       return {
-        message: `⚠️ 该操作需要确认：${summary}\n请确认或取消。`,
+        message: this.composeBoundaryMessage(userInput, undefined, "confirmation_required"),
         intent: fakeParsedIntent,
         confirmationId: confirmation.id,
         actionLogId: log.id,
@@ -574,7 +811,12 @@ export class AgentService {
     };
 
     return {
-      message: result.message,
+      message: this.composeBoundaryMessage(
+        userInput,
+        undefined,
+        result.success ? "tool_success" : "tool_failure",
+        [result]
+      ),
       intent: fakeParsedIntent,
       toolResult: result,
       actionLogId: log.id,
@@ -588,14 +830,14 @@ export class AgentService {
     const confirmation = await this.confirmService.getById(confirmationId);
     if (!confirmation) {
       return {
-        message: "确认记录不存在或已过期",
+        message: this.composeBoundaryMessage("", undefined, "confirmation_missing"),
         intent: { intent: "unknown", confidence: 0, args: {}, rawInput: "" },
       };
     }
 
     if (confirmation.status !== "pending") {
       return {
-        message: `该操作已${confirmation.status === "confirmed" ? "确认" : "取消"}`,
+        message: this.composeBoundaryMessage("", undefined, "confirmation_stale"),
         intent: { intent: "unknown", confidence: 0, args: {}, rawInput: "" },
       };
     }
@@ -632,7 +874,12 @@ export class AgentService {
     };
 
     return {
-      message: result.message,
+      message: this.composeBoundaryMessage(
+        "",
+        undefined,
+        result.success ? "tool_success" : "tool_failure",
+        [result]
+      ),
       intent: {
         intent: confirmation.action_type as IntentType,
         confidence: 1,
@@ -684,7 +931,7 @@ export class AgentService {
     };
 
     return {
-      message: "已取消操作",
+      message: this.composeBoundaryMessage("", undefined, "confirmation_rejected"),
       intent: { intent: "unknown", confidence: 0, args: {}, rawInput: "" },
       actionLogId: log.id,
       metadata,
@@ -692,6 +939,48 @@ export class AgentService {
   }
 
   // ─── 私有辅助方法 ────────────────────────────────────────────────────────
+
+  private getConversationMemorySnapshot(): ConversationMemorySnapshot {
+    return {
+      lastCreatedTaskId: this.lastCreatedTaskId,
+      lastMentionedTaskIds: [...this.lastMentionedTaskIds],
+      lastScheduledTimeBlockIds: [...this.lastScheduledTimeBlockIds],
+      lastToolResults: [...this.lastToolResults],
+    };
+  }
+
+  private updateExperienceMemory(
+    frame: SemanticFrame,
+    _plan: ExperienceActionPlan,
+    result: AgentToolResult
+  ): void {
+    if (result.relatedTaskId) {
+      this.rememberMentionedTask(result.relatedTaskId);
+      if (frame.userGoal === "create_and_schedule_task") {
+        this.lastCreatedTaskId = result.relatedTaskId;
+      }
+    }
+
+    if (result.relatedTimeBlockId) {
+      this.lastScheduledTimeBlockIds = this.prependUnique(
+        this.lastScheduledTimeBlockIds,
+        result.relatedTimeBlockId
+      );
+    }
+
+    this.lastToolResults = [result, ...this.lastToolResults].slice(0, 5);
+  }
+
+  private rememberMentionedTask(taskId: string): void {
+    this.lastMentionedTaskIds = this.prependUnique(
+      this.lastMentionedTaskIds,
+      taskId
+    );
+  }
+
+  private prependUnique(values: string[], value: string): string[] {
+    return [value, ...values.filter((item) => item !== value)].slice(0, 5);
+  }
 
   private async resolveArgs(
     intent: ParsedIntent

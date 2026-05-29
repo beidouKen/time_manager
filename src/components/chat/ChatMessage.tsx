@@ -12,6 +12,8 @@ const MODE_LABEL: Record<string, string> = {
   chitchat: "闲聊",
   unsupported: "不支持",
   error: "错误",
+  direct_response: "自然回复",
+  query_schedule: "查询安排",
 };
 
 const ERROR_KIND_LABEL: Record<string, string> = {
@@ -119,8 +121,8 @@ export function ChatMessage({ message }: Props) {
                   isError ? "text-red-400" : "text-gray-400"
                 )}>
                   {isError
-                    ? `✕ ${trace.errorKind ? ERROR_KIND_LABEL[trace.errorKind] ?? trace.errorKind : "错误"}`
-                    : `✨ ${MODE_LABEL[traceMode ?? ""] ?? traceMode}`}
+                    ? `✕ ${trace.errorKind ? ERROR_KIND_LABEL[trace.errorKind] ?? "错误" : "错误"}`
+                    : `✨ ${MODE_LABEL[traceMode ?? ""] ?? "已处理"}`}
                 </span>
                 {llmModel && (
                   <span className="text-[10px] text-gray-300 leading-none">
