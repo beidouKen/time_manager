@@ -7,6 +7,7 @@ import { formatDateKey } from "@/agent/experience/dateFormatting";
 import { TaskService } from "@/services/TaskService";
 
 const DEFAULT_DURATION_MINUTES = 30;
+const REMINDER_DEFAULT_DURATION_MINUTES = 10;
 
 export class ActionPlanner {
   constructor(private taskService: TaskService) {}
@@ -39,8 +40,11 @@ export class ActionPlanner {
         const hasStartNow = frame.timeExpressions.some(
           (expr) => expr.normalized === "start_now"
         );
+        const absoluteStart = frame.timeExpressions.find(
+          (expr) => expr.normalized === "absolute" && expr.iso
+        );
 
-        if (!hasStartNow) {
+        if (!hasStartNow && !absoluteStart) {
           return {
             ...base,
             kind: "request_recommendation",
@@ -53,7 +57,9 @@ export class ActionPlanner {
           };
         }
 
-        const start = new Date(context.currentDatetime);
+        const start = new Date(
+          absoluteStart?.iso ?? context.currentDatetime
+        );
         const end = new Date(start.getTime() + duration * 60 * 1000);
         const timelineDate = formatDateKey(start);
 
@@ -68,9 +74,68 @@ export class ActionPlanner {
             estimated_duration_minutes: duration,
             start_time: start.toISOString(),
             end_time: end.toISOString(),
+            start_label: absoluteStart?.sourceText ?? "现在开始",
           },
           summary: "create and schedule task",
           refreshHints: { tasks: true, timeline: true, timelineDate },
+        };
+      }
+
+      case "create_reminder": {
+        const anchorExpr = frame.timeExpressions.find(
+          (e) => e.normalized === "absolute" && e.iso
+        );
+        const startTime = anchorExpr?.iso ?? context.currentDatetime;
+        const duration =
+          frame.durationExpressions[0]?.minutes ?? REMINDER_DEFAULT_DURATION_MINUTES;
+        const end = new Date(
+          new Date(startTime).getTime() + duration * 60 * 1000
+        );
+        const timelineDate = formatDateKey(new Date(startTime));
+        const title = frame.extractedTitle ?? "提醒";
+
+        return {
+          ...base,
+          kind: "tool",
+          toolName: "create_time_block",
+          params: {
+            title,
+            type: "event",
+            start_time: startTime,
+            end_time: end.toISOString(),
+            source: "system",
+          },
+          summary: "create reminder",
+          refreshHints: { timeline: true, timelineDate },
+        };
+      }
+
+      case "delete_task": {
+        const taskId =
+          context.lastCreatedTaskId ?? context.lastMentionedTaskIds[0] ?? null;
+        const keyword = frame.objectReferences[0]?.keyword;
+        const resolvedTaskId =
+          taskId ?? (await this.findTaskIdByKeyword(keyword));
+        const title = frame.extractedTitle ?? keyword ?? "该任务";
+
+        if (!resolvedTaskId) {
+          return {
+            ...base,
+            kind: "direct_response",
+            params: { currentDatetime: context.currentDatetime },
+            summary: "delete_task_not_found",
+          };
+        }
+
+        return {
+          ...base,
+          kind: "tool",
+          toolName: "delete_task",
+          requiresConfirmation: true,
+          riskLevel: "destructive",
+          params: { taskId: resolvedTaskId, title },
+          summary: `删除任务「${title}」`,
+          refreshHints: { tasks: true, timeline: true },
         };
       }
 
@@ -100,6 +165,12 @@ export class ActionPlanner {
           summary: "general_chat",
         };
     }
+  }
+
+  private async findTaskIdByKeyword(
+    keyword: string | undefined
+  ): Promise<string | null> {
+    return this.findSingleTaskId(keyword);
   }
 
   private async findSingleTaskId(

@@ -10,6 +10,18 @@ export class SemanticFrameParser {
     const title = this.extractTitle(normalized, userGoal);
     const keyword = this.extractKeyword(normalized, userGoal);
     const startNow = /从现在开始|现在开始|马上开始|立即开始/.test(normalized);
+    const timeAnchor = this.parseTimeAnchor(normalized);
+
+    const timeExpressions: SemanticFrame["timeExpressions"] = [];
+    if (startNow) {
+      timeExpressions.push({ sourceText: "从现在开始", normalized: "start_now" });
+    } else if (timeAnchor) {
+      timeExpressions.push({
+        sourceText: timeAnchor.sourceText,
+        normalized: "absolute",
+        iso: timeAnchor.iso,
+      });
+    }
 
     return {
       userGoal,
@@ -24,9 +36,7 @@ export class SemanticFrameParser {
             },
           ]
         : [],
-      timeExpressions: startNow
-        ? [{ sourceText: "从现在开始", normalized: "start_now" }]
-        : [],
+      timeExpressions,
       durationExpressions: duration
         ? [{ sourceText: `${duration}分钟`, minutes: duration }]
         : [],
@@ -41,18 +51,20 @@ export class SemanticFrameParser {
   }
 
   private detectGoal(input: string): SemanticUserGoal {
-    if (/^(你好|您好|哈喽|hello|hi)[！!。.\s]*$/i.test(input)) {
-      return "greeting";
+    if (/现在.*(时候|时间|几点)|几点了|几点啊|当前时间/.test(input)) {
+      return "ask_current_time";
     }
 
     if (
-      /(你是谁|你是.*谁|介绍一下你自己|你能做什么|你可以做什么)/.test(input)
+      /(删除|删掉|去掉|不要了).*(任务|待办|这个|那个|刚刚|刚才)/.test(input) ||
+      /(任务|待办|这个|那个|刚刚|刚才).*(删除|删掉|去掉|不要了)/.test(input) ||
+      /^删除.+/.test(input)
     ) {
-      return "ask_assistant_identity";
+      return "delete_task";
     }
 
-    if (/现在.*(时候|时间|几点)|几点了|几点啊|当前时间/.test(input)) {
-      return "ask_current_time";
+    if (/(提醒|提示)我|^提醒/.test(input)) {
+      return "create_reminder";
     }
 
     if (/(安排在哪|排在哪|什么时候|时间段)/.test(input)) {
@@ -78,29 +90,131 @@ export class SemanticFrameParser {
     return undefined;
   }
 
+  /**
+   * Parse absolute time expressions like:
+   * "明天下午三点", "今天14:30", "下午两点半", "明天上午10点"
+   * Returns { sourceText, iso } where iso is the inferred UTC ISO string
+   * relative to "now" (new Date()).
+   */
+  parseTimeAnchor(
+    input: string
+  ): { sourceText: string; iso: string } | undefined {
+    const now = new Date();
+    const today = new Date(now);
+    today.setHours(0, 0, 0, 0);
+
+    // Day offset
+    let dayOffset = 0;
+    let dayMatch = "";
+    if (/明天/.test(input)) { dayOffset = 1; dayMatch = "明天"; }
+    else if (/后天/.test(input)) { dayOffset = 2; dayMatch = "后天"; }
+    else if (/今天|今晚|今早/.test(input)) { dayOffset = 0; dayMatch = input.match(/今天|今晚|今早/)?.[0] ?? ""; }
+
+    // Chinese hour words
+    const chineseHourMap: Record<string, number> = {
+      一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8,
+      九: 9, 十: 10, 十一: 11, 十二: 12,
+    };
+
+    // AM/PM modifier
+    let periodOffset = 0;
+    let periodMatch = "";
+    if (/上午|早上/.test(input)) { periodOffset = 0; periodMatch = input.match(/上午|早上/)?.[0] ?? ""; }
+    else if (/下午|傍晚/.test(input)) { periodOffset = 12; periodMatch = input.match(/下午|傍晚/)?.[0] ?? ""; }
+    else if (/晚上|夜里/.test(input)) { periodOffset = 12; periodMatch = input.match(/晚上|夜里/)?.[0] ?? ""; }
+    else if (/中午/.test(input)) { periodOffset = 0; periodMatch = "中午"; }
+
+    // Numeric time "14:30" or "14点30"
+    const numericMatch = input.match(/(\d{1,2})[:：点时](\d{0,2})/);
+    if (numericMatch) {
+      let hour = Number(numericMatch[1]);
+      const minute = numericMatch[2] ? Number(numericMatch[2]) : 0;
+      if (periodOffset === 12 && hour < 12) hour += 12;
+      if (periodOffset === 0 && periodMatch === "中午" && hour < 12) hour = 12;
+
+      const target = new Date(today);
+      target.setDate(today.getDate() + dayOffset);
+      target.setHours(hour, minute, 0, 0);
+
+      const sourceText = `${dayMatch}${periodMatch}${numericMatch[0]}`;
+      return { sourceText, iso: target.toISOString() };
+    }
+
+    // Chinese hour word "三点", "两点半"
+    const chineseTimeRe = new RegExp(
+      `(${Object.keys(chineseHourMap).join("|")})点(半)?`
+    );
+    const chineseMatch = input.match(chineseTimeRe);
+    if (chineseMatch) {
+      let hour = chineseHourMap[chineseMatch[1]] ?? 0;
+      const halfHour = chineseMatch[2] === "半";
+      if (periodOffset === 12 && hour < 12) hour += 12;
+      if (periodOffset === 0 && periodMatch === "中午" && hour < 12) hour = 12;
+
+      const target = new Date(today);
+      target.setDate(today.getDate() + dayOffset);
+      target.setHours(hour, halfHour ? 30 : 0, 0, 0);
+
+      const sourceText = `${dayMatch}${periodMatch}${chineseMatch[0]}`;
+      return { sourceText, iso: target.toISOString() };
+    }
+
+    // Only day offset without time (e.g. "明天" alone) — return undefined so upstream treats as no anchor
+    return undefined;
+  }
+
   private extractTitle(
     input: string,
     userGoal: SemanticUserGoal
   ): string | undefined {
-    if (userGoal !== "create_and_schedule_task") return undefined;
-
-    if (input.includes("临时") && input.includes("写作任务")) {
-      return "临时写作任务";
+    if (
+      userGoal !== "create_and_schedule_task" &&
+      userGoal !== "create_reminder" &&
+      userGoal !== "delete_task"
+    ) {
+      return undefined;
     }
 
-    const taskMatch = input.match(
-      /(?:有一个|有个|创建|安排|排一个|排个)?\s*(.+?)(?:任务|待办)/
-    );
-    const rawTitle = taskMatch?.[1]?.replace(/^(一个|个|临时的|临时)\s*/, "").trim();
-    if (rawTitle) return `${rawTitle}任务`;
-    return "新任务";
+    // For reminder: extract what comes after "提醒我...开/做/..."
+    if (userGoal === "create_reminder") {
+      const reminderMatch = input.match(/提醒(?:我)?(.+?)(?:的?事|$)/);
+      if (reminderMatch) {
+        const raw = reminderMatch[1].trim().replace(/^(要|去|把|在|[^\w])+/, "");
+        return raw || "提醒";
+      }
+      return "提醒";
+    }
+
+    const taskMatch = input.match(/(.+?)(?:任务|待办)/);
+    let raw = (taskMatch?.[1] ?? "").trim();
+
+    const FILLERS = [
+      "我", "现在", "有一个", "有个", "有", "一个", "个",
+      "临时的", "临时", "帮我", "给我", "创建", "安排",
+      "排一个", "排个", "新建", "添加", "删除", "删掉",
+    ];
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const f of FILLERS) {
+        if (raw.startsWith(f)) {
+          raw = raw.slice(f.length).trimStart();
+          changed = true;
+        }
+      }
+    }
+
+    return raw ? `${raw}任务` : "新任务";
   }
 
   private extractKeyword(
     input: string,
     userGoal: SemanticUserGoal
   ): string | undefined {
-    if (userGoal === "create_and_schedule_task") {
+    if (
+      userGoal === "create_and_schedule_task" ||
+      userGoal === "delete_task"
+    ) {
       return this.extractTitle(input, userGoal);
     }
 

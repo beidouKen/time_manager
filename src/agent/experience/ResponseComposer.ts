@@ -24,6 +24,7 @@ export type ResponseKind =
   | "meta_identity"
   | "unsupported_intent"
   | "clarification"
+  | "reminder_created"
   | "tool_success"
   | "tool_failure"
   | "verification_failed"
@@ -75,13 +76,15 @@ export class ResponseComposer {
       case "verification_failed":
         return "我执行后发现结果和你的要求不一致，所以没有把它当作成功处理。";
       case "confirmation_required":
-        return "这个操作需要你确认后我再执行。";
+        return `确认要删除「${plan.params.title ?? "该任务"}」吗？这个操作无法撤销。`;
       case "confirmation_missing":
         return "这条确认请求已经不存在或过期了。";
       case "confirmation_stale":
         return "这条确认请求已经处理过了。";
       case "confirmation_rejected":
         return "已取消这次操作。";
+      case "reminder_created":
+        return this.composeReminderCreated(context, plan);
       case "tool_success":
         return this.composeToolSuccess(context, frame, plan, queryBlocks);
     }
@@ -92,8 +95,6 @@ export class ResponseComposer {
     toolResults: AgentToolResult[]
   ): ResponseKind {
     if (
-      frame.userGoal === "greeting" ||
-      frame.userGoal === "ask_assistant_identity" ||
       frame.userGoal === "ask_current_time" ||
       frame.userGoal === "general_chat" ||
       frame.userGoal === "unsupported_intent"
@@ -104,6 +105,16 @@ export class ResponseComposer {
     const result = toolResults[0];
     if (result && !result.success) return "tool_failure";
     return "tool_success";
+  }
+
+  private composeReminderCreated(
+    context: AgentExperienceContext,
+    plan: ExperienceActionPlan
+  ): string {
+    const start = String(plan.params.start_time ?? "");
+    const title = String(plan.params.title ?? "提醒");
+    if (!start) return `已为你设置提醒「${title}」。`;
+    return `已为你设置提醒「${title}」，时间是 ${formatTimeInZone(start, context.timezone)}。`;
   }
 
   private composeToolSuccess(
@@ -117,7 +128,12 @@ export class ResponseComposer {
       const end = String(plan.params.end_time);
       const duration = Number(plan.params.duration);
       const title = String(plan.params.title);
-      return `我已把‘${title}’安排到现在开始，预计 ${duration} 分钟，时间段是 ${formatTimeInZone(start, context.timezone)} - ${formatTimeInZone(end, context.timezone)}。`;
+      const startLabel = String(plan.params.start_label ?? "现在开始");
+      return `我已把\u2018${title}\u2019安排到${startLabel}，预计 ${duration} 分钟，时间段是 ${formatTimeInZone(start, context.timezone)} - ${formatTimeInZone(end, context.timezone)}。`;
+    }
+
+    if (frame.userGoal === "create_reminder") {
+      return this.composeReminderCreated(context, plan);
     }
 
     if (frame.userGoal === "query_schedule") {

@@ -159,8 +159,11 @@ function expectNoInternalNames(message: string): void {
   expect(message).not.toContain("用户询问助手身份");
   expect(message).not.toContain("ask_current_time");
   expect(message).not.toContain("userGoal");
-  expect(message).not.toContain("tool");
-  expect(message).not.toContain("action");
+  expect(message).not.toContain("SemanticFrameParser");
+  expect(message).not.toContain("ActionPlanner");
+  expect(message).not.toContain("tool_success");
+  expect(message).not.toContain("create_reminder");
+  expect(message).not.toContain("delete_task");
 }
 
 describe("V3.6.1 Agent Experience Pipeline", () => {
@@ -248,7 +251,7 @@ describe("V3.6.1 Agent Experience Pipeline", () => {
     );
 
     expect(tasks.tasks).toHaveLength(1);
-    expect(tasks.tasks[0].title).toBe("临时写作任务");
+    expect(tasks.tasks[0].title).toBe("写作任务");
     expect(blocks.blocks).toHaveLength(1);
     expect(blocks.blocks[0].task_id).toBe(tasks.tasks[0].id);
     expect(
@@ -262,7 +265,7 @@ describe("V3.6.1 Agent Experience Pipeline", () => {
       timeline: true,
       timelineDate: "2026-05-27",
     });
-    expect(response.message).toContain("我已把‘临时写作任务’安排到现在开始");
+    expect(response.message).toContain("我已把‘写作任务’安排到现在开始");
     expect(response.message).toContain("20:17 - 20:27");
     expectNoInternalNames(response.message);
   });
@@ -288,6 +291,24 @@ describe("V3.6.1 Agent Experience Pipeline", () => {
     );
     expect(response.metadata?.agentTrace?.actionPlan?.params.taskId).toBe(
       "task-1"
+    );
+  });
+
+  it("creates a reminder event time_block from natural language", async () => {
+    const { agent, blocks } = createAgentHarness();
+
+    // NOW is 2026-05-27T12:17:00.000Z (UTC) = 20:17 CST
+    // "今天下午三点" in Shanghai = 15:00 CST = 07:00 UTC
+    const response = await agent.processInput("今天下午三点提醒我开会", {
+      timezone: TIMEZONE,
+    });
+
+    expect(blocks.blocks.length).toBe(1);
+    expect(blocks.blocks[0].type).toBe("event");
+    expect(response.message).toContain("已为你设置提醒");
+    expectNoInternalNames(response.message);
+    expect(response.metadata?.agentTrace?.semanticFrame?.userGoal).toBe(
+      "create_reminder"
     );
   });
 });

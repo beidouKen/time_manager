@@ -120,10 +120,10 @@ export interface AgentHandlerResult {
 }
 
 export type SemanticUserGoal =
-  | "greeting"
-  | "ask_assistant_identity"
   | "ask_current_time"
   | "create_and_schedule_task"
+  | "create_reminder"
+  | "delete_task"
   | "query_schedule"
   | "general_chat"
   | "unsupported_intent";
@@ -137,7 +137,9 @@ export interface SemanticFrame {
   }>;
   timeExpressions: Array<{
     sourceText: string;
-    normalized?: "start_now" | string;
+    normalized?: "start_now" | "absolute" | string;
+    /** ISO 8601 string, present when normalized === "absolute" */
+    iso?: string;
   }>;
   durationExpressions: Array<{
     sourceText: string;

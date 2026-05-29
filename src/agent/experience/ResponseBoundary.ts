@@ -14,7 +14,7 @@ interface FinalizeInput {
 }
 
 const INTERNAL_NAME_PATTERN =
-  /\b(userGoal|tool|action|processWith|ToolRouter|LLMPlanner|ActionPlanner)\b/gi;
+  /\b(userGoal|processWith|ToolRouter|LLMPlanner|ActionPlanner|SemanticFrameParser|AgentDomainRouter|semantic_frame|request_recommendation|tool_success|tool_failure|confirmation_required|delete_task|create_reminder|create_and_schedule_task|query_schedule|ask_current_time|unsupported_intent|general_chat)\b/gi;
 
 export class ResponseBoundary {
   private composer = new ResponseComposer();
@@ -47,18 +47,41 @@ export class ResponseBoundary {
   }
 
   private sanitize(message: string): string {
-    const trimmed = message.trim();
-    if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+    let text = message.trim();
+
+    // Unwrap markdown-fenced JSON: ```json\n{...}\n```
+    const fencedJsonMatch = text.match(/^```(?:json)?\s*\n([\s\S]*?)\n```\s*$/);
+    if (fencedJsonMatch) {
       try {
-        const parsed = JSON.parse(trimmed) as { message?: unknown };
-        if (typeof parsed.message === "string" && parsed.message.trim()) {
-          return parsed.message.trim();
+        const parsed = JSON.parse(fencedJsonMatch[1]) as Record<string, unknown>;
+        const extracted = parsed.message ?? parsed.reply ?? parsed.content;
+        if (typeof extracted === "string" && extracted.trim()) {
+          text = extracted.trim();
         }
       } catch {
-        // noop
+        // keep original
       }
     }
 
-    return trimmed.replace(INTERNAL_NAME_PATTERN, "").replace(/\s{2,}/g, " ").trim();
+    // Unwrap bare JSON object
+    if (text.startsWith("{") && text.endsWith("}")) {
+      try {
+        const parsed = JSON.parse(text) as { message?: unknown; reply?: unknown };
+        const extracted = parsed.message ?? parsed.reply;
+        if (typeof extracted === "string" && extracted.trim()) {
+          text = extracted.trim();
+        }
+      } catch {
+        // keep original
+      }
+    }
+
+    // Remove internal names
+    text = text.replace(INTERNAL_NAME_PATTERN, "").replace(/\s{2,}/g, " ").trim();
+
+    // Collapse 3+ consecutive newlines to a single blank line
+    text = text.replace(/\n{3,}/g, "\n\n");
+
+    return text;
   }
 }

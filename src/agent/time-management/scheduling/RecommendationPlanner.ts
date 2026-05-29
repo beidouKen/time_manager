@@ -16,9 +16,11 @@ export class RecommendationPlanner {
   async plan(args: {
     date: Date;
     durationMinutes: number;
+    timezone?: string;
   }): Promise<RecommendationCandidate[]> {
+    const timezone = args.timezone ?? "Asia/Shanghai";
     const availability: AvailabilitySlot[] =
-      await this.availabilityProvider.getAvailability(args.date);
+      await this.availabilityProvider.getAvailability(args.date, timezone);
     return this.reasoner.rank(availability, args.durationMinutes);
   }
 }

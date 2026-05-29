@@ -3,6 +3,7 @@ import {
   ConversationContextBuilder,
   type ConversationMemorySnapshot,
 } from "@/agent/experience/ConversationContextBuilder";
+import { formatTimeInZone } from "@/agent/experience/dateFormatting";
 import { ResponseBoundary } from "@/agent/experience/ResponseBoundary";
 import { SemanticFrameParser } from "@/agent/experience/SemanticFrameParser";
 import { ToolRouter } from "@/agent/ToolRouter";
@@ -17,9 +18,11 @@ import type {
   SemanticFrame,
 } from "@/agent/types";
 import type { ChatMessageMetadata, IntentType } from "@/agent/types";
+import { toLegacyRiskLevel } from "@/agent/types";
 import type { TimeBlock } from "@/types/timeblock.types";
 import { TaskService } from "@/services/TaskService";
 import { TimeBlockService } from "@/services/TimeBlockService";
+import { ConfirmationService } from "@/services/ConfirmationService";
 
 interface ActionLogPort {
   logRequest(userInput: string, detectedIntent?: string): Promise<{ id: string }>;
@@ -41,7 +44,7 @@ interface ProcessInputContext {
 }
 
 export interface TimeManagementHandleResult {
-  response: AgentHandlerResult;
+  response: AgentHandlerResult & { confirmationId?: string };
   metadata: ChatMessageMetadata;
   intent: {
     intent: IntentType;
@@ -60,6 +63,7 @@ interface TimeManagementAgentDeps {
   semanticFrameParser: SemanticFrameParser;
   experienceContextBuilder: ConversationContextBuilder;
   responseBoundary: ResponseBoundary;
+  confirmationService: ConfirmationService;
 }
 
 export class TimeManagementAgent {
@@ -93,11 +97,81 @@ export class TimeManagementAgent {
     const toolResults: AgentToolResult[] = [];
     let queryBlocks: TimeBlock[] | undefined;
     let actionLogId: string | undefined;
+    let confirmationId: string | undefined;
 
     const log = await this.deps.logService.logRequest(userInput, semanticFrame.userGoal);
     actionLogId = log.id;
 
     if (actionPlan.kind === "tool" && actionPlan.toolName) {
+      // Confirmation gate: destructive operations require confirmation before execution
+      if (actionPlan.requiresConfirmation) {
+        const pending = await this.deps.confirmationService.createConfirmation({
+          action_type: semanticFrame.userGoal,
+          tool_name: actionPlan.toolName,
+          tool_args_json: JSON.stringify(actionPlan.params),
+          risk_level: toLegacyRiskLevel(actionPlan.riskLevel),
+          description: actionPlan.summary,
+        });
+        confirmationId = pending.id;
+        await this.deps.logService.logSuccess(log.id, {
+          kind: "pending_confirmation",
+          confirmationId,
+        });
+
+        const finalResponse = this.deps.responseBoundary.finalize({
+          context,
+          frame: semanticFrame,
+          plan: actionPlan,
+          result: {
+            domain: "time_management",
+            responseKind: "confirmation_required",
+          },
+        });
+
+        const trace: AgentTrace = {
+          planner: "experience",
+          domain: "time_management",
+          mode: "clarification",
+          rawInput: userInput,
+          contextSnapshot: context,
+          semanticFrame,
+          actionPlan,
+          toolResults: [],
+          finalResponse,
+        };
+
+        const metadata: ChatMessageMetadata = {
+          intent: semanticFrame.userGoal,
+          toolName: actionPlan.toolName,
+          actionLogId,
+          confirmationId,
+          resultType: "pending_confirmation",
+          source: "llm",
+          confidence: semanticFrame.confidence,
+          llmResponseType: "clarification",
+          agentTrace: trace,
+        };
+
+        return {
+          response: {
+            domain: "time_management",
+            message: finalResponse,
+            toolResults: [],
+            refreshHints: undefined,
+            metadata,
+            confirmationId,
+          },
+          metadata,
+          intent: {
+            intent: "unknown",
+            confidence: semanticFrame.confidence,
+            args: actionPlan.params,
+            rawInput: userInput,
+          },
+        };
+      }
+
+      // Normal tool execution (no confirmation required)
       await this.deps.logService.logToolExecution(
         log.id,
         actionPlan.toolName,
@@ -143,13 +217,31 @@ export class TimeManagementAgent {
       const candidates = await this.recommendationPlanner.plan({
         date: new Date(context.currentDatetime),
         durationMinutes: Number.isFinite(duration) ? duration : 30,
+        timezone: context.timezone,
       });
       if (candidates.length > 0) {
-        actionPlan.params.recommendation = candidates[0];
+        const recommendation = candidates[0];
+        actionPlan.params.recommendation = recommendation;
+        const pending = await this.deps.confirmationService.createConfirmation({
+          action_type: semanticFrame.userGoal,
+          tool_name: "schedule_task",
+          tool_args_json: JSON.stringify({
+            title: actionPlan.params.title ?? semanticFrame.extractedTitle ?? "新任务",
+            category: actionPlan.params.category,
+            duration,
+            estimated_duration_minutes: duration,
+            start_time: recommendation.start,
+            end_time: recommendation.end,
+          }),
+          risk_level: "low",
+          description: `按推荐时间安排「${actionPlan.params.title ?? "新任务"}」`,
+        });
+        confirmationId = pending.id;
       }
       await this.deps.logService.logSuccess(log.id, {
         kind: actionPlan.kind,
         recommendationCount: candidates.length,
+        confirmationId,
       });
     } else {
       await this.deps.logService.logSuccess(log.id, {
@@ -168,9 +260,12 @@ export class TimeManagementAgent {
           actionPlan.kind === "request_recommendation" ? "clarification" : undefined,
         message:
           actionPlan.kind === "request_recommendation"
-            ? this.composeRecommendationMessage(actionPlan.params.recommendation as
-                | { start: string; end: string }
-                | undefined)
+            ? this.composeRecommendationMessage(
+                actionPlan.params.recommendation as
+                  | { start: string; end: string }
+                  | undefined,
+                context.timezone
+              )
             : undefined,
         toolResults,
         queryBlocks,
@@ -211,6 +306,7 @@ export class TimeManagementAgent {
       intent: semanticFrame.userGoal,
       toolName: actionPlan.toolName,
       actionLogId,
+      confirmationId,
       relatedTaskId:
         primaryResult?.relatedTaskId ??
         (actionPlan.params.taskId as string | undefined),
@@ -230,6 +326,7 @@ export class TimeManagementAgent {
         queryBlocks,
         refreshHints: actionPlan.refreshHints,
         metadata,
+        confirmationId,
       },
       metadata,
       intent: {
@@ -242,15 +339,14 @@ export class TimeManagementAgent {
   }
 
   private composeRecommendationMessage(
-    recommendation: { start: string; end: string } | undefined
+    recommendation: { start: string; end: string } | undefined,
+    timezone: string
   ): string {
     if (!recommendation) {
       return "我还需要一个更具体的时间偏好。比如今天上午、下午，或者从几点开始。";
     }
-    const start = new Date(recommendation.start);
-    const end = new Date(recommendation.end);
-    const hhmm = (d: Date) =>
-      `${`${d.getHours()}`.padStart(2, "0")}:${`${d.getMinutes()}`.padStart(2, "0")}`;
-    return `我建议安排在 ${hhmm(start)} - ${hhmm(end)}，需要我按这个时间来安排吗？`;
+    const startStr = formatTimeInZone(recommendation.start, timezone);
+    const endStr = formatTimeInZone(recommendation.end, timezone);
+    return `我建议安排在 ${startStr} - ${endStr}，需要我按这个时间来安排吗？`;
   }
 }

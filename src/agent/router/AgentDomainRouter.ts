@@ -2,6 +2,9 @@ import type { AgentDomain, AgentRouteResult } from "@/agent/types";
 
 const LOW_SIGNAL_PATTERN = /^[\s\p{P}\p{S}]*$/u;
 
+const TIME_MGMT_PATTERN =
+  /(提醒|提示我|提醒我|remind)|(今天|明天|后天|今晚|今早|明早|周[一二三四五六日])|(上午|下午|晚上|早上|中午|凌晨)(\d|半|点|时)?|\d+\s*(点|:\d+)|半小时|一小时|一会|稍后|过(几|半)小时|(现在.*(时候|时间|几点)|几点了|几点啊|当前时间)|(任务|安排|日程|时间块|待办|计划)|(创建|新建|添加|删除|取消|改成|挪到)\s*(任务|时间块)/u;
+
 export class AgentDomainRouter {
   classify(rawInput: string): AgentRouteResult {
     const input = rawInput.trim();
@@ -28,11 +31,7 @@ export class AgentDomainRouter {
       return "external_info";
     }
 
-    if (
-      /(现在.*(时候|时间|几点)|几点了|几点啊|当前时间|任务|安排|日程|时间块|待办)/.test(
-        input
-      )
-    ) {
+    if (TIME_MGMT_PATTERN.test(input)) {
       return "time_management";
     }
 

@@ -5,11 +5,9 @@ import {
   ConversationContextBuilder,
   type ConversationMemorySnapshot,
 } from "@/agent/experience/ConversationContextBuilder";
+import { formatDateKey } from "@/agent/experience/dateFormatting";
 import { ResponseBoundary } from "@/agent/experience/ResponseBoundary";
-import {
-  ResponseComposer,
-  type ResponseKind,
-} from "@/agent/experience/ResponseComposer";
+import type { ResponseKind } from "@/agent/experience/ResponseComposer";
 import { SemanticFrameParser } from "@/agent/experience/SemanticFrameParser";
 import { AgentDomainRouter } from "@/agent/router/AgentDomainRouter";
 import { TimeManagementAgent } from "@/agent/time-management/TimeManagementAgent";
@@ -153,7 +151,6 @@ export class AgentService {
   private experienceContextBuilder: ConversationContextBuilder;
   private semanticFrameParser: SemanticFrameParser;
   private actionPlanner: ActionPlanner;
-  private responseComposer: ResponseComposer;
   private responseBoundary: ResponseBoundary;
   private domainRouter: AgentDomainRouter;
   private timeManagementAgent: TimeManagementAgent;
@@ -175,7 +172,6 @@ export class AgentService {
     this.experienceContextBuilder = new ConversationContextBuilder();
     this.semanticFrameParser = new SemanticFrameParser();
     this.actionPlanner = new ActionPlanner(this.taskService);
-    this.responseComposer = new ResponseComposer();
     this.responseBoundary = new ResponseBoundary();
     this.domainRouter = new AgentDomainRouter();
     this.timeManagementAgent = new TimeManagementAgent({
@@ -187,6 +183,7 @@ export class AgentService {
       semanticFrameParser: this.semanticFrameParser,
       experienceContextBuilder: this.experienceContextBuilder,
       responseBoundary: this.responseBoundary,
+      confirmationService: this.confirmService,
     });
     this.handlers = new Map<AgentDomain, AgentHandler>([
       ["general_chat", new LLMDirectHandler("general_chat")],
@@ -264,6 +261,7 @@ export class AgentService {
         toolResult: handled.response.toolResults?.[0],
         refreshHints: handled.response.refreshHints,
         actionLogId: handled.metadata.actionLogId,
+        confirmationId: handled.response.confirmationId,
         metadata: handled.metadata,
       };
     }
@@ -318,17 +316,8 @@ export class AgentService {
   }
 
   private buildRouterFrame(domain: AgentDomain, userInput: string): SemanticFrame {
-    const goal =
-      domain === "assistant_meta"
-        ? "ask_assistant_identity"
-        : domain === "general_chat"
-          ? "greeting"
-        : domain === "time_management"
-          ? "ask_current_time"
-          : "general_chat";
-
     return {
-      userGoal: goal,
+      userGoal: "general_chat",
       objectReferences: [],
       timeExpressions: [],
       durationExpressions: [],
@@ -381,12 +370,15 @@ export class AgentService {
       createdAt: new Date().toISOString(),
     };
 
-    return this.responseComposer.compose({
+    return this.responseBoundary.finalize({
       context: experienceContext,
       frame: semanticFrame,
       plan,
-      toolResults,
-      responseKind,
+      result: {
+        domain: "general_chat",
+        responseKind,
+        toolResults,
+      },
     });
   }
 
@@ -440,6 +432,11 @@ export class AgentService {
       resultType: result.success ? "success" : "failure",
       source: "chat",
     };
+    const refreshHints = this.buildConfirmationRefreshHints(
+      confirmation.tool_name,
+      args,
+      result
+    );
 
     return {
       message: this.composeBoundaryMessage(
@@ -457,6 +454,7 @@ export class AgentService {
       toolResult: result,
       actionLogId: log.id,
       metadata,
+      refreshHints,
     };
   }
 
@@ -560,6 +558,42 @@ export class AgentService {
         if (task.id && typeof task.id === "string") return;
       }
     }
+  }
+
+  private buildConfirmationRefreshHints(
+    toolName: string,
+    args: Record<string, unknown>,
+    result: AgentToolResult
+  ): AgentRefreshHints | undefined {
+    if (!result.success) return undefined;
+
+    const startTime =
+      typeof args.start_time === "string" ? args.start_time : undefined;
+    const timelineDate = startTime
+      ? formatDateKey(new Date(startTime))
+      : undefined;
+
+    if (toolName === "schedule_task") {
+      return { tasks: true, timeline: true, timelineDate };
+    }
+
+    if (toolName === "create_time_block") {
+      return { timeline: true, timelineDate };
+    }
+
+    if (toolName === "delete_task") {
+      return { tasks: true, timeline: true };
+    }
+
+    if (toolName === "delete_time_block" || toolName === "update_time_block") {
+      return { timeline: true, timelineDate };
+    }
+
+    if (toolName === "create_task" || toolName === "update_task") {
+      return { tasks: true };
+    }
+
+    return undefined;
   }
 
   // ─── V3.5-B：Delay / Feedback 重排方案提议 ────────────────────────────────
