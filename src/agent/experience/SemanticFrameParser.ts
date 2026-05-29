@@ -55,18 +55,15 @@ export class SemanticFrameParser {
       return "ask_current_time";
     }
 
-    if (
-      /从现在开始|现在开始|马上开始|立即开始/.test(input) &&
-      /(任务|待办|写作)/.test(input)
-    ) {
-      return "create_and_schedule_task";
-    }
-
     if (/(安排在哪|排在哪|什么时候|时间段)/.test(input)) {
       return "query_schedule";
     }
 
-    if (input.length > 0) return "unsupported_intent";
+    if (/(任务|待办|安排|排一下|写作)/.test(input)) {
+      return "create_and_schedule_task";
+    }
+
+    if (input.length > 0) return "general_chat";
     return "general_chat";
   }
 
@@ -91,13 +88,11 @@ export class SemanticFrameParser {
       return "临时写作任务";
     }
 
-    const taskMatch = input.match(/(?:一个|个)?(.+?任务)/);
-    const rawTitle = taskMatch?.[1]
-      ?.replace(/^(临时的|一个|个)/, "临时")
-      .replace(/的/g, "")
-      .trim();
-
-    if (rawTitle) return rawTitle;
+    const taskMatch = input.match(
+      /(?:有一个|有个|创建|安排|排一个|排个)?\s*(.+?)(?:任务|待办)/
+    );
+    const rawTitle = taskMatch?.[1]?.replace(/^(一个|个|临时的|临时)\s*/, "").trim();
+    if (rawTitle) return `${rawTitle}任务`;
     return "新任务";
   }
 
@@ -112,7 +107,6 @@ export class SemanticFrameParser {
     if (userGoal !== "query_schedule") return undefined;
 
     if (/刚刚|刚才|那个|这个|它/.test(input)) return "刚刚那个任务";
-    if (input.includes("写作任务")) return "写作任务";
 
     const keywordMatch = input.match(/(.+?任务)/);
     return keywordMatch?.[1]?.trim();

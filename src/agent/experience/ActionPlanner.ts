@@ -24,10 +24,7 @@ export class ActionPlanner {
     };
 
     switch (frame.userGoal) {
-      case "greeting":
-      case "ask_assistant_identity":
       case "ask_current_time":
-      case "unsupported_intent":
       case "general_chat":
         return {
           ...base,
@@ -39,6 +36,23 @@ export class ActionPlanner {
       case "create_and_schedule_task": {
         const duration =
           frame.durationExpressions[0]?.minutes ?? DEFAULT_DURATION_MINUTES;
+        const hasStartNow = frame.timeExpressions.some(
+          (expr) => expr.normalized === "start_now"
+        );
+
+        if (!hasStartNow) {
+          return {
+            ...base,
+            kind: "request_recommendation",
+            params: {
+              title: frame.extractedTitle ?? "新任务",
+              duration,
+              category: frame.category,
+            },
+            summary: "request recommendation",
+          };
+        }
+
         const start = new Date(context.currentDatetime);
         const end = new Date(start.getTime() + duration * 60 * 1000);
         const timelineDate = formatDateKey(start);
@@ -77,6 +91,14 @@ export class ActionPlanner {
           summary: "query scheduled time",
         };
       }
+
+      default:
+        return {
+          ...base,
+          kind: "direct_response",
+          params: { currentDatetime: context.currentDatetime },
+          summary: "general_chat",
+        };
     }
   }
 

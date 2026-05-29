@@ -91,6 +91,34 @@ export interface AgentToolResult {
 
 // ─── V3.6.1 Agent Experience Pipeline Types ───────────────────────────────
 
+export type AgentDomain =
+  | "time_management"
+  | "general_chat"
+  | "knowledge_qa"
+  | "writing_assistant"
+  | "external_info"
+  | "assistant_meta"
+  | "feedback_or_complaint"
+  | "low_signal";
+
+export interface AgentRouteResult {
+  domain: AgentDomain;
+  confidence: number;
+  matchedRule?: string;
+  rawInput: string;
+}
+
+export interface AgentHandlerResult {
+  domain: AgentDomain;
+  message?: string;
+  responseKind?: string;
+  toolResults?: AgentToolResult[];
+  queryBlocks?: import("@/types/timeblock.types").TimeBlock[];
+  refreshHints?: AgentRefreshHints;
+  metadata?: Partial<ChatMessageMetadata>;
+  trace?: Partial<AgentTrace>;
+}
+
 export type SemanticUserGoal =
   | "greeting"
   | "ask_assistant_identity"
@@ -145,7 +173,12 @@ export interface AgentRefreshHints {
 
 export interface ExperienceActionPlan {
   id: string;
-  kind: "direct_response" | "tool" | "query_schedule" | "chat";
+  kind:
+    | "direct_response"
+    | "tool"
+    | "query_schedule"
+    | "chat"
+    | "request_recommendation";
   userGoal: SemanticUserGoal;
   toolName?: string;
   params: Record<string, unknown>;
@@ -299,7 +332,7 @@ export interface ChatMessageMetadata {
  * - errorKind: 仅 mode=error 时填充，标识具体错误原因
  */
 export interface AgentTrace {
-  planner: "llm" | "experience";
+  planner: "llm" | "experience" | "router";
   mode:
     | "tool_plan"
     | "clarification"
@@ -308,6 +341,7 @@ export interface AgentTrace {
     | "error"
     | "direct_response"
     | "query_schedule";
+  domain?: AgentDomain;
   model?: string;
   toolName?: string;
   errorKind?:

@@ -2,6 +2,8 @@ import { create } from "zustand";
 import { AgentService } from "@/agent/AgentService";
 import type { AgentResponse } from "@/agent/AgentService";
 import type { ChatMessageMetadata } from "@/agent/types";
+import type { AgentExperienceContext, ExperienceActionPlan, SemanticFrame } from "@/agent/types";
+import { ResponseBoundary } from "@/agent/experience/ResponseBoundary";
 import { SqliteConversationRepository } from "@/repositories/sqlite/SqliteConversationRepository";
 import type { ConversationMessage } from "@/types/agent.types";
 import { useTaskStore } from "@/store/taskStore";
@@ -10,6 +12,7 @@ import { useUiStore } from "@/store/uiStore";
 
 const agentService = new AgentService();
 const conversationRepo = new SqliteConversationRepository();
+const responseBoundary = new ResponseBoundary();
 
 // ─── ChatMessage 类型（前端运行时状态） ──────────────────────────────────────
 
@@ -191,10 +194,49 @@ export const useChatStore = create<ChatState & ChatActions>((set, _get) => ({
 
       await applyRefreshHints(response);
     } catch (e) {
+      const fallbackContext: AgentExperienceContext = {
+        currentDatetime: new Date().toISOString(),
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "Asia/Shanghai",
+        recentMessages: [],
+        lastCreatedTaskId: null,
+        lastMentionedTaskIds: [],
+        lastScheduledTimeBlockIds: [],
+        lastToolResults: [],
+      };
+      const fallbackFrame: SemanticFrame = {
+        userGoal: "general_chat",
+        objectReferences: [],
+        timeExpressions: [],
+        durationExpressions: [],
+        constraints: {},
+        userTone: "neutral",
+        urgency: "normal",
+        missingInfo: [],
+        confidence: 0.1,
+      };
+      const fallbackPlan: ExperienceActionPlan = {
+        id: crypto.randomUUID(),
+        kind: "direct_response",
+        userGoal: "general_chat",
+        params: {},
+        requiresConfirmation: false,
+        riskLevel: "safe",
+        summary: "store_error",
+        createdAt: new Date().toISOString(),
+      };
+      const safeMessage = responseBoundary.finalize({
+        context: fallbackContext,
+        frame: fallbackFrame,
+        plan: fallbackPlan,
+        result: {
+          domain: "general_chat",
+          responseKind: "tool_failure",
+        },
+      });
       const errorMsg: ChatMessage = {
         id: crypto.randomUUID(),
         role: "assistant",
-        content: `处理失败: ${String(e)}`,
+        content: safeMessage,
         timestamp: new Date().toISOString(),
       };
       set((s) => ({

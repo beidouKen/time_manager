@@ -15,6 +15,13 @@ export type ResponseKind =
   | "ask_assistant_identity"
   | "ask_current_time"
   | "general_chat"
+  | "general"
+  | "knowledge_no_source"
+  | "writing_assist"
+  | "external_info_no_tool"
+  | "feedback"
+  | "low_signal"
+  | "meta_identity"
   | "unsupported_intent"
   | "clarification"
   | "tool_success"
@@ -42,9 +49,23 @@ export class ResponseComposer {
         return "你好！我可以帮你记录任务、安排时间、查询日程，也可以根据你的反馈调整计划。";
       case "ask_assistant_identity":
         return "我是你的时间管理助手，可以帮你创建任务、安排时间、查看今天计划、调整任务和记录完成情况。";
+      case "meta_identity":
+        return "我是你的时间管理助手，可以帮你创建任务、安排时间、查看今天计划，并根据你的反馈持续优化安排。";
       case "ask_current_time":
         return `现在是 ${formatChineseDateTime(context.currentDatetime, context.timezone)}。`;
       case "general_chat":
+      case "general":
+        return "我在这儿。你可以告诉我你现在想推进什么，我可以帮你拆成可执行的下一步。";
+      case "knowledge_no_source":
+        return "这个问题我可以先给你一个通用解释；如果你要严格依据最新资料，请提供来源或让我基于你给的信息继续整理。";
+      case "writing_assist":
+        return "可以，我能帮你写草稿、润色语气，或按你指定的风格重写。告诉我主题和目标读者就行。";
+      case "external_info_no_tool":
+        return "这个请求需要实时外部信息，但我当前无法直接联网查询。你可以提供数据，我来帮你分析和整理。";
+      case "feedback":
+        return "收到你的反馈，这对我很重要。你可以告诉我哪里不符合预期，我会按你的偏好调整。";
+      case "low_signal":
+        return "我还不太确定你的目标。可以补充一下你想做什么、什么时候做吗？";
       case "unsupported_intent":
         return "这个我现在还不能很好地处理。你可以让我帮你创建任务、安排时间、查询今天计划或调整已有安排。";
       case "clarification":

@@ -108,8 +108,8 @@ export function ChatMessage({ message }: Props) {
           </div>
         )}
 
-        {/* V3.5：AgentTrace 底部标签（仅 assistant 且有 LLM 来源时显示） */}
-        {isLLM && !isUser && (
+        {/* V3.5：AgentTrace 底部标签（dev-only） */}
+        {import.meta.env.DEV && isLLM && !isUser && (
           <div className={cn(
             "mt-2 pt-1 border-t flex items-center gap-1.5",
             isError ? "border-red-200" : "border-gray-200"
