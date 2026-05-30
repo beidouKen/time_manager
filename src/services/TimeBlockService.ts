@@ -8,20 +8,6 @@ import type {
 import { CreateTimeBlockSchema, UpdateTimeBlockSchema } from "@/types/timeblock.types";
 import { getDayRange } from "@/lib/dateUtils";
 
-// V2 执行状态更新的字段子集（用于 HeartbeatService 调用）
-export type ExecutionStateUpdate = Pick<
-  UpdateTimeBlockInput,
-  | "status"
-  | "reminder_sent_at"
-  | "start_prompt_sent_at"
-  | "end_prompt_sent_at"
-  | "started_at"
-  | "completed_at"
-  | "skipped_at"
-  | "delayed_at"
-  | "feedback_note"
->;
-
 export class TimeBlockService {
   private repo: ITimeBlockRepository;
 
@@ -64,22 +50,6 @@ export class TimeBlockService {
     const existing = await this.repo.findById(id);
     if (!existing) throw new Error("时间块不存在");
     return this.repo.update(id, { status });
-  }
-
-  /**
-   * V2：更新执行状态字段（Heartbeat 专用）。
-   * 与 updateTimeBlock 的区别：
-   * - 不受 is_locked 限制（Heartbeat 状态转换应穿透锁定）
-   * - 只接受执行相关字段，不允许修改 title/start_time/end_time 等结构字段
-   */
-  async updateExecutionState(
-    id: string,
-    update: ExecutionStateUpdate
-  ): Promise<TimeBlock> {
-    const existing = await this.repo.findById(id);
-    if (!existing) throw new Error("时间块不存在");
-    if (existing.deleted_at) throw new Error("时间块已删除");
-    return this.repo.update(id, update);
   }
 
   async deleteTimeBlock(id: string): Promise<void> {

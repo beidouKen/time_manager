@@ -219,10 +219,10 @@ export function TimeBlockForm() {
               </button>
               <button
                 type="submit"
-                disabled={submitting || !!conflictWarning}
+                disabled={submitting}
                 className={cn(
-                  "px-4 py-2 text-sm text-white rounded-md transition-colors",
-                  submitting || conflictWarning ? "bg-blue-400 cursor-not-allowed" : "bg-blue-600 hover:bg-blue-700"
+                  "px-4 py-2 text-sm text-white rounded-md",
+                  submitting ? "bg-blue-400 cursor-not-allowed" : "bg-blue-600 hover:bg-blue-700"
                 )}
               >
                 {submitting ? "保存中..." : editingBlock ? "保存修改" : "创建"}

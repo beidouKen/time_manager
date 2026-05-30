@@ -1,7 +1,6 @@
 import { create } from "zustand";
 import { TaskService } from "@/services/TaskService";
 import { ScheduleService } from "@/services/ScheduleService";
-import { useTimeBlockStore } from "@/store/timeBlockStore";
 import type { Task, CreateTaskInput, UpdateTaskInput, TaskFilter } from "@/types/task.types";
 import type { ScheduleTaskInput } from "@/services/ScheduleService";
 
@@ -58,8 +57,6 @@ export const useTaskStore = create<TaskState & TaskActions>((set, get) => ({
     set({ error: null });
     await taskService.deleteTask(id);
     set((s) => ({ tasks: s.tasks.filter((t) => t.id !== id) }));
-    // Refresh timeline to remove blocks that were soft-deleted along with the task
-    await useTimeBlockStore.getState().refreshBlocks();
   },
 
   scheduleTask: async (input) => {

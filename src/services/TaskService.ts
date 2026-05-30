@@ -1,7 +1,5 @@
 import { SqliteTaskRepository } from "@/repositories/sqlite/SqliteTaskRepository";
-import { SqliteTimeBlockRepository } from "@/repositories/sqlite/SqliteTimeBlockRepository";
 import type { ITaskRepository } from "@/repositories/interfaces/ITaskRepository";
-import type { ITimeBlockRepository } from "@/repositories/interfaces/ITimeBlockRepository";
 import type {
   Task,
   CreateTaskInput,
@@ -13,11 +11,9 @@ import { CreateTaskSchema, UpdateTaskSchema } from "@/types/task.types";
 
 export class TaskService {
   private repo: ITaskRepository;
-  private blockRepo: ITimeBlockRepository;
 
-  constructor(repo?: ITaskRepository, blockRepo?: ITimeBlockRepository) {
+  constructor(repo?: ITaskRepository) {
     this.repo = repo ?? new SqliteTaskRepository();
-    this.blockRepo = blockRepo ?? new SqliteTimeBlockRepository();
   }
 
   async getTasks(filter?: TaskFilter): Promise<Task[]> {
@@ -51,15 +47,6 @@ export class TaskService {
   async deleteTask(id: string): Promise<void> {
     const existing = await this.repo.findById(id);
     if (!existing) throw new Error("任务不存在");
-
-    // Soft-delete all active time blocks associated with this task
-    const blocks = await this.blockRepo.findByTaskId(id);
-    await Promise.all(
-      blocks
-        .filter((b) => !b.deleted_at)
-        .map((b) => this.blockRepo.softDelete(b.id))
-    );
-
     await this.repo.softDelete(id);
   }
 
@@ -68,21 +55,5 @@ export class TaskService {
       status: ["todo", "scheduled", "in_progress"],
       excludeDeleted: true,
     });
-  }
-
-  /**
-   * V2：统计某个 Task 在指定时间点之后还有多少个活跃 TimeBlock。
-   * 用于 HeartbeatService 判断完成/跳过/延迟一个 TimeBlock 后，Task 是否还有后续安排。
-   * "活跃"定义：start_time > afterTime，status 为 scheduled 或 in_progress，未软删除。
-   */
-  async getFutureActiveBlocksCount(taskId: string, afterTime: Date): Promise<number> {
-    const afterTimeStr = afterTime.toISOString();
-    const blocks = await this.blockRepo.findByTaskId(taskId);
-    return blocks.filter(
-      (b) =>
-        !b.deleted_at &&
-        (b.status === "scheduled" || b.status === "in_progress") &&
-        b.start_time > afterTimeStr
-    ).length;
   }
 }

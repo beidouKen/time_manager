@@ -7,7 +7,6 @@ import {
   Pencil,
   Trash2,
   Undo2,
-  Clock,
 } from "lucide-react";
 import { toast } from "sonner";
 import { useTimeBlockStore } from "@/store/timeBlockStore";
@@ -19,7 +18,6 @@ import { getBlockTopPx, getBlockHeightPx, formatTime, getBlockDurationMinutes } 
 import { cn } from "@/lib/utils";
 import type { TimeBlock } from "@/types/timeblock.types";
 
-// 基础背景色（按类型）
 const TYPE_COLORS: Record<TimeBlock["type"], string> = {
   task: "bg-blue-50 border-blue-200 hover:border-blue-400",
   event: "bg-purple-50 border-purple-200 hover:border-purple-400",
@@ -33,22 +31,6 @@ const TYPE_HEADER_COLORS: Record<TimeBlock["type"], string> = {
   break: "bg-green-500",
   routine: "bg-orange-500",
 };
-
-// 状态覆盖样式（优先级高于类型样式）
-function getStatusOverrideClasses(status: TimeBlock["status"]): string {
-  switch (status) {
-    case "in_progress":
-      return "!bg-amber-50 !border-amber-400 ring-1 ring-amber-300";
-    case "delayed":
-      return "!bg-orange-50 !border-orange-300 border-dashed";
-    case "done":
-    case "skipped":
-    case "cancelled":
-      return "opacity-50";
-    default:
-      return "";
-  }
-}
 
 interface TimeBlockCardProps {
   block: TimeBlock;
@@ -69,9 +51,7 @@ export function TimeBlockCard({ block, dayStart }: TimeBlockCardProps) {
   const isDone = block.status === "done";
   const isSkipped = block.status === "skipped";
   const isCancelled = block.status === "cancelled";
-  const isDelayed = block.status === "delayed";
-  const isInProgress = block.status === "in_progress";
-  const isInactive = isDone || isSkipped || isCancelled || isDelayed;
+  const isInactive = isDone || isSkipped || isCancelled;
 
   const canMoveBack =
     !!block.task_id &&
@@ -92,15 +72,6 @@ export function TimeBlockCard({ block, dayStart }: TimeBlockCardProps) {
     try {
       await updateBlockStatus(block.id, "skipped");
       toast.success("已跳过");
-    } catch (e) {
-      toast.error(String(e));
-    }
-  };
-
-  const handleMarkDelayed = async () => {
-    try {
-      await updateBlockStatus(block.id, "delayed");
-      toast.success("已标记为延迟，可稍后重新安排");
     } catch (e) {
       toast.error(String(e));
     }
@@ -135,16 +106,15 @@ export function TimeBlockCard({ block, dayStart }: TimeBlockCardProps) {
         className={cn(
           "absolute left-14 right-2 rounded-md border transition-all group",
           TYPE_COLORS[block.type],
-          getStatusOverrideClasses(block.status)
+          isInactive && "opacity-50"
         )}
-        style={{ top, height: Math.max(height, 24), zIndex: isInProgress ? 15 : 10 }}
+        style={{ top, height: Math.max(height, 24), zIndex: 10 }}
       >
-        {/* Color bar（进行中时加脉冲动画） */}
+        {/* Color bar */}
         <div
           className={cn(
             "absolute left-0 top-0 bottom-0 w-1 rounded-l-md",
-            TYPE_HEADER_COLORS[block.type],
-            isInProgress && "animate-pulse"
+            TYPE_HEADER_COLORS[block.type]
           )}
         />
 
@@ -155,24 +125,11 @@ export function TimeBlockCard({ block, dayStart }: TimeBlockCardProps) {
             <span
               className={cn(
                 "text-xs font-semibold text-gray-800 truncate",
-                isDone && "line-through text-gray-400",
-                isSkipped && "line-through text-gray-400",
-                isDelayed && "text-orange-700"
+                isDone && "line-through text-gray-400"
               )}
             >
               {block.title}
             </span>
-            {isInProgress && (
-              <span className="text-xs font-bold text-amber-600 flex-shrink-0">
-                ▶
-              </span>
-            )}
-            {isDelayed && (
-              <span className="text-xs text-orange-500 flex-shrink-0 flex items-center gap-0.5">
-                <Clock size={10} />
-                延迟
-              </span>
-            )}
           </div>
           {!isShort && (
             <div className="flex items-center gap-2 mt-0.5">
@@ -214,13 +171,6 @@ export function TimeBlockCard({ block, dayStart }: TimeBlockCardProps) {
                     >
                       <SkipForward size={14} />
                       跳过
-                    </DropdownMenu.Item>
-                    <DropdownMenu.Item
-                      className="flex items-center gap-2 px-3 py-2 text-sm text-orange-600 rounded hover:bg-orange-50 cursor-pointer outline-none"
-                      onClick={handleMarkDelayed}
-                    >
-                      <Clock size={14} />
-                      延迟
                     </DropdownMenu.Item>
                     <DropdownMenu.Separator className="my-1 h-px bg-gray-100" />
                   </>

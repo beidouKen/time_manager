@@ -1,7 +1,6 @@
 import { Sidebar } from "./Sidebar";
 import { useUiStore } from "@/store/uiStore";
 import { TodayPage } from "@/pages/TodayPage";
-import { ChatPage } from "@/pages/ChatPage";
 import { SettingsPage } from "@/pages/SettingsPage";
 import { TodoForm } from "@/components/todo/TodoForm";
 import { ScheduleTaskDialog } from "@/components/schedule/ScheduleTaskDialog";
@@ -16,7 +15,6 @@ export function AppLayout() {
       <Sidebar />
       <main className="flex-1 overflow-hidden">
         {activePage === "today" && <TodayPage />}
-        {activePage === "chat" && <ChatPage />}
         {activePage === "settings" && <SettingsPage />}
       </main>
 

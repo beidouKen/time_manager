@@ -21,15 +21,6 @@ function rowToTimeBlock(row: Record<string, unknown>): TimeBlock {
     created_at: row.created_at as string,
     updated_at: row.updated_at as string,
     deleted_at: (row.deleted_at as string) ?? undefined,
-    // V2 执行时间戳字段
-    reminder_sent_at: (row.reminder_sent_at as string) ?? undefined,
-    start_prompt_sent_at: (row.start_prompt_sent_at as string) ?? undefined,
-    end_prompt_sent_at: (row.end_prompt_sent_at as string) ?? undefined,
-    started_at: (row.started_at as string) ?? undefined,
-    completed_at: (row.completed_at as string) ?? undefined,
-    skipped_at: (row.skipped_at as string) ?? undefined,
-    delayed_at: (row.delayed_at as string) ?? undefined,
-    feedback_note: (row.feedback_note as string) ?? undefined,
   };
 }
 
@@ -133,39 +124,6 @@ export class SqliteTimeBlockRepository implements ITimeBlockRepository {
     if (data.is_locked !== undefined) {
       fields.push(`is_locked = $${idx++}`);
       params.push(data.is_locked ? 1 : 0);
-    }
-    // V2 执行时间戳字段
-    if (data.reminder_sent_at !== undefined) {
-      fields.push(`reminder_sent_at = $${idx++}`);
-      params.push(data.reminder_sent_at ?? null);
-    }
-    if (data.start_prompt_sent_at !== undefined) {
-      fields.push(`start_prompt_sent_at = $${idx++}`);
-      params.push(data.start_prompt_sent_at ?? null);
-    }
-    if (data.end_prompt_sent_at !== undefined) {
-      fields.push(`end_prompt_sent_at = $${idx++}`);
-      params.push(data.end_prompt_sent_at ?? null);
-    }
-    if (data.started_at !== undefined) {
-      fields.push(`started_at = $${idx++}`);
-      params.push(data.started_at ?? null);
-    }
-    if (data.completed_at !== undefined) {
-      fields.push(`completed_at = $${idx++}`);
-      params.push(data.completed_at ?? null);
-    }
-    if (data.skipped_at !== undefined) {
-      fields.push(`skipped_at = $${idx++}`);
-      params.push(data.skipped_at ?? null);
-    }
-    if (data.delayed_at !== undefined) {
-      fields.push(`delayed_at = $${idx++}`);
-      params.push(data.delayed_at ?? null);
-    }
-    if (data.feedback_note !== undefined) {
-      fields.push(`feedback_note = $${idx++}`);
-      params.push(data.feedback_note ?? null);
     }
 
     params.push(id);

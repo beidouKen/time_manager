@@ -6,8 +6,7 @@ export type TimeBlockStatus =
   | "in_progress"
   | "done"
   | "skipped"
-  | "cancelled"
-  | "delayed";
+  | "cancelled";
 export type TimeBlockSource = "manual" | "system";
 
 export interface TimeBlock {
@@ -23,15 +22,6 @@ export interface TimeBlock {
   created_at: string;
   updated_at: string;
   deleted_at?: string;
-  // V2 执行时间戳字段
-  reminder_sent_at?: string;
-  start_prompt_sent_at?: string;
-  end_prompt_sent_at?: string;
-  started_at?: string;
-  completed_at?: string;
-  skipped_at?: string;
-  delayed_at?: string;
-  feedback_note?: string;
 }
 
 export const CreateTimeBlockSchema = z
@@ -59,18 +49,9 @@ export const UpdateTimeBlockSchema = z.object({
   end_time: z.string().optional(),
   type: z.enum(["task", "event", "break", "routine"]).optional(),
   status: z
-    .enum(["scheduled", "in_progress", "done", "skipped", "cancelled", "delayed"])
+    .enum(["scheduled", "in_progress", "done", "skipped", "cancelled"])
     .optional(),
   is_locked: z.boolean().optional(),
-  // V2 执行时间戳字段（均为可选，由 HeartbeatService 按需更新）
-  reminder_sent_at: z.string().nullable().optional(),
-  start_prompt_sent_at: z.string().nullable().optional(),
-  end_prompt_sent_at: z.string().nullable().optional(),
-  started_at: z.string().nullable().optional(),
-  completed_at: z.string().nullable().optional(),
-  skipped_at: z.string().nullable().optional(),
-  delayed_at: z.string().nullable().optional(),
-  feedback_note: z.string().nullable().optional(),
 });
 
 export type UpdateTimeBlockInput = z.infer<typeof UpdateTimeBlockSchema>;
