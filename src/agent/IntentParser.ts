@@ -1,3 +1,8 @@
+/**
+ * @deprecated dead since V3.6.1; not imported anywhere as of Agent V3;
+ * scheduled for removal post Agent V5.
+ * Active rule-based parsing is now in SemanticFrameParser.ts.
+ */
 import type { ParsedIntent, IntentType } from "@/agent/types";
 
 interface PatternRule {

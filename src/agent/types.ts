@@ -126,7 +126,12 @@ export type SemanticUserGoal =
   | "delete_task"
   | "query_schedule"
   | "general_chat"
-  | "unsupported_intent";
+  | "unsupported_intent"
+  // V4+: 多日 / 批量 / 延期
+  | "query_schedule_range"
+  | "batch_delete_tasks"
+  | "batch_reschedule_day"
+  | "defer_task";
 
 export interface SemanticFrame {
   userGoal: SemanticUserGoal;
@@ -152,6 +157,15 @@ export interface SemanticFrame {
   confidence: number;
   extractedTitle?: string;
   category?: string;
+  /**
+   * V4+: 多日日期范围，用于 query_schedule_range / batch_delete_tasks 等目标。
+   * from/to 为 "YYYY-MM-DD" 格式（本地日期）。
+   */
+  dateRange?: {
+    from: string;
+    to: string;
+    sourceText: string;
+  };
 }
 
 export interface AgentExperienceContext {
@@ -180,7 +194,10 @@ export interface ExperienceActionPlan {
     | "tool"
     | "query_schedule"
     | "chat"
-    | "request_recommendation";
+    | "request_recommendation"
+    | "suggestion"
+    | "defer_task"
+    | "batch_action";
   userGoal: SemanticUserGoal;
   toolName?: string;
   params: Record<string, unknown>;
@@ -189,6 +206,16 @@ export interface ExperienceActionPlan {
   summary: string;
   refreshHints?: AgentRefreshHints;
   createdAt: string;
+  /**
+   * V3+: 人类可读的 trace 标签，例如 "create_and_schedule_task:exact"。
+   * 用于可追溯性和回放测试。
+   */
+  traceLabel?: string;
+  /**
+   * V3+: 回放键（确定性内容 hash，排除 id/createdAt），
+   * 相同输入 + 相同时间应产生相同 replayKey。
+   */
+  replayKey?: string;
 }
 
 // ─── ToolDefinition（保持向后兼容，所有 17 个 Tool 实现此接口） ─────────
@@ -342,7 +369,8 @@ export interface AgentTrace {
     | "unsupported"
     | "error"
     | "direct_response"
-    | "query_schedule";
+    | "query_schedule"
+    | "suggestion";
   domain?: AgentDomain;
   model?: string;
   toolName?: string;
@@ -352,13 +380,31 @@ export interface AgentTrace {
     | "network_error"
     | "http_error"
     | "parse_error"
-    | "fallback";
+    | "fallback"
+    | "invalid_tool"
+    | "policy_upgraded";
   rawInput?: string;
   contextSnapshot?: AgentExperienceContext;
   semanticFrame?: SemanticFrame;
   actionPlan?: ExperienceActionPlan;
   toolResults?: AgentToolResult[];
   finalResponse?: string;
+  /**
+   * V3+: 人类可读的计划摘要，例如 "安排写文档任务（30分钟，推荐时间）"。
+   */
+  planSummary?: string;
+  /**
+   * V3+: 确认链路元数据（当操作进入 confirmation_required 时填充）。
+   */
+  confirmationMetadata?: {
+    confirmationId: string;
+    riskLevel: RiskLevel;
+    toolName: string;
+  };
+  /**
+   * V5+: 建议类响应的分类。
+   */
+  suggestionKind?: "suggestion" | "confirmation_required" | "executable_action";
 }
 
 // ─── V3.5 AgentMessage ──────────────────────────────────────────────────────

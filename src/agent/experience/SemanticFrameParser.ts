@@ -11,6 +11,7 @@ export class SemanticFrameParser {
     const keyword = this.extractKeyword(normalized, userGoal);
     const startNow = /从现在开始|现在开始|马上开始|立即开始/.test(normalized);
     const timeAnchor = this.parseTimeAnchor(normalized);
+    const dateRange = this.parseDateRange(normalized);
 
     const timeExpressions: SemanticFrame["timeExpressions"] = [];
     if (startNow) {
@@ -47,12 +48,21 @@ export class SemanticFrameParser {
       confidence: userGoal === "general_chat" ? 0.5 : 0.86,
       extractedTitle: title,
       category: normalized.includes("写作") ? "writing" : undefined,
+      dateRange: dateRange ?? undefined,
     };
   }
 
   private detectGoal(input: string): SemanticUserGoal {
     if (/现在.*(时候|时间|几点)|几点了|几点啊|当前时间/.test(input)) {
       return "ask_current_time";
+    }
+
+    // V4+: 批量删除（整天/多日）
+    if (
+      /(删除|删掉|去掉|清空).*(今天|明天|后天|这周|本周|所有).*(任务|待办)/.test(input) ||
+      /(今天|明天|后天|这周|本周).*(任务|待办).*(删除|删掉|去掉|清空)/.test(input)
+    ) {
+      return "batch_delete_tasks";
     }
 
     if (
@@ -63,8 +73,21 @@ export class SemanticFrameParser {
       return "delete_task";
     }
 
+    // V4+: 延期任务
+    if (/(延期|推迟|推到|改到|挪到).*(明天|后天|下周|下午|早上|晚上)/.test(input)) {
+      return "defer_task";
+    }
+
     if (/(提醒|提示)我|^提醒/.test(input)) {
       return "create_reminder";
+    }
+
+    // V4+: 多日查询
+    if (
+      /(未来|接下来).*(几天|三天|两天|一周|这周|本周)/.test(input) ||
+      /(这周|本周|下周|今天和明天|明天和后天).*任务/.test(input)
+    ) {
+      return "query_schedule_range";
     }
 
     if (/(安排在哪|排在哪|什么时候|时间段)/.test(input)) {
@@ -77,6 +100,64 @@ export class SemanticFrameParser {
 
     if (input.length > 0) return "general_chat";
     return "general_chat";
+  }
+
+  /**
+   * V4+: 解析多日日期范围，如"未来三天"、"这周"、"今天和明天"等。
+   * 返回 { from, to, sourceText }，from/to 为 "YYYY-MM-DD" 本地日期。
+   */
+  parseDateRange(input: string): SemanticFrame["dateRange"] {
+    const now = new Date();
+    const pad = (n: number) => String(n).padStart(2, "0");
+    const toDateKey = (d: Date) =>
+      `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+    const addDays = (d: Date, n: number) => {
+      const r = new Date(d);
+      r.setDate(r.getDate() + n);
+      return r;
+    };
+    const today = new Date(now);
+    today.setHours(0, 0, 0, 0);
+
+    if (/未来三天|接下来三天|今天和明天和后天/.test(input)) {
+      return {
+        from: toDateKey(today),
+        to: toDateKey(addDays(today, 2)),
+        sourceText: "未来三天",
+      };
+    }
+    if (/未来两天|今天和明天|明天和后天/.test(input)) {
+      const offset = /明天和后天/.test(input) ? 1 : 0;
+      return {
+        from: toDateKey(addDays(today, offset)),
+        to: toDateKey(addDays(today, offset + 1)),
+        sourceText: input.match(/今天和明天|明天和后天/)?.[0] ?? "未来两天",
+      };
+    }
+    if (/这周|本周/.test(input)) {
+      const weekday = today.getDay(); // 0=Sun
+      const monOffset = weekday === 0 ? -6 : 1 - weekday;
+      const mon = addDays(today, monOffset);
+      const sun = addDays(mon, 6);
+      return {
+        from: toDateKey(mon),
+        to: toDateKey(sun),
+        sourceText: input.match(/这周|本周/)?.[0] ?? "这周",
+      };
+    }
+    if (/下周/.test(input)) {
+      const weekday = today.getDay();
+      const monOffset = weekday === 0 ? 1 : 8 - weekday;
+      const mon = addDays(today, monOffset);
+      const sun = addDays(mon, 6);
+      return {
+        from: toDateKey(mon),
+        to: toDateKey(sun),
+        sourceText: "下周",
+      };
+    }
+
+    return undefined;
   }
 
   private parseDuration(input: string): number | undefined {

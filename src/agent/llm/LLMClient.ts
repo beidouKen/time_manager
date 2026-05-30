@@ -60,7 +60,7 @@ export interface LLMClient {
 
   /**
    * 检查客户端是否可用（API key 已配置且 enabled）。
-   * 返回 false 时调用方应 fallback 到规则 IntentParser。
+   * 返回 false 时调用方应 fallback 到 boundary（规则 IntentParser 已 @deprecated）。
    */
   isAvailable(): boolean;
 

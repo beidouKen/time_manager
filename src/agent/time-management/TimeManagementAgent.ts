@@ -1,4 +1,4 @@
-import { ActionPlanner } from "@/agent/experience/ActionPlanner";
+import type { PlannerPort } from "@/agent/experience/PlannerPort";
 import {
   ConversationContextBuilder,
   type ConversationMemorySnapshot,
@@ -59,7 +59,7 @@ interface TimeManagementAgentDeps {
   timeBlockService: TimeBlockService;
   router: ToolRouter;
   logService: ActionLogPort;
-  actionPlanner: ActionPlanner;
+  plannerPort: PlannerPort;
   semanticFrameParser: SemanticFrameParser;
   experienceContextBuilder: ConversationContextBuilder;
   responseBoundary: ResponseBoundary;
@@ -93,7 +93,7 @@ export class TimeManagementAgent {
     semanticFrame: SemanticFrame;
   }): Promise<TimeManagementHandleResult> {
     const { userInput, context, semanticFrame } = args;
-    const actionPlan = await this.deps.actionPlanner.plan(semanticFrame, context);
+    const actionPlan = await this.deps.plannerPort.plan(semanticFrame, context);
     const toolResults: AgentToolResult[] = [];
     let queryBlocks: TimeBlock[] | undefined;
     let actionLogId: string | undefined;
@@ -103,13 +103,76 @@ export class TimeManagementAgent {
     actionLogId = log.id;
 
     if (actionPlan.kind === "tool" && actionPlan.toolName) {
+      // Defense: reject unregistered tool names (StubPlanner / malformed plans)
+      if (!this.deps.router.getTool(actionPlan.toolName)) {
+        await this.deps.logService.logFailure(
+          log.id,
+          `invalid_tool: ${actionPlan.toolName}`
+        );
+        const fallbackResponse = this.deps.responseBoundary.finalize({
+          context,
+          frame: semanticFrame,
+          plan: {
+            ...actionPlan,
+            kind: "direct_response",
+            toolName: undefined,
+          },
+          result: {
+            domain: "time_management",
+            message: "抱歉，我无法处理这个请求，请稍后再试。",
+          },
+        });
+        const fallbackTrace: AgentTrace = {
+          planner: "experience",
+          domain: "time_management",
+          mode: "error",
+          errorKind: "invalid_tool",
+          rawInput: userInput,
+          contextSnapshot: context,
+          semanticFrame,
+          actionPlan,
+          toolResults: [],
+          finalResponse: fallbackResponse,
+          planSummary: actionPlan.summary,
+        };
+        return {
+          response: {
+            domain: "time_management",
+            message: fallbackResponse,
+            toolResults: [],
+            metadata: { agentTrace: fallbackTrace },
+          },
+          metadata: {
+            intent: semanticFrame.userGoal,
+            resultType: "failure",
+            source: "llm",
+            agentTrace: fallbackTrace,
+          },
+          intent: {
+            intent: "unknown",
+            confidence: 0,
+            args: actionPlan.params,
+            rawInput: userInput,
+          },
+        };
+      }
+
+      // Policy enforcement: CONFIRMATION_POLICY overrides planner's requiresConfirmation
+      // for destructive tools (e.g., StubPlanner tries to bypass confirmation)
+      const toolRequiresConfirm = this.deps.router.hasToolRequiringConfirmation(
+        actionPlan.toolName
+      );
+      const effectiveRequiresConfirmation =
+        actionPlan.requiresConfirmation || toolRequiresConfirm;
+      const policyRisk = toolRequiresConfirm ? "destructive" : actionPlan.riskLevel;
+
       // Confirmation gate: destructive operations require confirmation before execution
-      if (actionPlan.requiresConfirmation) {
+      if (effectiveRequiresConfirmation) {
         const pending = await this.deps.confirmationService.createConfirmation({
           action_type: semanticFrame.userGoal,
           tool_name: actionPlan.toolName,
           tool_args_json: JSON.stringify(actionPlan.params),
-          risk_level: toLegacyRiskLevel(actionPlan.riskLevel),
+          risk_level: toLegacyRiskLevel(policyRisk),
           description: actionPlan.summary,
         });
         confirmationId = pending.id;
@@ -138,6 +201,12 @@ export class TimeManagementAgent {
           actionPlan,
           toolResults: [],
           finalResponse,
+          planSummary: actionPlan.summary,
+          confirmationMetadata: {
+            confirmationId,
+            riskLevel: policyRisk,
+            toolName: actionPlan.toolName,
+          },
         };
 
         const metadata: ChatMessageMetadata = {
@@ -243,11 +312,44 @@ export class TimeManagementAgent {
         recommendationCount: candidates.length,
         confirmationId,
       });
+    } else if (actionPlan.kind === "batch_action" || actionPlan.kind === "defer_task") {
+      // V4+: batch / defer — high risk, always requires confirmation
+      const pending = await this.deps.confirmationService.createConfirmation({
+        action_type: semanticFrame.userGoal,
+        tool_name: actionPlan.kind,
+        tool_args_json: JSON.stringify(actionPlan.params),
+        risk_level: toLegacyRiskLevel(actionPlan.riskLevel),
+        description: actionPlan.summary,
+      });
+      confirmationId = pending.id;
+      await this.deps.logService.logSuccess(log.id, {
+        kind: actionPlan.kind,
+        confirmationId,
+      });
     } else {
       await this.deps.logService.logSuccess(log.id, {
         kind: actionPlan.kind,
         userGoal: semanticFrame.userGoal,
       });
+    }
+
+    let finalResponseMessage: string | undefined;
+    let finalResponseKind: string | undefined;
+
+    if (actionPlan.kind === "request_recommendation") {
+      finalResponseKind = "clarification";
+      finalResponseMessage = this.composeRecommendationMessage(
+        actionPlan.params.recommendation as { start: string; end: string } | undefined,
+        context.timezone
+      );
+    } else if (actionPlan.kind === "batch_action") {
+      finalResponseMessage = `已收到批量操作请求（${actionPlan.summary}），请确认是否继续。`;
+    } else if (actionPlan.kind === "defer_task") {
+      const title = String(actionPlan.params.title ?? "该任务");
+      const target = actionPlan.params.targetSourceText
+        ? `延期到${actionPlan.params.targetSourceText}`
+        : "调整时间";
+      finalResponseMessage = `建议将「${title}」${target}，是否确认？`;
     }
 
     const finalResponse = this.deps.responseBoundary.finalize({
@@ -256,17 +358,8 @@ export class TimeManagementAgent {
       plan: actionPlan,
       result: {
         domain: "time_management",
-        responseKind:
-          actionPlan.kind === "request_recommendation" ? "clarification" : undefined,
-        message:
-          actionPlan.kind === "request_recommendation"
-            ? this.composeRecommendationMessage(
-                actionPlan.params.recommendation as
-                  | { start: string; end: string }
-                  | undefined,
-                context.timezone
-              )
-            : undefined,
+        responseKind: finalResponseKind,
+        message: finalResponseMessage,
         toolResults,
         queryBlocks,
       },
@@ -281,7 +374,9 @@ export class TimeManagementAgent {
             ? "chitchat"
             : actionPlan.kind === "request_recommendation"
               ? "clarification"
-              : "tool_plan";
+              : actionPlan.kind === "suggestion"
+                ? "suggestion"
+                : "tool_plan";
 
     const trace: AgentTrace = {
       planner: "experience",
@@ -294,6 +389,7 @@ export class TimeManagementAgent {
       actionPlan,
       toolResults,
       finalResponse,
+      planSummary: actionPlan.summary,
     };
 
     const primaryResult = toolResults[0];

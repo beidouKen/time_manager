@@ -1,6 +1,10 @@
 import { ToolRouter } from "@/agent/ToolRouter";
 import type { RecentMessage } from "@/agent/llm/contextBuilder";
 import { ActionPlanner } from "@/agent/experience/ActionPlanner";
+import type { PlannerPort } from "@/agent/experience/PlannerPort";
+import type { MemoryAdapter } from "@/agent/memory/MemoryAdapter";
+import type { RagAdapter } from "@/agent/memory/RagAdapter";
+import type { NotificationAdapter } from "@/agent/notification/NotificationAdapter";
 import {
   ConversationContextBuilder,
   type ConversationMemorySnapshot,
@@ -135,6 +139,14 @@ interface AgentServiceOptions {
   scheduleService?: ScheduleService;
   logService?: ActionLogPort;
   confirmService?: ConfirmationService;
+  /** Phase 1+: 可替换的 Planner 实现（默认 ActionPlanner）。测试时可注入 StubPlanner。 */
+  plannerPort?: PlannerPort;
+  /** Phase 1+: 行为记录适配器（默认不启用）。 */
+  memoryAdapter?: MemoryAdapter;
+  /** Phase 1+: RAG 检索适配器（默认不启用）。 */
+  ragAdapter?: RagAdapter;
+  /** Phase 1+: 通知适配器（默认不启用）。 */
+  notificationAdapter?: NotificationAdapter;
 }
 
 // ─── AgentService ───────────────────────────────────────────────────────────
@@ -150,11 +162,16 @@ export class AgentService {
   // V3：LLM 相关组件
   private experienceContextBuilder: ConversationContextBuilder;
   private semanticFrameParser: SemanticFrameParser;
-  private actionPlanner: ActionPlanner;
+  private plannerPort: PlannerPort;
   private responseBoundary: ResponseBoundary;
   private domainRouter: AgentDomainRouter;
   private timeManagementAgent: TimeManagementAgent;
   private handlers: Map<AgentDomain, AgentHandler>;
+
+  // Phase 1+: 可选适配器（mock 或未来真实实现）
+  readonly memoryAdapter: MemoryAdapter | undefined;
+  readonly ragAdapter: RagAdapter | undefined;
+  readonly notificationAdapter: NotificationAdapter | undefined;
 
   private lastCreatedTaskId: string | null = null;
   private lastMentionedTaskIds: string[] = [];
@@ -171,15 +188,18 @@ export class AgentService {
 
     this.experienceContextBuilder = new ConversationContextBuilder();
     this.semanticFrameParser = new SemanticFrameParser();
-    this.actionPlanner = new ActionPlanner(this.taskService);
+    this.plannerPort = options.plannerPort ?? new ActionPlanner(this.taskService);
     this.responseBoundary = new ResponseBoundary();
     this.domainRouter = new AgentDomainRouter();
+    this.memoryAdapter = options.memoryAdapter;
+    this.ragAdapter = options.ragAdapter;
+    this.notificationAdapter = options.notificationAdapter;
     this.timeManagementAgent = new TimeManagementAgent({
       taskService: this.taskService,
       timeBlockService: this.timeBlockService,
       router: this.router,
       logService: this.logService,
-      actionPlanner: this.actionPlanner,
+      plannerPort: this.plannerPort,
       semanticFrameParser: this.semanticFrameParser,
       experienceContextBuilder: this.experienceContextBuilder,
       responseBoundary: this.responseBoundary,
@@ -517,7 +537,7 @@ export class AgentService {
 
   private updateExperienceMemory(
     frame: SemanticFrame,
-    _plan: ExperienceActionPlan,
+    plan: ExperienceActionPlan,
     result: AgentToolResult
   ): void {
     if (result.relatedTaskId) {
@@ -535,6 +555,36 @@ export class AgentService {
     }
 
     this.lastToolResults = [result, ...this.lastToolResults].slice(0, 5);
+
+    // V5+: 记录行为到 MemoryAdapter（在 ToolRouter execute 成功后，不在 Tool 内部）
+    if (this.memoryAdapter && result.success) {
+      if (
+        frame.userGoal === "create_and_schedule_task" &&
+        plan.toolName === "schedule_task"
+      ) {
+        void this.memoryAdapter.recordSchedule({
+          taskId: result.relatedTaskId ?? "",
+          title: String(plan.params.title ?? ""),
+          category: frame.category,
+          estimatedMinutes: Number(plan.params.duration ?? 0),
+        });
+      }
+    }
+
+    // V5+: 提醒创建后发送通知（只有 create_time_block/create_reminder 触发）
+    if (
+      this.notificationAdapter &&
+      result.success &&
+      plan.toolName === "create_time_block" &&
+      frame.userGoal === "create_reminder"
+    ) {
+      void this.notificationAdapter.notify({
+        channel: "reminder",
+        title: String(plan.params.title ?? "提醒"),
+        message: `提醒已创建：${String(plan.params.title ?? "")}`,
+        scheduledAt: String(plan.params.start_time ?? ""),
+      });
+    }
   }
 
   private rememberMentionedTask(taskId: string): void {
