@@ -207,6 +207,11 @@ export interface ExperienceActionPlan {
   refreshHints?: AgentRefreshHints;
   createdAt: string;
   /**
+   * V3.7: batch_action / defer_task 确认执行前预先分解的原子操作列表。
+   * confirmAction() 检测到此字段后按序执行，而非尝试调用未注册的 Tool。
+   */
+  actions?: SinglePlanAction[];
+  /**
    * V3+: 人类可读的 trace 标签，例如 "create_and_schedule_task:exact"。
    * 用于可追溯性和回放测试。
    */
@@ -351,6 +356,18 @@ export interface ChatMessageMetadata {
   // V3.5 新增
   /** Agent 执行追踪（LLM 路径写入，用于调试与 UI 展示） */
   agentTrace?: AgentTrace;
+}
+
+// ─── V3.7 SinglePlanAction（batch/defer 分解后的原子操作） ──────────────────
+
+/**
+ * batch_action / defer_task 确认执行时，分解出的单个原子操作。
+ * 结构与 PlanOption.actions[*] 对齐，共用 executeActionList 路径。
+ */
+export interface SinglePlanAction {
+  toolName: string;
+  params: Record<string, unknown>;
+  summary?: string;
 }
 
 // ─── V3.5 AgentTrace ────────────────────────────────────────────────────────

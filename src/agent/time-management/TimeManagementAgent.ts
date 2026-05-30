@@ -1,4 +1,5 @@
 import type { PlannerPort } from "@/agent/experience/PlannerPort";
+import type { CompositePlanner } from "@/agent/CompositePlanner";
 import {
   ConversationContextBuilder,
   type ConversationMemorySnapshot,
@@ -10,6 +11,7 @@ import { ToolRouter } from "@/agent/ToolRouter";
 import { AvailabilityProvider } from "@/agent/time-management/scheduling/AvailabilityProvider";
 import { RecommendationPlanner } from "@/agent/time-management/scheduling/RecommendationPlanner";
 import { SchedulingReasoner } from "@/agent/time-management/scheduling/SchedulingReasoner";
+import { PlanSafetyValidator } from "@/agent/validators/PlanSafetyValidator";
 import type {
   AgentExperienceContext,
   AgentHandlerResult,
@@ -68,12 +70,14 @@ interface TimeManagementAgentDeps {
 
 export class TimeManagementAgent {
   private recommendationPlanner: RecommendationPlanner;
+  private safetyValidator: PlanSafetyValidator;
 
   constructor(private deps: TimeManagementAgentDeps) {
     this.recommendationPlanner = new RecommendationPlanner(
       new AvailabilityProvider(this.deps.timeBlockService),
       new SchedulingReasoner()
     );
+    this.safetyValidator = new PlanSafetyValidator(this.deps.router);
   }
 
   buildContext(
@@ -93,7 +97,62 @@ export class TimeManagementAgent {
     semanticFrame: SemanticFrame;
   }): Promise<TimeManagementHandleResult> {
     const { userInput, context, semanticFrame } = args;
-    const actionPlan = await this.deps.plannerPort.plan(semanticFrame, context);
+    const rawPlan = await this.deps.plannerPort.plan(semanticFrame, context);
+
+    // V3.7: 所有 planner 输出都经过 PlanSafetyValidator 统一校验
+    const safetyResult = this.safetyValidator.validate(rawPlan);
+    if (!safetyResult.ok) {
+      const log = await this.deps.logService.logRequest(userInput, semanticFrame.userGoal);
+      await this.deps.logService.logFailure(log.id, safetyResult.reason);
+      const fallbackResponse = this.deps.responseBoundary.finalize({
+        context,
+        frame: semanticFrame,
+        plan: {
+          ...rawPlan,
+          kind: "direct_response",
+          toolName: undefined,
+        },
+        result: {
+          domain: "time_management",
+          message: "抱歉，我无法处理这个请求，请稍后再试。",
+        },
+      });
+      const fallbackTrace: AgentTrace = {
+        planner: "experience",
+        domain: "time_management",
+        mode: "error",
+        errorKind: safetyResult.errorKind as AgentTrace["errorKind"],
+        rawInput: userInput,
+        contextSnapshot: context,
+        semanticFrame,
+        actionPlan: rawPlan,
+        toolResults: [],
+        finalResponse: fallbackResponse,
+        planSummary: rawPlan.summary,
+      };
+      return {
+        response: {
+          domain: "time_management",
+          message: fallbackResponse,
+          toolResults: [],
+          metadata: { agentTrace: fallbackTrace },
+        },
+        metadata: {
+          intent: semanticFrame.userGoal,
+          resultType: "failure",
+          source: "llm",
+          agentTrace: fallbackTrace,
+        },
+        intent: {
+          intent: "unknown",
+          confidence: 0,
+          args: rawPlan.params,
+          rawInput: userInput,
+        },
+      };
+    }
+
+    const actionPlan = safetyResult.plan;
     const toolResults: AgentToolResult[] = [];
     let queryBlocks: TimeBlock[] | undefined;
     let actionLogId: string | undefined;
@@ -103,68 +162,8 @@ export class TimeManagementAgent {
     actionLogId = log.id;
 
     if (actionPlan.kind === "tool" && actionPlan.toolName) {
-      // Defense: reject unregistered tool names (StubPlanner / malformed plans)
-      if (!this.deps.router.getTool(actionPlan.toolName)) {
-        await this.deps.logService.logFailure(
-          log.id,
-          `invalid_tool: ${actionPlan.toolName}`
-        );
-        const fallbackResponse = this.deps.responseBoundary.finalize({
-          context,
-          frame: semanticFrame,
-          plan: {
-            ...actionPlan,
-            kind: "direct_response",
-            toolName: undefined,
-          },
-          result: {
-            domain: "time_management",
-            message: "抱歉，我无法处理这个请求，请稍后再试。",
-          },
-        });
-        const fallbackTrace: AgentTrace = {
-          planner: "experience",
-          domain: "time_management",
-          mode: "error",
-          errorKind: "invalid_tool",
-          rawInput: userInput,
-          contextSnapshot: context,
-          semanticFrame,
-          actionPlan,
-          toolResults: [],
-          finalResponse: fallbackResponse,
-          planSummary: actionPlan.summary,
-        };
-        return {
-          response: {
-            domain: "time_management",
-            message: fallbackResponse,
-            toolResults: [],
-            metadata: { agentTrace: fallbackTrace },
-          },
-          metadata: {
-            intent: semanticFrame.userGoal,
-            resultType: "failure",
-            source: "llm",
-            agentTrace: fallbackTrace,
-          },
-          intent: {
-            intent: "unknown",
-            confidence: 0,
-            args: actionPlan.params,
-            rawInput: userInput,
-          },
-        };
-      }
-
-      // Policy enforcement: CONFIRMATION_POLICY overrides planner's requiresConfirmation
-      // for destructive tools (e.g., StubPlanner tries to bypass confirmation)
-      const toolRequiresConfirm = this.deps.router.hasToolRequiringConfirmation(
-        actionPlan.toolName
-      );
-      const effectiveRequiresConfirmation =
-        actionPlan.requiresConfirmation || toolRequiresConfirm;
-      const policyRisk = toolRequiresConfirm ? "destructive" : actionPlan.riskLevel;
+      const effectiveRequiresConfirmation = actionPlan.requiresConfirmation;
+      const policyRisk = actionPlan.riskLevel;
 
       // Confirmation gate: destructive operations require confirmation before execution
       if (effectiveRequiresConfirmation) {
@@ -313,7 +312,8 @@ export class TimeManagementAgent {
         confirmationId,
       });
     } else if (actionPlan.kind === "batch_action" || actionPlan.kind === "defer_task") {
-      // V4+: batch / defer — high risk, always requires confirmation
+      // V3.7: batch / defer — high risk, always requires confirmation.
+      // params.actions[] 已由 PlanSafetyValidator 确认存在，序列化整个 params。
       const pending = await this.deps.confirmationService.createConfirmation({
         action_type: semanticFrame.userGoal,
         tool_name: actionPlan.kind,
@@ -325,6 +325,9 @@ export class TimeManagementAgent {
       await this.deps.logService.logSuccess(log.id, {
         kind: actionPlan.kind,
         confirmationId,
+        actionsCount: Array.isArray(actionPlan.params.actions)
+          ? (actionPlan.params.actions as unknown[]).length
+          : 0,
       });
     } else {
       await this.deps.logService.logSuccess(log.id, {
@@ -378,8 +381,11 @@ export class TimeManagementAgent {
                 ? "suggestion"
                 : "tool_plan";
 
+    // V3.7: 若 plannerPort 是 CompositePlanner，读取实际使用的 planner 类型
+    const plannerKind = this.getPlannerKind();
+
     const trace: AgentTrace = {
-      planner: "experience",
+      planner: plannerKind,
       domain: "time_management",
       mode: traceMode,
       toolName: actionPlan.toolName,
@@ -432,6 +438,14 @@ export class TimeManagementAgent {
         rawInput: userInput,
       },
     };
+  }
+
+  private getPlannerKind(): AgentTrace["planner"] {
+    const composite = this.deps.plannerPort as Partial<CompositePlanner>;
+    if (typeof composite.lastUsedPlanner === "string") {
+      return composite.lastUsedPlanner === "llm" ? "llm" : "experience";
+    }
+    return "experience";
   }
 
   private composeRecommendationMessage(

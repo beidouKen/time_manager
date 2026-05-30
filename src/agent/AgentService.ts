@@ -21,6 +21,11 @@ import { MetaHandler } from "@/agent/handlers/MetaHandler";
 import { FeedbackHandler } from "@/agent/handlers/FeedbackHandler";
 import { LowSignalHandler } from "@/agent/handlers/LowSignalHandler";
 import { LLMDirectHandler } from "@/agent/handlers/LLMDirectHandler";
+import type { LLMClient } from "@/agent/llm/LLMClient";
+import { DeepSeekClient } from "@/agent/llm/DeepSeekClient";
+import { LLMExperiencePlanner } from "@/agent/llm/LLMExperiencePlanner";
+import { CompositePlanner } from "@/agent/CompositePlanner";
+import { LLMChatExecutor } from "@/agent/llm/LLMChatExecutor";
 import type {
   AgentDomain,
   AgentHandlerResult,
@@ -34,6 +39,7 @@ import type {
   PlanOption,
   PlanProposal,
   SemanticFrame,
+  SinglePlanAction,
 } from "@/agent/types";
 import type { FreeSlot } from "@/agent/tools/schedule/getFreeSlotsTool";
 import { formatTime } from "@/lib/dateUtils";
@@ -104,11 +110,7 @@ interface PlanPrecheckResult {
   conflictInfo?: PlanConflictInfo;
 }
 
-interface SinglePlanAction {
-  toolName: string;
-  params: Record<string, unknown>;
-  summary?: string;
-}
+// SinglePlanAction is now exported from @/agent/types (V3.7)
 
 // ─── ProcessInput 调用上下文（V3 新增） ─────────────────────────────────────
 
@@ -139,8 +141,15 @@ interface AgentServiceOptions {
   scheduleService?: ScheduleService;
   logService?: ActionLogPort;
   confirmService?: ConfirmationService;
-  /** Phase 1+: 可替换的 Planner 实现（默认 ActionPlanner）。测试时可注入 StubPlanner。 */
+  /** Phase 1+: 可替换的 Planner 实现（默认使用 CompositePlanner）。测试时可注入 StubPlanner。 */
   plannerPort?: PlannerPort;
+  /**
+   * V3.7: 注入 LLM 客户端。
+   * - 不传：使用默认 DeepSeekClient（读取 VITE_LLM_AGENT_ENABLED 环境变量）。
+   * - 传 undefined 显式禁用 LLM，只走规则路径。
+   * - 测试时注入 MockLLMClient。
+   */
+  llmClient?: LLMClient | null;
   /** Phase 1+: 行为记录适配器（默认不启用）。 */
   memoryAdapter?: MemoryAdapter;
   /** Phase 1+: RAG 检索适配器（默认不启用）。 */
@@ -188,12 +197,31 @@ export class AgentService {
 
     this.experienceContextBuilder = new ConversationContextBuilder();
     this.semanticFrameParser = new SemanticFrameParser();
-    this.plannerPort = options.plannerPort ?? new ActionPlanner(this.taskService);
     this.responseBoundary = new ResponseBoundary();
     this.domainRouter = new AgentDomainRouter();
     this.memoryAdapter = options.memoryAdapter;
     this.ragAdapter = options.ragAdapter;
     this.notificationAdapter = options.notificationAdapter;
+
+    // V3.7: 组装 plannerPort
+    // 优先级：显式传入的 plannerPort（测试用）> CompositePlanner（生产）
+    if (options.plannerPort) {
+      this.plannerPort = options.plannerPort;
+    } else {
+      // options.llmClient === null 时显式禁用 LLM
+      const rulePlanner = new ActionPlanner(this.taskService);
+      // this.router 在 registerTools() 之前为空注册表，但 LLMExperiencePlanner
+      // 只在 plan() 时查 router，所以可以在 registerTools() 之前创建
+      let llmPlanner: LLMExperiencePlanner | undefined;
+      if (options.llmClient !== null) {
+        const client = options.llmClient ?? this.createDefaultLLMClient();
+        if (client) {
+          llmPlanner = new LLMExperiencePlanner(client, this.router);
+        }
+      }
+      this.plannerPort = new CompositePlanner(llmPlanner, rulePlanner);
+    }
+
     this.timeManagementAgent = new TimeManagementAgent({
       taskService: this.taskService,
       timeBlockService: this.timeBlockService,
@@ -205,10 +233,18 @@ export class AgentService {
       responseBoundary: this.responseBoundary,
       confirmationService: this.confirmService,
     });
+    // V3.7: 为只读域创建 LLMChatExecutor（与 time_management 共用同一个 LLM client）
+    const resolvedLLMClient = options.llmClient !== null
+      ? (options.llmClient ?? this.createDefaultLLMClient())
+      : undefined;
+    const chatExecutor = resolvedLLMClient
+      ? new LLMChatExecutor(resolvedLLMClient)
+      : undefined;
+
     this.handlers = new Map<AgentDomain, AgentHandler>([
-      ["general_chat", new LLMDirectHandler("general_chat")],
-      ["knowledge_qa", new LLMDirectHandler("knowledge_qa")],
-      ["writing_assistant", new LLMDirectHandler("writing_assistant")],
+      ["general_chat", new LLMDirectHandler("general_chat", chatExecutor)],
+      ["knowledge_qa", new LLMDirectHandler("knowledge_qa", chatExecutor)],
+      ["writing_assistant", new LLMDirectHandler("writing_assistant", chatExecutor)],
       ["external_info", new ExternalInfoHandler()],
       ["assistant_meta", new MetaHandler()],
       ["feedback_or_complaint", new FeedbackHandler()],
@@ -216,6 +252,12 @@ export class AgentService {
     ]);
 
     this.registerTools();
+  }
+
+  private createDefaultLLMClient(): LLMClient | undefined {
+    const enabled = (import.meta.env?.VITE_LLM_AGENT_ENABLED as string | undefined) === "true";
+    if (!enabled) return undefined;
+    return new DeepSeekClient();
   }
 
   private registerTools(): void {
@@ -433,6 +475,18 @@ export class AgentService {
     );
     await this.logService.logToolExecution(log.id, confirmation.tool_name, args);
 
+    // V3.7: 若 args.actions[] 存在（batch_action / defer_task），按序执行
+    const decomposedActions = args.actions as SinglePlanAction[] | undefined;
+    const isBatchKind =
+      confirmation.tool_name === "batch_action" ||
+      confirmation.tool_name === "defer_task";
+
+    if (isBatchKind && Array.isArray(decomposedActions) && decomposedActions.length > 0) {
+      const batchResult = await this.executeActionList(decomposedActions, log.id, confirmationId);
+      return batchResult;
+    }
+
+    // 单 tool 执行（原路径）
     const result = await this.router.execute(confirmation.tool_name, args);
 
     if (result.success) {
@@ -521,6 +575,82 @@ export class AgentService {
       intent: { intent: "unknown", confidence: 0, args: {}, rawInput: "" },
       actionLogId: log.id,
       metadata,
+    };
+  }
+
+  // ─── V3.7: batch/defer 原子操作顺序执行器 ────────────────────────────────
+
+  private async executeActionList(
+    actions: SinglePlanAction[],
+    parentLogId: string,
+    confirmationId: string
+  ): Promise<AgentResponse> {
+    const toolResults: AgentToolResult[] = [];
+    const refreshHints: AgentRefreshHints = { tasks: true, timeline: true };
+
+    for (const action of actions) {
+      await this.logService.logToolExecution(
+        parentLogId,
+        action.toolName,
+        action.params
+      );
+      const result = await this.router.execute(action.toolName, action.params);
+      toolResults.push(result);
+
+      if (!result.success) {
+        // short-circuit：第一个失败就停止
+        await this.logService.logFailure(
+          parentLogId,
+          result.error ?? result.message
+        );
+        const metadata: ChatMessageMetadata = {
+          toolName: action.toolName,
+          actionLogId: parentLogId,
+          confirmationId,
+          resultType: "failure",
+          source: "chat",
+        };
+        return {
+          message: this.composeBoundaryMessage(
+            "",
+            undefined,
+            "tool_failure",
+            toolResults
+          ),
+          intent: { intent: "unknown", confidence: 1, args: {}, rawInput: "" },
+          toolResult: result,
+          actionLogId: parentLogId,
+          metadata,
+          refreshHints,
+        };
+      }
+
+      this.trackLastEntities(action.toolName, result);
+    }
+
+    await this.logService.logSuccess(parentLogId, {
+      executedActions: toolResults.length,
+    });
+
+    const metadata: ChatMessageMetadata = {
+      actionLogId: parentLogId,
+      confirmationId,
+      resultType: "success",
+      source: "chat",
+    };
+
+    return {
+      message: this.composeBoundaryMessage(
+        "",
+        undefined,
+        "tool_success",
+        toolResults
+      ),
+      intent: { intent: "unknown", confidence: 1, args: {}, rawInput: "" },
+      toolResult: toolResults[toolResults.length - 1],
+      actionLogId: parentLogId,
+      metadata,
+      refreshHints,
     };
   }
 

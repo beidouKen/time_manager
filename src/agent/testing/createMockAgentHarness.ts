@@ -18,6 +18,7 @@ import type { PlannerPort } from "@/agent/experience/PlannerPort";
 import type { MemoryAdapter } from "@/agent/memory/MemoryAdapter";
 import type { RagAdapter } from "@/agent/memory/RagAdapter";
 import type { NotificationAdapter } from "@/agent/notification/NotificationAdapter";
+import type { LLMClient } from "@/agent/llm/LLMClient";
 import { MockMemoryAdapter } from "@/agent/memory/MockMemoryAdapter";
 import { MockRagAdapter } from "@/agent/memory/MockRagAdapter";
 import { MockNotificationAdapter } from "@/agent/notification/MockNotificationAdapter";
@@ -41,8 +42,14 @@ export interface MockAgentHarness {
 }
 
 export interface MockAgentHarnessOptions {
-  /** 注入自定义 PlannerPort（默认使用 ActionPlanner）。用于 StubPlanner 防御测试。 */
+  /** 注入自定义 PlannerPort（默认使用 ActionPlanner 规则路径）。用于 StubPlanner 防御测试。 */
   plannerPort?: PlannerPort;
+  /**
+   * V3.7: 注入 LLM 客户端。
+   * - 不传（undefined）：默认禁用 LLM（null），走规则路径，避免测试依赖真实 API。
+   * - 传 MockLLMClient：测试 LLM 路径。
+   */
+  llmClient?: LLMClient;
   /** 覆盖 MemoryAdapter（默认 MockMemoryAdapter）。 */
   memoryAdapter?: MemoryAdapter;
   /** 覆盖 RagAdapter（默认 MockRagAdapter）。 */
@@ -76,10 +83,23 @@ export function createMockAgentHarness(
     logService: logs,
     confirmService,
     plannerPort: options.plannerPort,
+    // V3.7: 默认禁用 LLM（null），避免测试依赖真实 API。
+    // 若需要测试 LLM 路径，显式传入 MockLLMClient。
+    llmClient: options.llmClient ?? null,
     memoryAdapter: memory,
     ragAdapter: rag,
     notificationAdapter: notifier,
   });
 
   return { agent, tasks, blocks, confirmRepo, logs, memory, rag, notifier };
+}
+
+/**
+ * 便捷构造：创建带 LLM client 的 mock harness（用于 LLM 安全边界测试）。
+ */
+export function createMockAgentHarnessWithLLM(
+  llmClient: LLMClient,
+  options: Omit<MockAgentHarnessOptions, "llmClient"> = {}
+): MockAgentHarness {
+  return createMockAgentHarness({ ...options, llmClient });
 }

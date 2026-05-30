@@ -1,16 +1,19 @@
 // ============================================================
-// prompts.ts — System Prompt + 工具描述生成
+// prompts.ts — System Prompt 生成（V3.7 重写）
 //
-// 设计原则：
-// 1. prompt 控制在合理 token 范围内（避免浪费）
-// 2. 工具列表硬编码（与 AgentService.registerTools 同步）
-//    如后续工具有变动，请同步更新 TOOL_DESCRIPTIONS
-// 3. JSON 输出格式要求在 prompt 中明确
+// 变更：
+// - system prompt 核心技能部分从 timeManagementSkill.md 读取
+// - 输出 schema 更新为 LLMExperiencePlanResponse 格式
+// - 工具列表保留为静态常量（与 AgentService.registerTools 同步）
 // ============================================================
 
+// eslint-disable-next-line @typescript-eslint/ban-ts-comment
+// @ts-ignore — vite ?raw 导入
+import skillContent from "@/agent/skills/timeManagementSkill.md?raw";
+
 /**
- * 工具精简描述（仅列出 LLM 决策所需的最小信息）。
- * 格式：toolName | 简要说明 | 关键参数
+ * 工具精简描述（供 LLM 决策工具选择）。
+ * toolName | 说明 | 关键参数
  */
 const TOOL_DESCRIPTIONS = `
 可用工具列表（toolName | 说明 | 关键参数）：
@@ -34,71 +37,104 @@ const TOOL_DESCRIPTIONS = `
 `.trim();
 
 /**
- * JSON 输出格式说明。
+ * V3.7 输出格式（LLMExperiencePlanResponse）。
+ * 直接对应 ExperienceActionPlan.kind，减少 AgentService 层的转换。
  */
 const OUTPUT_FORMAT = `
 你必须输出严格 JSON，不要输出 Markdown、解释文字或代码块。
 
 输出结构：
 {
-  "type": "tool_plan" | "clarification" | "chitchat" | "unsupported",
-  "intent": "<意图名，如 create_task>",
-  "toolName": "<工具名或 null>",
-  "params": { /* 工具参数 */ },
+  "kind": "tool" | "query_schedule" | "request_recommendation" | "batch_action" | "defer_task" | "direct_response" | "chat" | "clarification" | "unsupported",
+  "userGoal": "<SemanticUserGoal，如 create_and_schedule_task>",
+  "toolName": "<工具名，kind=tool 时必填，其他时为 null>",
+  "params": { /* 工具参数或操作参数 */ },
   "requiresConfirmation": true | false,
   "riskLevel": "safe" | "confirm" | "destructive",
   "summary": "<人类可读操作摘要>",
   "clarifyingQuestion": "<追问内容或 null>",
-  "confidence": 0.0~1.0
+  "confidence": 0.0~1.0,
+  "actions": [ /* kind=batch_action 或 defer_task 时必填，格式见下 */ ]
 }
 
-type 说明：
-- tool_plan: 信息充分，可生成工具计划
-- clarification: 信息不足或有歧义，需追问用户
-- chitchat: 普通闲聊，不调用工具
+kind 说明：
+- tool: 信息充分，调用单个工具
+- query_schedule: 查询任务的时间安排
+- request_recommendation: 需要系统推荐时间（用户未指定具体时间）
+- batch_action: 批量操作（如批量删除），必须带 actions[]
+- defer_task: 延期操作，必须带 actions[]
+- direct_response: 直接回复（如回答当前时间）
+- chat: 普通闲聊
+- clarification: 信息不足，需追问用户
 - unsupported: 超出系统能力范围
+
+actions 格式（batch_action / defer_task 时必填）：
+[
+  { "toolName": "delete_task", "params": { "taskId": "xxx" }, "summary": "删除任务 xxx" },
+  ...
+]
+
+userGoal 可选值：
+ask_current_time | create_and_schedule_task | create_reminder | delete_task | query_schedule |
+general_chat | unsupported_intent | query_schedule_range | batch_delete_tasks |
+batch_reschedule_day | defer_task
 `.trim();
 
 /**
- * 安全规则。
+ * 安全规则（代码层会强制执行，prompt 仅作为提示）。
  */
 const SAFETY_RULES = `
 安全规则（必须严格遵守）：
 1. 不要说"我已经创建/删除/修改了..."，你只能输出计划，实际执行由系统完成
-2. delete_task、delete_time_block、reschedule_day 必须设 requiresConfirmation=true
-3. 参数不足时必须返回 type=clarification，不要猜测参数
-4. 有多个候选对象时（如"这个任务"无法唯一定位）必须返回 type=clarification
-5. 用户请求文件操作、代码执行、Shell、打开程序等系统操作时返回 type=unsupported
-6. 不要把 API Key 或任何敏感信息输出到响应中
-7. 不得假装执行工具——所有写操作必须通过 type=tool_plan 返回，由系统执行
-8. 不得编造不存在的任务或日程——只能引用上下文中已列出的 ID；无法定位时返回 type=clarification
-9. 高风险操作（delete_task、delete_time_block、reschedule_day）必须设 requiresConfirmation=true，且 riskLevel=destructive
+2. delete_task、delete_time_block、reschedule_day 必须设 requiresConfirmation=true，riskLevel=destructive
+3. batch_action / defer_task 必须携带 actions[]，且 requiresConfirmation=true
+4. 参数不足时必须返回 kind=clarification，不要猜测参数
+5. 有多个候选对象时（如"这个任务"无法唯一定位）必须返回 kind=clarification
+6. 用户请求文件操作、代码执行、Shell、打开程序等系统操作时返回 kind=unsupported
+7. 不要把 API Key 或任何敏感信息输出到响应中
+8. 不得假装执行工具——所有写操作必须通过 kind=tool 或 kind=batch_action 返回，由系统执行
+9. 不得编造不存在的任务或日程——只能引用上下文中已列出的 ID；无法定位时返回 kind=clarification
 `.trim();
 
 /**
- * 生成完整的 system prompt。
- * 接收动态上下文（当前日期时间）。
+ * 生成完整的 system prompt（V3.7 版本，从 skill md 动态注入）。
  */
 export function buildSystemPrompt(currentDateTime: string): string {
-  return `你是 Time Manager 的计划管理 Agent。
+  const skill = typeof skillContent === "string" ? skillContent : "";
 
-当前时间：${currentDateTime}
+  return `${skill}
 
-你的职责：
-- 理解用户的自然语言输入
-- 将其转换为结构化工具计划（JSON 格式）
-- 不直接修改数据库，不执行系统命令，不假装已完成操作
+---
+
+## 当前时间
+
+${currentDateTime}
+
+---
+
+## 工具列表
 
 ${TOOL_DESCRIPTIONS}
 
+---
+
+## 输出格式
+
 ${OUTPUT_FORMAT}
+
+---
+
+## 安全规则
 
 ${SAFETY_RULES}
 
-上下文说明：
+---
+
+## 上下文说明
+
 - 用户消息前会附带"当前上下文"块，包含今日任务和时间安排
 - 如果用户说"这个任务"/"它"等指代，先从上下文中找唯一匹配；找不到则 clarification
-- 时间表达式（如"明天下午3点"）请转换为 ISO 8601 格式（如 2026-05-19T15:00:00.000Z）`;
+- 时间表达式（如"明天下午3点"）请转换为 ISO 8601 格式（如 2026-05-31T15:00:00.000+08:00）`;
 }
 
 /**

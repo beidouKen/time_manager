@@ -2,6 +2,7 @@ import type {
   AgentExperienceContext,
   ExperienceActionPlan,
   SemanticFrame,
+  SinglePlanAction,
 } from "@/agent/types";
 import { formatDateKey } from "@/agent/experience/dateFormatting";
 import type { PlannerPort } from "@/agent/experience/PlannerPort";
@@ -191,9 +192,10 @@ export class ActionPlanner implements PlannerPort {
         };
       }
 
-      // V4+: 批量删除（高风险，必须确认）
+      // V4+: 批量删除（高风险，必须确认）— V3.7 预先分解 actions[]
       case "batch_delete_tasks": {
         const { dateRange } = frame;
+        const actions = await this.buildBatchDeleteActions(dateRange);
         return {
           ...base,
           kind: "batch_action",
@@ -201,9 +203,9 @@ export class ActionPlanner implements PlannerPort {
           riskLevel: "destructive",
           params: {
             dateRange: dateRange ?? null,
-            batchActions: [] as Array<{ toolName: string; args: Record<string, unknown> }>,
+            actions,
           },
-          summary: `批量删除${dateRange?.sourceText ?? ""}任务`,
+          summary: `批量删除${dateRange?.sourceText ?? ""}任务（共 ${actions.length} 个）`,
           refreshHints: { tasks: true, timeline: true },
           traceLabel: "batch_delete_tasks:confirmation_required",
           replayKey: `batch_delete:${dateRange?.from ?? ""}:${dateRange?.to ?? ""}`,
@@ -226,11 +228,12 @@ export class ActionPlanner implements PlannerPort {
         };
       }
 
-      // V4+: 延期任务（建议，不直接改原计划）
+      // V4+: 延期任务（建议，不直接改原计划）— V3.7 预先分解 actions[]
       case "defer_task": {
         const title = frame.extractedTitle ?? frame.objectReferences[0]?.keyword ?? "该任务";
         const taskId = context.lastCreatedTaskId ?? context.lastMentionedTaskIds[0] ?? null;
         const targetAnchor = frame.timeExpressions.find(e => e.normalized === "absolute");
+        const actions = this.buildDeferActions(taskId, title, targetAnchor?.iso ?? null);
         return {
           ...base,
           kind: "defer_task",
@@ -241,6 +244,7 @@ export class ActionPlanner implements PlannerPort {
             title,
             targetTime: targetAnchor?.iso ?? null,
             targetSourceText: targetAnchor?.sourceText ?? null,
+            actions,
           },
           summary: `建议延期「${title}」`,
           refreshHints: { tasks: true, timeline: true },
@@ -281,5 +285,75 @@ export class ActionPlanner implements PlannerPort {
     );
 
     return matches.length === 1 ? matches[0].id : null;
+  }
+
+  // ─── V3.7 辅助：预先分解 batch/defer 为 actions[] ────────────────────────
+
+  private async buildBatchDeleteActions(
+    dateRange: SemanticFrame["dateRange"]
+  ): Promise<SinglePlanAction[]> {
+    try {
+      const allTasks = await this.taskService.getTasks({ excludeDeleted: true });
+      const activeTasks = allTasks.filter((t) => t.status !== "done" && t.status !== "cancelled");
+
+      if (!dateRange) {
+        return activeTasks.map((t) => ({
+          toolName: "delete_task",
+          params: { taskId: t.id, title: t.title },
+          summary: `删除任务「${t.title}」`,
+        }));
+      }
+
+      const from = new Date(dateRange.from + "T00:00:00");
+      const to = new Date(dateRange.to + "T23:59:59");
+
+      const inRange = activeTasks.filter((t) => {
+        if (!t.deadline) return false;
+        const d = new Date(t.deadline);
+        return d >= from && d <= to;
+      });
+
+      if (inRange.length === 0) {
+        return activeTasks.map((t) => ({
+          toolName: "delete_task",
+          params: { taskId: t.id, title: t.title },
+          summary: `删除任务「${t.title}」`,
+        }));
+      }
+
+      return inRange.map((t) => ({
+        toolName: "delete_task",
+        params: { taskId: t.id, title: t.title },
+        summary: `删除任务「${t.title}」`,
+      }));
+    } catch {
+      return [];
+    }
+  }
+
+  private buildDeferActions(
+    taskId: string | null,
+    title: string,
+    targetTime: string | null
+  ): SinglePlanAction[] {
+    if (!taskId) return [];
+
+    if (targetTime) {
+      return [
+        {
+          toolName: "update_task",
+          params: { taskId, deadline: targetTime },
+          summary: `将「${title}」截止时间更新为 ${targetTime.slice(0, 10)}`,
+        },
+      ];
+    }
+
+    return [
+      {
+        toolName: "update_task",
+        params: { taskId, status: "todo" },
+        summary: `将「${title}」标记为待办（稍后安排）`,
+      },
+    ];
   }
 }

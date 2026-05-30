@@ -22,6 +22,12 @@ function getDateTimeParts(
   isoString: string,
   timezone: string
 ): Record<string, string> {
+  const date = new Date(isoString);
+  if (isNaN(date.getTime())) {
+    // 返回占位符，避免崩溃
+    return { year: "--", month: "--", day: "--", hour: "--", minute: "--" };
+  }
+
   const formatter = new Intl.DateTimeFormat("zh-CN", {
     timeZone: timezone,
     year: "numeric",
@@ -33,7 +39,7 @@ function getDateTimeParts(
   });
 
   return Object.fromEntries(
-    formatter.formatToParts(new Date(isoString)).map((part) => [
+    formatter.formatToParts(date).map((part) => [
       part.type,
       part.value,
     ])

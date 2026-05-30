@@ -4,14 +4,14 @@ import type { AgentResponse } from "@/agent/AgentService";
 import type { ChatMessageMetadata } from "@/agent/types";
 import type { AgentExperienceContext, ExperienceActionPlan, SemanticFrame } from "@/agent/types";
 import { ResponseBoundary } from "@/agent/experience/ResponseBoundary";
-import { SqliteConversationRepository } from "@/repositories/sqlite/SqliteConversationRepository";
+import { ConversationService } from "@/services/ConversationService";
 import type { ConversationMessage } from "@/types/agent.types";
 import { useTaskStore } from "@/store/taskStore";
 import { useTimeBlockStore } from "@/store/timeBlockStore";
 import { useUiStore } from "@/store/uiStore";
 
 const agentService = new AgentService();
-const conversationRepo = new SqliteConversationRepository();
+const conversationService = new ConversationService();
 const responseBoundary = new ResponseBoundary();
 
 // ─── ChatMessage 类型（前端运行时状态） ──────────────────────────────────────
@@ -116,7 +116,7 @@ export const useChatStore = create<ChatState & ChatActions>((set, _get) => ({
 
   loadHistory: async () => {
     try {
-      const history = await conversationRepo.findRecent(50);
+      const history = await conversationService.loadRecent(50);
       const messages: ChatMessage[] = history.map((m: ConversationMessage) => {
         const meta = parseMetadata(m.metadata_json);
         return {
@@ -153,7 +153,7 @@ export const useChatStore = create<ChatState & ChatActions>((set, _get) => ({
     set((s) => ({ messages: [...s.messages, userMsg] }));
 
     // 持久化用户消息（无 metadata）
-    await conversationRepo.create({ role: "user", content });
+    await conversationService.createMessage({ role: "user", content });
 
     try {
 
@@ -186,7 +186,7 @@ export const useChatStore = create<ChatState & ChatActions>((set, _get) => ({
       }));
 
       // 持久化 assistant 消息，带 metadata_json
-      await conversationRepo.create({
+      await conversationService.createMessage({
         role: "assistant",
         content: response.message,
         metadata_json: buildMetadataJson(response),
@@ -264,7 +264,7 @@ export const useChatStore = create<ChatState & ChatActions>((set, _get) => ({
         isProcessing: false,
       }));
 
-      await conversationRepo.create({
+      await conversationService.createMessage({
         role: "assistant",
         content: response.message,
         metadata_json: buildMetadataJson(response),
@@ -293,7 +293,7 @@ export const useChatStore = create<ChatState & ChatActions>((set, _get) => ({
         isProcessing: false,
       }));
 
-      await conversationRepo.create({
+      await conversationService.createMessage({
         role: "assistant",
         content: response.message,
         metadata_json: buildMetadataJson(response),
@@ -304,7 +304,7 @@ export const useChatStore = create<ChatState & ChatActions>((set, _get) => ({
   },
 
   clearHistory: async () => {
-    await conversationRepo.deleteAll();
+    await conversationService.clearAll();
     set({ messages: [] });
   },
 }));
