@@ -147,6 +147,7 @@ function createAgentHarness(): {
       timeBlockService: blocks,
       scheduleService: schedule,
       logService,
+      llmClient: null, // V3.7: 测试中禁用 LLM，走规则路径
     }),
     tasks,
     blocks,

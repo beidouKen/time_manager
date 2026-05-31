@@ -54,23 +54,32 @@ export class ScheduleTaskTool extends BaseTool {
         );
       }
 
-      // No existing task - create task then schedule
+      // No existing task - create task then schedule (with compensating rollback)
       const newTask = await this.taskService.createTask({
         title,
         estimated_duration_minutes: duration,
         category,
       });
-      const block = await this.scheduleService.scheduleTaskToTimeBlock({
-        taskId: newTask.id,
-        title,
-        startTime,
-        endTime,
-      });
-
-      return this.success(
-        `已创建任务「${title}」并安排到时间轴`,
-        { task: newTask, timeBlock: block }
-      );
+      try {
+        const block = await this.scheduleService.scheduleTaskToTimeBlock({
+          taskId: newTask.id,
+          title,
+          startTime,
+          endTime,
+        });
+        return this.success(
+          `已创建任务「${title}」并安排到时间轴`,
+          { task: newTask, timeBlock: block }
+        );
+      } catch (scheduleErr) {
+        // 安排时间块失败，回滚刚创建的任务以避免孤儿数据
+        try {
+          await this.taskService.deleteTask(newTask.id);
+        } catch {
+          // 回滚失败只记录，不覆盖原始错误
+        }
+        return this.failure(`安排时间块失败，已回滚任务创建：${String(scheduleErr)}`);
+      }
     } catch (e) {
       return this.failure(String(e));
     }

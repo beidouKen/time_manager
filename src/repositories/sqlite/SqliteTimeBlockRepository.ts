@@ -5,7 +5,6 @@ import type {
   CreateTimeBlockInput,
   UpdateTimeBlockInput,
 } from "@/types/timeblock.types";
-import { formatISO } from "date-fns";
 
 function rowToTimeBlock(row: Record<string, unknown>): TimeBlock {
   return {
@@ -30,14 +29,16 @@ function rowToTimeBlock(row: Record<string, unknown>): TimeBlock {
     skipped_at: (row.skipped_at as string) ?? undefined,
     delayed_at: (row.delayed_at as string) ?? undefined,
     feedback_note: (row.feedback_note as string) ?? undefined,
+    feedback_snoozed_until:
+      (row.feedback_snoozed_until as string) ?? undefined,
   };
 }
 
 export class SqliteTimeBlockRepository implements ITimeBlockRepository {
   async findByDateRange(start: Date, end: Date): Promise<TimeBlock[]> {
     const db = await getDb();
-    const startStr = formatISO(start);
-    const endStr = formatISO(end);
+    const startStr = start.toISOString();
+    const endStr = end.toISOString();
 
     const rows = await db.select<Record<string, unknown>[]>(
       `SELECT * FROM time_blocks
@@ -167,6 +168,14 @@ export class SqliteTimeBlockRepository implements ITimeBlockRepository {
       fields.push(`feedback_note = $${idx++}`);
       params.push(data.feedback_note ?? null);
     }
+    if (data.feedback_snoozed_until !== undefined) {
+      fields.push(`feedback_snoozed_until = $${idx++}`);
+      params.push(data.feedback_snoozed_until ?? null);
+    }
+    if (data.deleted_at !== undefined) {
+      fields.push(`deleted_at = $${idx++}`);
+      params.push(data.deleted_at ?? null);
+    }
 
     params.push(id);
     await db.execute(
@@ -191,7 +200,10 @@ export class SqliteTimeBlockRepository implements ITimeBlockRepository {
   async countActiveByTaskId(taskId: string): Promise<number> {
     const db = await getDb();
     const rows = await db.select<{ count: number }[]>(
-      "SELECT COUNT(*) as count FROM time_blocks WHERE task_id = $1 AND deleted_at IS NULL",
+      `SELECT COUNT(*) as count FROM time_blocks
+       WHERE task_id = $1
+         AND deleted_at IS NULL
+         AND status NOT IN ('done', 'skipped', 'cancelled', 'delayed')`,
       [taskId]
     );
     return rows[0]?.count ?? 0;

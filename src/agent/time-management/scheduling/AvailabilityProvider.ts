@@ -72,9 +72,19 @@ function localStringToUtc(
 export class AvailabilityProvider {
   constructor(private timeBlockService: TimeBlockService) {}
 
+  /**
+   * 计算指定日期的空闲段。
+   *
+   * V3.7 P0-3：可选参数 `now` 用于跳过已过去的部分日窗。
+   * 调用方传入 now 后，slot 起点会被抬到 max(dayStart, now)，
+   * 减少对 SchedulingReasoner 的无效输入。Reasoner 中再做 buffer 抬升。
+   *
+   * 不传 now（旧用法）保持原行为，便于 V4+ 多日预览这种需要看完整日窗的场景。
+   */
   async getAvailability(
     date: Date,
-    timezone = "Asia/Shanghai"
+    timezone = "Asia/Shanghai",
+    options: { now?: Date } = {}
   ): Promise<AvailabilitySlot[]> {
     const blocks = await this.timeBlockService.getBlocksForDate(date);
     const active = blocks
@@ -82,13 +92,26 @@ export class AvailabilityProvider {
       .sort((a, b) => a.start_time.localeCompare(b.start_time));
 
     const { dayStart, dayEnd } = zonedDayBounds(date, timezone);
+    const dayStartMs = dayStart.getTime();
+    const dayEndMs = dayEnd.getTime();
+
+    // 如果当前时间已晚于日窗结束（如 23:00 之后问明天的事）→ 不裁剪，让 Reasoner 处理。
+    // 如果 now 落在日窗内 → 把 cursor 抬升，减少完全位于过去的 slot。
+    const nowMs = options.now ? options.now.getTime() : -Infinity;
+    const isNowInsideDay = nowMs >= dayStartMs && nowMs < dayEndMs;
+    const initialCursor = isNowInsideDay
+      ? Math.max(dayStartMs, nowMs)
+      : dayStartMs;
 
     if (active.length === 0) {
-      return [{ start: dayStart.toISOString(), end: dayEnd.toISOString() }];
+      if (initialCursor >= dayEndMs) return [];
+      return [
+        { start: new Date(initialCursor).toISOString(), end: dayEnd.toISOString() },
+      ];
     }
 
     const slots: AvailabilitySlot[] = [];
-    let cursor = dayStart.getTime();
+    let cursor = initialCursor;
     for (const block of active) {
       const blockStart = new Date(block.start_time).getTime();
       const blockEnd = new Date(block.end_time).getTime();
@@ -101,7 +124,7 @@ export class AvailabilityProvider {
       cursor = Math.max(cursor, blockEnd);
     }
 
-    if (cursor < dayEnd.getTime()) {
+    if (cursor < dayEndMs) {
       slots.push({
         start: new Date(cursor).toISOString(),
         end: dayEnd.toISOString(),

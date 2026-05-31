@@ -50,6 +50,7 @@ export class ActionPlanner implements PlannerPort {
 
         if (!hasStartNow && !absoluteStart) {
           const title = frame.extractedTitle ?? "新任务";
+          const timeOfDay = frame.constraints.timeOfDay;
           return {
             ...base,
             kind: "request_recommendation",
@@ -57,6 +58,7 @@ export class ActionPlanner implements PlannerPort {
               title,
               duration,
               category: frame.category,
+              ...(timeOfDay ? { timeOfDay } : {}),
             },
             summary: "request recommendation",
             traceLabel: "create_and_schedule_task:fuzzy_recommendation",
@@ -196,6 +198,12 @@ export class ActionPlanner implements PlannerPort {
       case "batch_delete_tasks": {
         const { dateRange } = frame;
         const actions = await this.buildBatchDeleteActions(dateRange);
+        // dateRange 已提供但匹配为空 → 返回空 actions[] 并提示无需操作
+        const summaryText = dateRange
+          ? actions.length === 0
+            ? `${dateRange.sourceText ?? ""}范围内未找到活跃任务`
+            : `批量删除${dateRange.sourceText ?? ""}活跃任务（共 ${actions.length} 个）`
+          : `批量删除全部活跃任务（共 ${actions.length} 个）`;
         return {
           ...base,
           kind: "batch_action",
@@ -205,23 +213,24 @@ export class ActionPlanner implements PlannerPort {
             dateRange: dateRange ?? null,
             actions,
           },
-          summary: `批量删除${dateRange?.sourceText ?? ""}任务（共 ${actions.length} 个）`,
+          summary: summaryText,
           refreshHints: { tasks: true, timeline: true },
           traceLabel: "batch_delete_tasks:confirmation_required",
           replayKey: `batch_delete:${dateRange?.from ?? ""}:${dateRange?.to ?? ""}`,
         };
       }
 
-      // V4+: 批量重排（高风险）
+      // V4+: 批量重排（高风险）— V3.7 预先分解 actions[]
       case "batch_reschedule_day": {
         const { dateRange } = frame;
+        const actions = this.buildBatchRescheduleActions(dateRange);
         return {
           ...base,
           kind: "batch_action",
           requiresConfirmation: true,
           riskLevel: "destructive",
-          params: { dateRange: dateRange ?? null },
-          summary: `重排${dateRange?.sourceText ?? ""}计划`,
+          params: { dateRange: dateRange ?? null, actions },
+          summary: `重排${dateRange?.sourceText ?? "今天"}计划`,
           refreshHints: { tasks: true, timeline: true },
           traceLabel: "batch_reschedule_day:confirmation_required",
           replayKey: `batch_reschedule:${dateRange?.from ?? ""}`,
@@ -313,12 +322,9 @@ export class ActionPlanner implements PlannerPort {
         return d >= from && d <= to;
       });
 
+      // dateRange 提供但无匹配 → 返回空数组，不扩大作用域
       if (inRange.length === 0) {
-        return activeTasks.map((t) => ({
-          toolName: "delete_task",
-          params: { taskId: t.id, title: t.title },
-          summary: `删除任务「${t.title}」`,
-        }));
+        return [];
       }
 
       return inRange.map((t) => ({
@@ -329,6 +335,20 @@ export class ActionPlanner implements PlannerPort {
     } catch {
       return [];
     }
+  }
+
+  private buildBatchRescheduleActions(
+    dateRange: SemanticFrame["dateRange"]
+  ): SinglePlanAction[] {
+    const dateKey = dateRange?.from ?? formatDateKey(new Date());
+    const sourceText = dateRange?.sourceText ?? "今天";
+    return [
+      {
+        toolName: "reschedule_day",
+        params: { date: dateKey },
+        summary: `重排${sourceText}的时间块`,
+      },
+    ];
   }
 
   private buildDeferActions(

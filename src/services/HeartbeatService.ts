@@ -135,7 +135,8 @@ export class HeartbeatService {
    * 返回需要弹出结束反馈的 TimeBlock（每个块只弹一次）。
    * - now >= end_time（时间块已结束）
    * - status 为 scheduled 或 in_progress（尚未完成反馈）
-   * - end_prompt_sent_at 为空（防重复弹出）
+   * - end_prompt_sent_at 为空（防永久重复）
+   * - feedback_snoozed_until 为空或已过（V3.7 P0-2：暂缓静默期内不再弹）
    * - 未软删除
    */
   getPendingFeedback(blocks: TimeBlock[], now: Date): TimeBlock | null {
@@ -146,7 +147,8 @@ export class HeartbeatService {
         !b.deleted_at &&
         (b.status === "scheduled" || b.status === "in_progress") &&
         b.end_time <= nowStr &&
-        !b.end_prompt_sent_at
+        !b.end_prompt_sent_at &&
+        !(b.feedback_snoozed_until && b.feedback_snoozed_until > nowStr)
     );
 
     if (candidates.length === 0) return null;
@@ -170,6 +172,24 @@ export class HeartbeatService {
   async markEndPromptSent(blockId: string): Promise<TimeBlock> {
     return this.timeBlockService.updateExecutionState(blockId, {
       end_prompt_sent_at: new Date().toISOString(),
+    });
+  }
+
+  /**
+   * V3.7 P0-2: 用户对结束反馈点「暂不处理」时调用。
+   * 把 feedback_snoozed_until 写入 DB（默认 +10min），跨 session/页面切换后
+   * 仍能在静默期内不重复弹窗。
+   *
+   * 注意：与 markEndPromptSent 的区别——后者一次性永久标记，前者临时暂缓。
+   */
+  async snoozeFeedback(
+    blockId: string,
+    options: { minutes?: number } = {}
+  ): Promise<TimeBlock> {
+    const minutes = options.minutes ?? 10;
+    const until = new Date(Date.now() + minutes * 60 * 1000).toISOString();
+    return this.timeBlockService.updateExecutionState(blockId, {
+      feedback_snoozed_until: until,
     });
   }
 

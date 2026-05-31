@@ -6,7 +6,6 @@ import {
   isValid,
   differenceInMinutes,
   addMinutes,
-  formatISO,
   isBefore,
   isAfter,
   areIntervalsOverlapping,
@@ -43,7 +42,7 @@ export function getDayRange(date: Date): { start: Date; end: Date } {
 }
 
 export function toISOString(date: Date): string {
-  return formatISO(date);
+  return date.toISOString();
 }
 
 export function parseDate(isoString: string): Date {

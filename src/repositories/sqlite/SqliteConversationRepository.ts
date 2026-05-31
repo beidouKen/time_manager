@@ -8,7 +8,7 @@ import type {
 export class SqliteConversationRepository implements IConversationRepository {
   async create(data: CreateMessageInput): Promise<ConversationMessage> {
     const db = await getDb();
-    const id = crypto.randomUUID();
+    const id = data.id ?? crypto.randomUUID();
     const now = new Date().toISOString();
 
     await db.execute(
@@ -46,5 +46,20 @@ export class SqliteConversationRepository implements IConversationRepository {
   async deleteAll(): Promise<void> {
     const db = await getDb();
     await db.execute("DELETE FROM conversation_messages");
+  }
+
+  async updateMetadata(id: string, metadataJson: string): Promise<boolean> {
+    const db = await getDb();
+    const result = await db.execute(
+      `UPDATE conversation_messages SET metadata_json = $1 WHERE id = $2`,
+      [metadataJson, id]
+    );
+    // Tauri sql 插件返回的 result.rowsAffected 在不同实现下名字略不同；
+    // 取保守判断：影响行 > 0 视为成功。
+    const affected =
+      (result as { rowsAffected?: number; changes?: number }).rowsAffected ??
+      (result as { changes?: number }).changes ??
+      0;
+    return affected > 0;
   }
 }

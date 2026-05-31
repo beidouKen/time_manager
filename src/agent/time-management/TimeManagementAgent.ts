@@ -282,10 +282,17 @@ export class TimeManagementAgent {
       });
     } else if (actionPlan.kind === "request_recommendation") {
       const duration = Number(actionPlan.params.duration ?? 30);
+      // V3.7 P0-3：把当前时间传给 RecommendationPlanner，避免推荐 08:00 这种已过去的时间。
+      const now = new Date(context.currentDatetime);
+      const timeOfDay = actionPlan.params.timeOfDay as
+        | import("@/agent/experience/SemanticFrameParser").TimeOfDayRange
+        | undefined;
       const candidates = await this.recommendationPlanner.plan({
-        date: new Date(context.currentDatetime),
+        date: now,
         durationMinutes: Number.isFinite(duration) ? duration : 30,
         timezone: context.timezone,
+        now,
+        timeOfDay,
       });
       if (candidates.length > 0) {
         const recommendation = candidates[0];
@@ -404,6 +411,10 @@ export class TimeManagementAgent {
         ? "schedule_task"
         : "unknown";
 
+    // request_recommendation：用户还未确认，resultType 应为 "pending_confirmation"
+    const isRecommendationPending =
+      actionPlan.kind === "request_recommendation" && !!confirmationId;
+
     const metadata: ChatMessageMetadata = {
       intent: semanticFrame.userGoal,
       toolName: actionPlan.toolName,
@@ -413,10 +424,14 @@ export class TimeManagementAgent {
         primaryResult?.relatedTaskId ??
         (actionPlan.params.taskId as string | undefined),
       relatedTimeBlockId: primaryResult?.relatedTimeBlockId,
-      resultType: primaryResult && !primaryResult.success ? "failure" : "success",
+      resultType: isRecommendationPending
+        ? "pending_confirmation"
+        : primaryResult && !primaryResult.success
+          ? "failure"
+          : "success",
       source: "llm",
       confidence: semanticFrame.confidence,
-      llmResponseType: traceMode === "chitchat" ? "chitchat" : "tool_plan",
+      llmResponseType: traceMode === "chitchat" ? "chitchat" : traceMode === "clarification" ? "clarification" : "tool_plan",
       agentTrace: trace,
     };
 

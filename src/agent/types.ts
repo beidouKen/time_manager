@@ -101,11 +101,41 @@ export type AgentDomain =
   | "feedback_or_complaint"
   | "low_signal";
 
+// ─── V3.7 P1 DomainRoutingDecision（LLMDomainClassifier 输出契约） ───────────
+
+export interface DomainRoutingDecision {
+  domain: AgentDomain;
+  /** 细分子类型，如 meta_model / meta_capabilities / meta_app_help */
+  subtype?: string;
+  /** 置信度 0..1 */
+  confidence: number;
+  /** true 表示此次分类需要写操作，只有 time_management 合法 */
+  requiresWrite: boolean;
+  /** 可读 trace 原因，用于 QA */
+  reason: string;
+}
+
 export interface AgentRouteResult {
   domain: AgentDomain;
   confidence: number;
   matchedRule?: string;
   rawInput: string;
+  /** V3.7 P1: 路由来源 */
+  routerSource?: "contextual" | "llm" | "fallback";
+  /** V3.7 P1: LLM 分类决策（routerSource=llm 时存在） */
+  llmDecision?: DomainRoutingDecision;
+  /** V3.7 P1: fallback 原因（routerSource=fallback 时存在） */
+  fallbackReason?: string;
+  /** V3.7 P1: LLM 决策子类型（assistant_meta 细分等） */
+  subtype?: string;
+  /**
+   * V3.7 P1: ContextualPreRouter 检测到 pending confirmation 回复时填充。
+   * AgentService.processInput 直接转发给 confirmAction / rejectAction。
+   */
+  pendingAction?: {
+    kind: "confirm" | "reject" | "adjust_later" | "adjust_earlier";
+    confirmationId: string;
+  };
 }
 
 export interface AgentHandlerResult {
@@ -379,6 +409,12 @@ export interface SinglePlanAction {
  */
 export interface AgentTrace {
   planner: "llm" | "experience" | "router";
+  /** V3.7 P1: 三段式路由器来源（planner=router 时填充） */
+  routerSource?: "contextual" | "llm" | "fallback";
+  /** V3.7 P1: LLM 分类决策（routerSource=llm 时填充） */
+  llmDecision?: DomainRoutingDecision;
+  /** V3.7 P1: fallback 原因（routerSource=fallback 时填充） */
+  routerFallbackReason?: string;
   mode:
     | "tool_plan"
     | "clarification"
@@ -465,6 +501,14 @@ export interface PlanOption {
     params: Record<string, unknown>;
     summary?: string;
   }>;
+  /**
+   * V3.7 P1: UI 层附加动作，不进入 ToolRouter。
+   * - open_schedule_dialog: 执行完 create_task 后由 UI 打开调度对话框
+   * - split_then_recommend: 创建任务后由 AgentService/UI 串行推荐时段
+   */
+  uiAction?:
+    | { kind: "open_schedule_dialog"; taskId?: string; defaultDurationMinutes?: number }
+    | { kind: "split_then_recommend"; durationMinutes: number };
 }
 
 /**

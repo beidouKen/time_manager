@@ -9,6 +9,7 @@ import { CreateTimeBlockSchema, UpdateTimeBlockSchema } from "@/types/timeblock.
 import { getDayRange } from "@/lib/dateUtils";
 
 // V2 执行状态更新的字段子集（用于 HeartbeatService 调用）
+// V3.7 P0-2: 加入 feedback_snoozed_until
 export type ExecutionStateUpdate = Pick<
   UpdateTimeBlockInput,
   | "status"
@@ -20,6 +21,7 @@ export type ExecutionStateUpdate = Pick<
   | "skipped_at"
   | "delayed_at"
   | "feedback_note"
+  | "feedback_snoozed_until"
 >;
 
 export class TimeBlockService {
@@ -63,6 +65,7 @@ export class TimeBlockService {
   ): Promise<TimeBlock> {
     const existing = await this.repo.findById(id);
     if (!existing) throw new Error("时间块不存在");
+    if (existing.deleted_at) throw new Error("时间块已删除");
     return this.repo.update(id, { status });
   }
 
@@ -90,5 +93,13 @@ export class TimeBlockService {
 
   async countActiveByTaskId(taskId: string): Promise<number> {
     return this.repo.countActiveByTaskId(taskId);
+  }
+
+  /**
+   * V3.7 P0-2: 对指定 TimeBlock 设置反馈静默截止时间（snooze）。
+   * 静默期内 HeartbeatService.getPendingFeedback 不再返回该 block。
+   */
+  async snoozeFeedback(blockId: string, untilISO: string): Promise<TimeBlock> {
+    return this.updateExecutionState(blockId, { feedback_snoozed_until: untilISO });
   }
 }

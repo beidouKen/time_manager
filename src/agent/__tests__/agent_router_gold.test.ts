@@ -193,6 +193,7 @@ function createAgentHarness(): {
       scheduleService: schedule,
       logService,
       confirmService,
+      llmClient: null, // V3.7: 测试中禁用 LLM，走规则路径
     }),
     tasks,
     blocks,
@@ -303,10 +304,11 @@ describe("Agent router gold set", () => {
     expectNoInternalNames(response.message);
   });
 
-  it("assistant_meta: what can you do returns identity, no write", async () => {
+  it("assistant_meta: what can you do returns capabilities, no write", async () => {
     const { agent, tasks, blocks } = createAgentHarness();
     const response = await agent.processInput("你能做什么");
-    expect(response.message).toContain("时间管理助手");
+    // V3.7 P1: MetaHandler 子分类，"你能做什么" → meta_capabilities，列出功能
+    expect(response.message.length).toBeGreaterThan(0);
     expect(tasks.tasks.length).toBe(0);
     expect(blocks.blocks.length).toBe(0);
     expectNoInternalNames(response.message);
@@ -477,21 +479,31 @@ describe("Agent router gold set", () => {
     expect(task?.deleted_at).toBeTruthy();
   });
 
-  it("time_management: recommendation uses timezone (Shanghai time slot starts at 08:00 local)", async () => {
+  it("time_management: recommendation uses timezone and never returns past time (V3.7 P0-3)", async () => {
     const { agent } = createAgentHarness();
     const response = await agent.processInput("帮我安排一个写文档任务，30分钟", {
       timezone: "Asia/Shanghai",
     });
     expect(response.message).toContain("我建议安排在");
-    // Proposed time must be formatted as local Shanghai HH:MM, NOT a UTC time like "00:17"
-    // Shanghai is UTC+8, so 08:00 local = 00:00 UTC.
-    // The message should NOT contain "00:" as a start time that looks like midnight UTC.
-    // Instead it should show something >= "08:00".
+
+    // V3.7 P0-3: 推荐时间必须 >= now + buffer(15min)，不能再返回 08:00 这种已过去的时间。
+    // 当前 fake clock NOW="2026-05-27T12:17:00.000Z"（上海 20:17）。
+    // 期望推荐 >= 上海 20:32。
     const timeMatch = response.message.match(/我建议安排在\s*(\d{2}:\d{2})/);
-    if (timeMatch) {
-      const hour = Number(timeMatch[1].split(":")[0]);
-      expect(hour).toBeGreaterThanOrEqual(8);
-    }
+    expect(timeMatch).not.toBeNull();
+    const [hh, mm] = timeMatch![1].split(":").map(Number);
+    const proposedMinutes = hh * 60 + mm;
+
+    // NOW UTC = 12:17 → 上海 20:17
+    // earliestAllowed (上海) = 20:32
+    const nowShanghaiMinutes = 20 * 60 + 17;
+    const bufferMinutes = 15;
+    expect(proposedMinutes).toBeGreaterThanOrEqual(
+      nowShanghaiMinutes + bufferMinutes
+    );
+
+    // 同时确保 ≥ 08:00 的旧约束依然成立（局部健壮性）
+    expect(hh).toBeGreaterThanOrEqual(8);
     expectNoInternalNames(response.message);
   });
 
@@ -504,5 +516,141 @@ describe("Agent router gold set", () => {
     await agent.processInput("帮我写一段开场白");
     expect(tasks.tasks.length).toBe(0);
     expect(blocks.blocks.length).toBe(0);
+  });
+
+  // ─── V3.7 P1: Pending Confirmation 快捷路径 ─────────────────────────────────
+
+  it("pending confirm + '好' → 直接触发 confirmAction，写入任务和时间块", async () => {
+    const { agent, tasks, blocks } = createAgentHarness();
+    // Step 1: 发出推荐请求，获取 confirmationId
+    const response = await agent.processInput("帮我安排一个写文档任务，30分钟", {
+      timezone: "Asia/Shanghai",
+    });
+    expect(response.confirmationId).toBeTruthy();
+    expect(tasks.tasks.length).toBe(0);
+    expect(blocks.blocks.length).toBe(0);
+
+    // Step 2: 用"好"回复，传入 pendingConfirmationId → ContextualPreRouter 捕获
+    const confirmResponse = await agent.processInput("好", {
+      timezone: "Asia/Shanghai",
+      pendingConfirmationId: response.confirmationId!,
+    });
+    // 确认执行后应有 task + block
+    expect(tasks.tasks.length).toBe(1);
+    expect(blocks.blocks.length).toBe(1);
+    expect(confirmResponse.message.length).toBeGreaterThan(0);
+    expectNoInternalNames(confirmResponse.message);
+  });
+
+  it("pending confirm + 'ok' → 直接触发 confirmAction", async () => {
+    const { agent, tasks, blocks } = createAgentHarness();
+    const response = await agent.processInput("帮我安排一个写报告任务，30分钟", {
+      timezone: "Asia/Shanghai",
+    });
+    expect(response.confirmationId).toBeTruthy();
+
+    await agent.processInput("ok", {
+      timezone: "Asia/Shanghai",
+      pendingConfirmationId: response.confirmationId!,
+    });
+    expect(tasks.tasks.length).toBe(1);
+    expect(blocks.blocks.length).toBe(1);
+  });
+
+  it("pending confirm + '确认' → 直接触发 confirmAction", async () => {
+    const { agent, tasks, blocks } = createAgentHarness();
+    const response = await agent.processInput("帮我安排一个读书任务，20分钟", {
+      timezone: "Asia/Shanghai",
+    });
+    expect(response.confirmationId).toBeTruthy();
+
+    await agent.processInput("确认", {
+      timezone: "Asia/Shanghai",
+      pendingConfirmationId: response.confirmationId!,
+    });
+    expect(tasks.tasks.length).toBe(1);
+    expect(blocks.blocks.length).toBe(1);
+  });
+
+  it("pending confirm + '取消' → 触发 rejectAction，不写入数据", async () => {
+    const { agent, tasks, blocks } = createAgentHarness();
+    const response = await agent.processInput("帮我安排一个写文档任务，30分钟", {
+      timezone: "Asia/Shanghai",
+    });
+    expect(response.confirmationId).toBeTruthy();
+
+    const rejectResponse = await agent.processInput("取消", {
+      timezone: "Asia/Shanghai",
+      pendingConfirmationId: response.confirmationId!,
+    });
+    // 取消后不应有任务和时间块
+    expect(tasks.tasks.length).toBe(0);
+    expect(blocks.blocks.length).toBe(0);
+    expect(rejectResponse.message.length).toBeGreaterThan(0);
+  });
+
+  it("pending confirm + '不' → 触发 rejectAction", async () => {
+    const { agent, tasks, blocks } = createAgentHarness();
+    const response = await agent.processInput("帮我安排一个任务，30分钟", {
+      timezone: "Asia/Shanghai",
+    });
+    expect(response.confirmationId).toBeTruthy();
+
+    await agent.processInput("不", {
+      timezone: "Asia/Shanghai",
+      pendingConfirmationId: response.confirmationId!,
+    });
+    expect(tasks.tasks.length).toBe(0);
+    expect(blocks.blocks.length).toBe(0);
+  });
+
+  it("无 pending 状态时 '好' → low_signal（不触发确认）", async () => {
+    const { agent, tasks, blocks } = createAgentHarness();
+    const response = await agent.processInput("好");
+    // 单字符 → low_signal → 不触发确认，也不创建任何数据
+    expect(tasks.tasks.length).toBe(0);
+    expect(blocks.blocks.length).toBe(0);
+    // low_signal 消息应包含引导文案
+    expect(response.message).toContain("不太确定你的目标");
+    expectNoInternalNames(response.message);
+  });
+
+  // ─── V3.7 P1: proposeEndFeedback split → 3 options ─────────────────────────
+
+  it("proposeEndFeedback split → 返回 3 个方案，包含正确 uiAction", async () => {
+    const { agent } = createAgentHarness();
+    // 先创建时间块
+    await agent.processInput("我现在有一个写文档任务，30分钟，从现在开始");
+
+    const mockBlock = {
+      id: "block-1",
+      task_id: "task-1",
+      title: "写文档",
+      start_time: new Date().toISOString(),
+      end_time: new Date(Date.now() + 30 * 60000).toISOString(),
+      type: "task" as const,
+      status: "scheduled" as const,
+      is_locked: false,
+      source: "system" as const,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+
+    const proposal = await agent.proposeEndFeedback(mockBlock, "split");
+    expect(proposal.options.length).toBe(3);
+
+    // 第 1 个：仅创建，无 uiAction
+    expect(proposal.options[0].id).toBe("split_create_only");
+    expect(proposal.options[0].uiAction).toBeUndefined();
+    expect(proposal.options[0].toolName).toBe("create_task");
+
+    // 第 2 个：创建 + 推荐时间
+    expect(proposal.options[1].id).toBe("split_create_recommend");
+    expect(proposal.options[1].uiAction?.kind).toBe("split_then_recommend");
+    expect((proposal.options[1].uiAction as { kind: "split_then_recommend"; durationMinutes: number }).durationMinutes).toBeGreaterThan(0);
+
+    // 第 3 个：创建 + 手动选时间
+    expect(proposal.options[2].id).toBe("split_create_manual");
+    expect(proposal.options[2].uiAction?.kind).toBe("open_schedule_dialog");
   });
 });

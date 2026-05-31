@@ -65,6 +65,12 @@ export interface ConversationMessage {
 }
 
 export const CreateMessageSchema = z.object({
+  /**
+   * V3.7 P0-1: 可选客户端预生成 id。
+   * 若提供，repo 直接使用；否则 repo 生成 UUID。
+   * 用于让前端 in-memory 消息 id 与 DB 行 id 一致，便于后续 updateMetadata。
+   */
+  id: z.string().optional(),
   role: z.enum(["user", "assistant", "system"]),
   content: z.string().min(1),
   metadata_json: z.string().optional(),

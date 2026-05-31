@@ -212,6 +212,31 @@ const MIGRATIONS: Migration[] = [
       await db.execute(`PRAGMA foreign_keys = ON`);
     },
   },
+  {
+    // V3.7 P0-2: Heartbeat 反馈持久化 snooze。
+    // 新增 feedback_snoozed_until 字段：当用户对结束反馈点「暂不处理」时，
+    // 写入 now + 10min 的 ISO 时间戳。HeartbeatService.getPendingFeedback
+    // 在该时间点之前不再把该 block 当作待反馈。
+    // 与 end_prompt_sent_at 的语义区分：后者表示「已永久处理过提示」；
+    // 前者表示「临时暂缓 N 分钟」。
+    version: 5,
+    async run(db) {
+      const hasColumn = await tableHasColumn(
+        db,
+        "time_blocks",
+        "feedback_snoozed_until",
+      );
+      if (hasColumn) return;
+      try {
+        await db.execute(
+          `ALTER TABLE time_blocks ADD COLUMN feedback_snoozed_until TEXT`,
+        );
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        if (!msg.includes("duplicate column name")) throw e;
+      }
+    },
+  },
 ];
 
 export async function runMigrations(): Promise<void> {

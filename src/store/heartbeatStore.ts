@@ -127,13 +127,14 @@ export const useHeartbeatStore = create<HeartbeatState>()(
         const { _intervalId } = get();
         if (_intervalId !== null) {
           clearInterval(_intervalId);
+          // V3.7 P0-2: 不再清空 feedbackSnoozeUntil，避免离开页面后立刻重复弹。
+          // 真正的 snooze 已由 DB 字段 feedback_snoozed_until 持久化兜底。
           set({
             _intervalId: null,
             currentFocusBlock: null,
             upcomingReminderBlock: null,
             startPromptBlock: null,
             pendingFeedbackBlock: null,
-            feedbackSnoozeUntil: null,
             isDelayDialogOpen: false,
             delayTargetBlock: null,
           });
@@ -198,9 +199,26 @@ export const useHeartbeatStore = create<HeartbeatState>()(
       // ─── 反馈对话框 ──────────────────────────────────────────────────────
 
       closeFeedbackDialog: () => {
-        // V3.5-B: 关闭弹窗但不写 end_prompt_sent_at，10 分钟后允许再次弹出
-        const snoozeUntil = new Date(Date.now() + 10 * 60 * 1000).toISOString();
-        set({ isFeedbackDialogOpen: false, pendingFeedbackBlock: null, feedbackSnoozeUntil: snoozeUntil });
+        // V3.7 P0-2: 关闭弹窗时把 snooze 同步写入 DB（异步），跨 session 也能生效。
+        // 同时保留内存 feedbackSnoozeUntil 作为单 session 的快路径，避免 tick 间隔内反复检查 DB。
+        const snoozeUntilMs = Date.now() + 10 * 60 * 1000;
+        const snoozeUntil = new Date(snoozeUntilMs).toISOString();
+        const block = get().pendingFeedbackBlock;
+        set({
+          isFeedbackDialogOpen: false,
+          pendingFeedbackBlock: null,
+          feedbackSnoozeUntil: snoozeUntil,
+        });
+        if (block) {
+          heartbeatService
+            .snoozeFeedback(block.id, { minutes: 10 })
+            .catch((e) => {
+              console.warn(
+                "[Heartbeat] snoozeFeedback 持久化失败（仅依赖内存 snooze）:",
+                e
+              );
+            });
+        }
       },
 
       // ─── 执行操作（含 ActionLog 记录） ───────────────────────────────────

@@ -1,6 +1,9 @@
 import { cn } from "@/lib/utils";
 import type { ChatMessage as ChatMessageType } from "@/store/chatStore";
-import { useChatStore } from "@/store/chatStore";
+import {
+  shouldShowConfirmationButtons,
+  useChatStore,
+} from "@/store/chatStore";
 
 interface Props {
   message: ChatMessageType;
@@ -32,6 +35,11 @@ export function ChatMessage({ message }: Props) {
   // confirmationId 优先从 metadata 读取，向后兼容旧的顶层字段
   const confirmationId =
     message.metadata?.confirmationId ?? message.confirmationId;
+
+  // V3.7 P0-1：仅在确认请求处于 pending 状态时显示按钮。
+  // - 已 confirmed/rejected/failed 的消息：metadata.resultType 为 success/failure/rejected
+  // - 仍 pending 的消息：metadata.resultType 为 "pending_confirmation"，或为 undefined（旧数据兼容）
+  const isPendingConfirmation = shouldShowConfirmationButtons(message);
 
   // V3.5：优先读取 agentTrace，兼容旧字段
   const trace = message.metadata?.agentTrace;
@@ -88,8 +96,8 @@ export function ChatMessage({ message }: Props) {
 
         {message.content}
 
-        {/* 危险操作确认按钮（保持不变） */}
-        {confirmationId && message.role === "assistant" && (
+        {/* 危险操作确认按钮：仅在 pending 状态下显示（V3.7 P0-1） */}
+        {isPendingConfirmation && confirmationId && message.role === "assistant" && (
           <div className="flex gap-2 mt-3 pt-2 border-t border-gray-200">
             <button
               onClick={() => confirmAction(confirmationId)}

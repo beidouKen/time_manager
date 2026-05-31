@@ -2,6 +2,14 @@ import type { SemanticFrame, SemanticUserGoal } from "@/agent/types";
 
 const DEFAULT_DURATION_MINUTES = 30;
 
+export interface TimeOfDayRange {
+  /** 本地小时（含），0-23 */
+  startHour: number;
+  /** 本地小时（不含），0-23 */
+  endHour: number;
+  label: string;
+}
+
 export class SemanticFrameParser {
   parse(input: string): SemanticFrame {
     const normalized = input.trim();
@@ -12,6 +20,7 @@ export class SemanticFrameParser {
     const startNow = /从现在开始|现在开始|马上开始|立即开始/.test(normalized);
     const timeAnchor = this.parseTimeAnchor(normalized);
     const dateRange = this.parseDateRange(normalized);
+    const timeOfDay = timeAnchor ? undefined : this.parseTimeOfDay(normalized);
 
     const timeExpressions: SemanticFrame["timeExpressions"] = [];
     if (startNow) {
@@ -41,7 +50,7 @@ export class SemanticFrameParser {
       durationExpressions: duration
         ? [{ sourceText: `${duration}分钟`, minutes: duration }]
         : [],
-      constraints: {},
+      constraints: timeOfDay ? { timeOfDay } : {},
       userTone: "neutral",
       urgency: startNow ? "high" : "normal",
       missingInfo: [],
@@ -50,6 +59,29 @@ export class SemanticFrameParser {
       category: normalized.includes("写作") ? "writing" : undefined,
       dateRange: dateRange ?? undefined,
     };
+  }
+
+  /**
+   * 识别"下午/上午/中午/晚上"等时段词（无具体小时时调用）。
+   * 有具体时刻时应优先使用 parseTimeAnchor 的结果，不再走此方法。
+   */
+  parseTimeOfDay(input: string): TimeOfDayRange | undefined {
+    if (/下午|午后/.test(input)) {
+      return { startHour: 12, endHour: 18, label: "下午" };
+    }
+    if (/上午/.test(input)) {
+      return { startHour: 8, endHour: 12, label: "上午" };
+    }
+    if (/早上/.test(input)) {
+      return { startHour: 8, endHour: 10, label: "早上" };
+    }
+    if (/中午/.test(input)) {
+      return { startHour: 11, endHour: 14, label: "中午" };
+    }
+    if (/晚上|夜里|傍晚/.test(input)) {
+      return { startHour: 18, endHour: 22, label: "晚上" };
+    }
+    return undefined;
   }
 
   private detectGoal(input: string): SemanticUserGoal {

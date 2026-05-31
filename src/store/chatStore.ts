@@ -107,6 +107,120 @@ function parseMetadata(metadataJson?: string): ChatMessageMetadata | undefined {
   }
 }
 
+/**
+ * V3.7 P0-1: 判断一条 ChatMessage 当前是否应该显示「确认/取消」按钮。
+ * 与 ChatMessage.tsx 中的渲染条件保持一致，便于单测和组件复用。
+ */
+export function shouldShowConfirmationButtons(message: ChatMessage): boolean {
+  if (message.role !== "assistant") return false;
+  const confirmationId =
+    message.metadata?.confirmationId ?? message.confirmationId;
+  if (!confirmationId) return false;
+  const resultType = message.metadata?.resultType;
+  return resultType === undefined || resultType === "pending_confirmation";
+}
+
+/**
+ * V3.7 P0-1: 计算 patch 旧消息的结果，纯函数，便于单测。
+ * - 找到 role=assistant 且 metadata.confirmationId 命中的所有消息（理论上只有 1 条）。
+ * - 仅当原 resultType 为 undefined / "pending_confirmation" 时 patch；
+ *   已经是终态（success/failure/rejected）的不再变更。
+ *
+ * 返回 patched messages 列表 + 需要持久化的 patch 信息。
+ */
+export function applyConfirmationPatch(
+  messages: ChatMessage[],
+  confirmationId: string,
+  newResultType: "success" | "failure" | "rejected"
+): {
+  messages: ChatMessage[];
+  patches: Array<{ id: string; metadataJson: string }>;
+} {
+  const patches: Array<{ id: string; metadataJson: string }> = [];
+  const next = messages.map((m) => {
+    const matches =
+      m.role === "assistant" &&
+      ((m.metadata?.confirmationId ?? m.confirmationId) === confirmationId) &&
+      (m.metadata?.resultType === undefined ||
+        m.metadata?.resultType === "pending_confirmation");
+    if (!matches) return m;
+
+    const nextMetadata: ChatMessageMetadata = {
+      ...(m.metadata ?? {}),
+      confirmationId,
+      resultType: newResultType,
+    };
+    patches.push({ id: m.id, metadataJson: JSON.stringify(nextMetadata) });
+    return { ...m, metadata: nextMetadata };
+  });
+  return { messages: next, patches };
+}
+
+/**
+ * V3.7 P0-1: confirmAction / rejectAction 的副作用收尾流程。
+ *
+ * 1. 在内存里 patch 同 confirmationId 的旧 assistant 消息的 resultType；
+ * 2. append 新的「执行结果」消息；
+ * 3. 通过 ConversationService.updateMessageMetadata 把 patch 持久化到 DB；
+ * 4. 持久化新消息。
+ *
+ * 这样既能保证当前 session 中按钮立即消失，也能保证页面刷新后旧消息上的按钮不复活。
+ */
+async function runConfirmationFinalize(
+  set: (
+    fn: (
+      state: ChatState & ChatActions
+    ) => Partial<ChatState & ChatActions>
+  ) => void,
+  confirmationId: string,
+  response: AgentResponse,
+  newResultType: "success" | "failure" | "rejected"
+): Promise<void> {
+  const newMsgId = crypto.randomUUID();
+  let collectedPatches: Array<{ id: string; metadataJson: string }> = [];
+
+  set((state) => {
+    const { messages: patched, patches } = applyConfirmationPatch(
+      state.messages,
+      confirmationId,
+      newResultType
+    );
+    collectedPatches = patches;
+    const newMsg: ChatMessage = {
+      id: newMsgId,
+      role: "assistant",
+      content: response.message,
+      metadata: response.metadata,
+      timestamp: new Date().toISOString(),
+    };
+    return {
+      messages: [...patched, newMsg],
+      isProcessing: false,
+    };
+  });
+
+  await Promise.all(
+    collectedPatches.map(({ id, metadataJson }) =>
+      conversationService
+        .updateMessageMetadata(id, metadataJson)
+        .catch((err) =>
+          console.warn(
+            "[chatStore] updateMessageMetadata failed:",
+            id,
+            err
+          )
+        )
+    )
+  );
+
+  await conversationService.createMessage({
+    id: newMsgId,
+    role: "assistant",
+    content: response.message,
+    metadata_json: buildMetadataJson(response),
+  });
+}
+
 // ─── Store ────────────────────────────────────────────────────────────────
 
 export const useChatStore = create<ChatState & ChatActions>((set, _get) => ({
@@ -152,8 +266,12 @@ export const useChatStore = create<ChatState & ChatActions>((set, _get) => ({
     };
     set((s) => ({ messages: [...s.messages, userMsg] }));
 
-    // 持久化用户消息（无 metadata）
-    await conversationService.createMessage({ role: "user", content });
+    // 持久化用户消息（无 metadata），用同一 id 让 in-memory 与 DB 行 id 对齐。
+    await conversationService.createMessage({
+      id: userMsg.id,
+      role: "user",
+      content,
+    });
 
     try {
 
@@ -163,12 +281,26 @@ export const useChatStore = create<ChatState & ChatActions>((set, _get) => ({
       const timezone =
         Intl.DateTimeFormat().resolvedOptions().timeZone || "Asia/Shanghai";
 
+      // 从最近一条 assistant 消息提取 pending 状态，供路由器做上下文感知。
+      const allMessages = _get().messages;
+      const lastAssistantMsg = [...allMessages].reverse().find(m => m.role === "assistant");
+      const lastResultType = lastAssistantMsg?.metadata?.resultType;
+      const pendingConfirmationId =
+        (lastResultType === "pending_confirmation" || lastResultType === undefined)
+          ? (lastAssistantMsg?.metadata?.confirmationId ?? lastAssistantMsg?.confirmationId)
+          : undefined;
+      const pendingClarification =
+        lastAssistantMsg?.metadata?.llmResponseType === "clarification" ||
+        (!!lastAssistantMsg?.metadata?.confirmationId && lastResultType !== "success" && lastResultType !== "failure" && lastResultType !== "rejected");
+
       const response: AgentResponse = await agentService.processInput(content, {
         recentMessages,
         timezone,
         currentTimelineDate,
         selectedDate: currentTimelineDate,
         currentScreen: useUiStore.getState().activePage,
+        pendingConfirmationId: pendingConfirmationId ?? undefined,
+        pendingClarification,
       });
 
       const assistantMsg: ChatMessage = {
@@ -185,8 +317,9 @@ export const useChatStore = create<ChatState & ChatActions>((set, _get) => ({
         isProcessing: false,
       }));
 
-      // 持久化 assistant 消息，带 metadata_json
+      // 持久化 assistant 消息，复用 in-memory id；后续 updateMetadata 才能命中同一行。
       await conversationService.createMessage({
+        id: assistantMsg.id,
         role: "assistant",
         content: response.message,
         metadata_json: buildMetadataJson(response),
@@ -251,25 +384,9 @@ export const useChatStore = create<ChatState & ChatActions>((set, _get) => ({
     set({ isProcessing: true });
     try {
       const response = await agentService.confirmAction(confirmationId);
-
-      const msg: ChatMessage = {
-        id: crypto.randomUUID(),
-        role: "assistant",
-        content: response.message,
-        metadata: response.metadata,
-        timestamp: new Date().toISOString(),
-      };
-      set((s) => ({
-        messages: [...s.messages, msg],
-        isProcessing: false,
-      }));
-
-      await conversationService.createMessage({
-        role: "assistant",
-        content: response.message,
-        metadata_json: buildMetadataJson(response),
-      });
-
+      const newResultType: "success" | "failure" =
+        response.metadata?.resultType === "failure" ? "failure" : "success";
+      await runConfirmationFinalize(set, confirmationId, response, newResultType);
       await applyRefreshHints(response);
     } catch (e) {
       set({ isProcessing: false, error: String(e) });
@@ -280,24 +397,7 @@ export const useChatStore = create<ChatState & ChatActions>((set, _get) => ({
     set({ isProcessing: true });
     try {
       const response = await agentService.rejectAction(confirmationId);
-
-      const msg: ChatMessage = {
-        id: crypto.randomUUID(),
-        role: "assistant",
-        content: response.message,
-        metadata: response.metadata,
-        timestamp: new Date().toISOString(),
-      };
-      set((s) => ({
-        messages: [...s.messages, msg],
-        isProcessing: false,
-      }));
-
-      await conversationService.createMessage({
-        role: "assistant",
-        content: response.message,
-        metadata_json: buildMetadataJson(response),
-      });
+      await runConfirmationFinalize(set, confirmationId, response, "rejected");
     } catch (e) {
       set({ isProcessing: false, error: String(e) });
     }

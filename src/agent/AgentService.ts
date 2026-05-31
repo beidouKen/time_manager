@@ -13,11 +13,12 @@ import { formatDateKey } from "@/agent/experience/dateFormatting";
 import { ResponseBoundary } from "@/agent/experience/ResponseBoundary";
 import type { ResponseKind } from "@/agent/experience/ResponseComposer";
 import { SemanticFrameParser } from "@/agent/experience/SemanticFrameParser";
-import { AgentDomainRouter } from "@/agent/router/AgentDomainRouter";
+import { DomainRoutingService } from "@/agent/router/DomainRoutingService";
 import { TimeManagementAgent } from "@/agent/time-management/TimeManagementAgent";
 import type { AgentHandler } from "@/agent/handlers/AgentHandler";
 import { ExternalInfoHandler } from "@/agent/handlers/ExternalInfoHandler";
 import { MetaHandler } from "@/agent/handlers/MetaHandler";
+// MetaHandler is used directly for subtype routing (V3.7 P1)
 import { FeedbackHandler } from "@/agent/handlers/FeedbackHandler";
 import { LowSignalHandler } from "@/agent/handlers/LowSignalHandler";
 import { LLMDirectHandler } from "@/agent/handlers/LLMDirectHandler";
@@ -50,6 +51,9 @@ import { ScheduleService } from "@/services/ScheduleService";
 import { TaskService } from "@/services/TaskService";
 import { TimeBlockService } from "@/services/TimeBlockService";
 
+import { AvailabilityProvider } from "@/agent/time-management/scheduling/AvailabilityProvider";
+import { RecommendationPlanner } from "@/agent/time-management/scheduling/RecommendationPlanner";
+import { SchedulingReasoner } from "@/agent/time-management/scheduling/SchedulingReasoner";
 import { CreateTaskTool } from "@/agent/tools/task/createTaskTool";
 import { UpdateTaskTool } from "@/agent/tools/task/updateTaskTool";
 import { DeleteTaskTool } from "@/agent/tools/task/deleteTaskTool";
@@ -102,6 +106,10 @@ interface ExecutePlanOptionResult {
   actionLogIds?: string[];
   metadata?: ChatMessageMetadata;
   conflictInfo?: PlanConflictInfo;
+  /** V3.7 P1: 透传 PlanOption.uiAction，UI 层处理后续动作 */
+  uiAction?: PlanOption["uiAction"];
+  /** V3.7 P1: 透传 ToolResult.relatedTaskId，供 split_then_recommend 使用 */
+  relatedTaskId?: string;
 }
 
 interface PlanPrecheckResult {
@@ -121,6 +129,16 @@ export interface ProcessInputContext {
   currentTimelineDate?: string;
   selectedDate?: string;
   currentScreen?: string;
+  /**
+   * V3.7 P1: 当前存在的 pending confirmation ID。
+   * chatStore 在 sendMessage 时从最近消息中提取并传入，
+   * 供 ContextualPreRouter 检测"好/取消"等快捷确认输入。
+   */
+  pendingConfirmationId?: string;
+  /**
+   * V3.7 P1: 当前是否处于 pending clarification 状态。
+   */
+  pendingClarification?: boolean;
 }
 
 interface ActionLogPort {
@@ -173,7 +191,7 @@ export class AgentService {
   private semanticFrameParser: SemanticFrameParser;
   private plannerPort: PlannerPort;
   private responseBoundary: ResponseBoundary;
-  private domainRouter: AgentDomainRouter;
+  private domainRoutingService: DomainRoutingService;
   private timeManagementAgent: TimeManagementAgent;
   private handlers: Map<AgentDomain, AgentHandler>;
 
@@ -198,7 +216,6 @@ export class AgentService {
     this.experienceContextBuilder = new ConversationContextBuilder();
     this.semanticFrameParser = new SemanticFrameParser();
     this.responseBoundary = new ResponseBoundary();
-    this.domainRouter = new AgentDomainRouter();
     this.memoryAdapter = options.memoryAdapter;
     this.ragAdapter = options.ragAdapter;
     this.notificationAdapter = options.notificationAdapter;
@@ -240,6 +257,9 @@ export class AgentService {
     const chatExecutor = resolvedLLMClient
       ? new LLMChatExecutor(resolvedLLMClient)
       : undefined;
+
+    // V3.7 P1: 三段式域路由服务（DomainRoutingService 内部管理 fallback router）
+    this.domainRoutingService = new DomainRoutingService(resolvedLLMClient);
 
     this.handlers = new Map<AgentDomain, AgentHandler>([
       ["general_chat", new LLMDirectHandler("general_chat", chatExecutor)],
@@ -292,7 +312,27 @@ export class AgentService {
       context,
       this.getConversationMemorySnapshot()
     );
-    const route = this.domainRouter.classify(userInput);
+    const route = await this.domainRoutingService.classify(userInput, {
+      pendingConfirmationId: context?.pendingConfirmationId,
+      pendingClarification: context?.pendingClarification,
+      lastAssistantText: (() => {
+        const assistantMsgs = context?.recentMessages?.filter((m) => m.role === "assistant") ?? [];
+        return assistantMsgs[assistantMsgs.length - 1]?.content;
+      })(),
+      timezone: context?.timezone,
+    });
+
+    // V3.7 P1: Contextual pre-router 检测到 pending confirmation 快捷回复
+    if (route.pendingAction) {
+      const { kind, confirmationId } = route.pendingAction;
+      if (kind === "confirm") {
+        return this.confirmAction(confirmationId);
+      } else if (kind === "reject") {
+        return this.rejectAction(confirmationId);
+      } else if (kind === "adjust_later" || kind === "adjust_earlier") {
+        return this.adjustRecommendation(confirmationId, kind, experienceContext);
+      }
+    }
 
     if (route.domain === "time_management") {
       const semanticFrame = this.timeManagementAgent.parse(userInput);
@@ -328,10 +368,21 @@ export class AgentService {
       };
     }
 
-    const handler = this.handlers.get(route.domain);
-    const handlerResult: AgentHandlerResult = handler
-      ? await handler.handle(userInput, experienceContext)
-      : { domain: "general_chat", responseKind: "general" };
+    // V3.7 P1: MetaHandler 支持传入 LLM 检测到的 subtype
+    let handlerResult: AgentHandlerResult;
+    if (route.domain === "assistant_meta") {
+      const metaHandler = this.handlers.get("assistant_meta") as MetaHandler | undefined;
+      if (metaHandler) {
+        handlerResult = metaHandler.handleWithSubtype(userInput, experienceContext, route.subtype);
+      } else {
+        handlerResult = { domain: "assistant_meta", responseKind: "meta_identity" };
+      }
+    } else {
+      const handler = this.handlers.get(route.domain);
+      handlerResult = handler
+        ? await handler.handle(userInput, experienceContext)
+        : { domain: "general_chat", responseKind: "general" };
+    }
 
     const frame = this.buildRouterFrame(route.domain, userInput);
     const plan = this.buildRouterPlan(frame.userGoal, experienceContext.currentDatetime);
@@ -350,6 +401,9 @@ export class AgentService {
       domain: route.domain,
       mode: "direct_response",
       rawInput: userInput,
+      routerSource: route.routerSource,
+      llmDecision: route.llmDecision,
+      routerFallbackReason: route.fallbackReason,
       contextSnapshot: experienceContext,
       semanticFrame: frame,
       actionPlan: plan,
@@ -449,6 +503,9 @@ export class AgentService {
   // ─── 确认执行 ────────────────────────────────────────────────────────────
 
   async confirmAction(confirmationId: string): Promise<AgentResponse> {
+    // 先刷新过期状态，防止前端持有 pending confirmation 但实际已超时
+    await this.confirmService.expireStale();
+
     const confirmation = await this.confirmService.getById(confirmationId);
     if (!confirmation) {
       return {
@@ -464,7 +521,15 @@ export class AgentService {
       };
     }
 
-    await this.confirmService.confirm(confirmationId);
+    try {
+      await this.confirmService.confirm(confirmationId);
+    } catch (e) {
+      // 过期或其他状态异常 → stale 分支
+      return {
+        message: this.composeBoundaryMessage("", undefined, "confirmation_stale"),
+        intent: { intent: "unknown", confidence: 0, args: {}, rawInput: "" },
+      };
+    }
 
     const args = JSON.parse(confirmation.tool_args_json) as Record<string, unknown>;
 
@@ -529,6 +594,113 @@ export class AgentService {
       actionLogId: log.id,
       metadata,
       refreshHints,
+    };
+  }
+
+  // ─── 时间调整：重新推荐更晚/更早的时段 ────────────────────────────────────
+
+  private async adjustRecommendation(
+    confirmationId: string,
+    direction: "adjust_later" | "adjust_earlier",
+    context: import("@/agent/types").AgentExperienceContext
+  ): Promise<AgentResponse> {
+    const confirmation = await this.confirmService.getById(confirmationId);
+    if (!confirmation || confirmation.status !== "pending") {
+      return {
+        message: this.composeBoundaryMessage("", undefined, "confirmation_stale"),
+        intent: { intent: "unknown", confidence: 0, args: {}, rawInput: "" },
+      };
+    }
+
+    const prevArgs = JSON.parse(confirmation.tool_args_json) as Record<string, unknown>;
+    const prevTitle = String(prevArgs.title ?? "新任务");
+    const prevDuration = Number(prevArgs.estimated_duration_minutes ?? prevArgs.duration ?? 30);
+    const prevEnd = prevArgs.end_time as string | undefined;
+    const prevStart = prevArgs.start_time as string | undefined;
+
+    // 取消旧的 pending recommendation
+    try { await this.confirmService.reject(confirmationId); } catch { /* ignore */ }
+
+    // 计算新的推荐起点约束
+    const now = new Date(context.currentDatetime);
+    let notBefore: Date;
+    if (direction === "adjust_later") {
+      // 从上次推荐的结束时间之后开始找（至少也不早于 now+buffer）
+      notBefore = prevEnd ? new Date(prevEnd) : now;
+    } else {
+      // 提前：从上次推荐起点减 duration 前开始（不得早于 now+buffer）
+      const prevStartMs = prevStart ? new Date(prevStart).getTime() : now.getTime();
+      notBefore = new Date(Math.max(prevStartMs - prevDuration * 60 * 1000, now.getTime()));
+    }
+
+    // 重新用 RecommendationPlanner 推荐，notBefore 作为自定义 "now" 以跳过已推荐时段
+    const availabilityProvider = new AvailabilityProvider(this.timeBlockService);
+    const reasoner = new SchedulingReasoner();
+    const planner = new RecommendationPlanner(availabilityProvider, reasoner);
+
+    const candidates = await planner.plan({
+      date: now,
+      durationMinutes: prevDuration,
+      timezone: context.timezone,
+      now: notBefore,
+      bufferMinutes: 0, // notBefore 已经是截断点，不再叠加 buffer
+    });
+
+    const log = await this.logService.logRequest(
+      `[调整推荐:${direction}] ${prevTitle}`,
+      "adjust_recommendation"
+    );
+
+    let newConfirmationId: string | undefined;
+    if (candidates.length > 0) {
+      const rec = candidates[0];
+      const newPending = await this.confirmService.createConfirmation({
+        action_type: confirmation.action_type,
+        tool_name: "schedule_task",
+        tool_args_json: JSON.stringify({
+          title: prevTitle,
+          category: prevArgs.category,
+          duration: prevDuration,
+          estimated_duration_minutes: prevDuration,
+          start_time: rec.start,
+          end_time: rec.end,
+        }),
+        risk_level: "low",
+        description: `按调整后时间安排「${prevTitle}」`,
+      });
+      newConfirmationId = newPending.id;
+      await this.logService.logSuccess(log.id, { newConfirmationId, recommendation: rec });
+
+      const startStr = new Date(rec.start).toLocaleTimeString("zh-CN", {
+        hour: "2-digit", minute: "2-digit", timeZone: context.timezone,
+      });
+      const endStr = new Date(rec.end).toLocaleTimeString("zh-CN", {
+        hour: "2-digit", minute: "2-digit", timeZone: context.timezone,
+      });
+      const message = `那改到 ${startStr} - ${endStr} 怎么样，需要我按这个时间来安排吗？`;
+
+      const metadata: ChatMessageMetadata = {
+        intent: confirmation.action_type,
+        confirmationId: newConfirmationId,
+        actionLogId: log.id,
+        resultType: "pending_confirmation",
+        source: "llm",
+        llmResponseType: "clarification",
+      };
+
+      return {
+        message,
+        intent: { intent: "unknown", confidence: 0.95, args: {}, rawInput: "" },
+        confirmationId: newConfirmationId,
+        metadata,
+      };
+    }
+
+    // 没有更多可用时段
+    await this.logService.logSuccess(log.id, { candidates: 0 });
+    return {
+      message: "今天已经没有更合适的时间段了，你可以手动选择一个时间或者换一天安排。",
+      intent: { intent: "unknown", confidence: 0.8, args: {}, rawInput: "" },
     };
   }
 
@@ -783,7 +955,7 @@ export class AgentService {
    * 用于 DelayChoiceDialog「今天做」路径。
    */
   async proposeReschedule(block: TimeBlock): Promise<PlanProposal> {
-    const today = new Date().toISOString().split("T")[0];
+    const today = formatDateKey(new Date());
     const durationMs =
       new Date(block.end_time).getTime() - new Date(block.start_time).getTime();
 
@@ -847,15 +1019,37 @@ export class AgentService {
       return { mode: "propose", options, question: "选择延长时间：" };
     }
 
-    // split: 创建剩余任务
+    // split: 创建剩余任务 — V3.7 P1 提供 3 个方案
+    const remainingTitle = `${block.title}（剩余）`;
+    const durationMs =
+      new Date(block.end_time).getTime() - new Date(block.start_time).getTime();
+    const durationMinutes = Math.round(durationMs / 60000) || 30;
+
     return {
       mode: "propose",
       options: [
         {
-          label: `创建「${block.title}（剩余）」任务`,
+          id: "split_create_only",
+          label: `仅创建「${remainingTitle}」，暂不安排`,
           toolName: "create_task",
-          params: { title: `${block.title}（剩余）`, priority: "medium" },
-          summary: `创建「${block.title}（剩余）」任务`,
+          params: { title: remainingTitle, priority: "medium" },
+          summary: `创建「${remainingTitle}」任务`,
+        },
+        {
+          id: "split_create_recommend",
+          label: `创建「${remainingTitle}」并由我推荐时间`,
+          toolName: "create_task",
+          params: { title: remainingTitle, priority: "medium" },
+          summary: `创建「${remainingTitle}」任务，安排到推荐时间`,
+          uiAction: { kind: "split_then_recommend" as const, durationMinutes },
+        },
+        {
+          id: "split_create_manual",
+          label: `创建「${remainingTitle}」，我自己选时间`,
+          toolName: "create_task",
+          params: { title: remainingTitle, priority: "medium" },
+          summary: `创建「${remainingTitle}」任务，手动选择时间`,
+          uiAction: { kind: "open_schedule_dialog" as const, defaultDurationMinutes: durationMinutes },
         },
       ],
       question: "将剩余工作保存为新任务：",
@@ -919,6 +1113,9 @@ export class AgentService {
       success: result.success,
       message: result.message,
       actionLogIds,
+      // V3.7 P1: 透传 uiAction，UI 层据此打开调度对话框或触发推荐流程
+      uiAction: result.success ? option.uiAction : undefined,
+      relatedTaskId: result.relatedTaskId,
       metadata: {
         toolName: actionOption.toolName,
         relatedTaskId: result.relatedTaskId,

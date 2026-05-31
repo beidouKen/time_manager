@@ -26,6 +26,10 @@ export class ConfirmationService {
     if (existing.status !== "pending") {
       throw new Error(`确认记录状态为 ${existing.status}，无法确认`);
     }
+    if (existing.expires_at && existing.expires_at < new Date().toISOString()) {
+      await this.repo.updateStatus(id, "expired");
+      throw new Error("确认已过期，请重新发起操作");
+    }
     return this.repo.updateStatus(id, "confirmed");
   }
 
@@ -34,6 +38,10 @@ export class ConfirmationService {
     if (!existing) throw new Error("确认记录不存在");
     if (existing.status !== "pending") {
       throw new Error(`确认记录状态为 ${existing.status}，无法拒绝`);
+    }
+    if (existing.expires_at && existing.expires_at < new Date().toISOString()) {
+      await this.repo.updateStatus(id, "expired");
+      throw new Error("确认已过期");
     }
     return this.repo.updateStatus(id, "rejected");
   }

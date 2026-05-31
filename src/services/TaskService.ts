@@ -52,15 +52,30 @@ export class TaskService {
     const existing = await this.repo.findById(id);
     if (!existing) throw new Error("任务不存在");
 
-    // Soft-delete all active time blocks associated with this task
+    // 先软删关联的活跃时间块，记录已处理的 id 以便回滚
     const blocks = await this.blockRepo.findByTaskId(id);
-    await Promise.all(
-      blocks
-        .filter((b) => !b.deleted_at)
-        .map((b) => this.blockRepo.softDelete(b.id))
-    );
+    const activeBlocks = blocks.filter((b) => !b.deleted_at);
+    const deletedBlockIds: string[] = [];
 
-    await this.repo.softDelete(id);
+    for (const block of activeBlocks) {
+      await this.blockRepo.softDelete(block.id);
+      deletedBlockIds.push(block.id);
+    }
+
+    // 再软删任务本体；若失败则回滚已删的时间块
+    try {
+      await this.repo.softDelete(id);
+    } catch (taskDeleteErr) {
+      // 补偿：将已软删的时间块 deleted_at 清回 null
+      for (const blockId of deletedBlockIds) {
+        try {
+          await this.blockRepo.update(blockId, { deleted_at: null });
+        } catch {
+          // 回滚失败只记录，不覆盖原始错误
+        }
+      }
+      throw taskDeleteErr;
+    }
   }
 
   async getActiveTasks(): Promise<Task[]> {
