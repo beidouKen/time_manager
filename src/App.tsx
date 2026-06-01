@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import { runMigrations } from "@/db/migrations";
 import { AppLayout } from "@/components/layout/AppLayout";
+import { RagService } from "@/services/rag/RagService";
+import { seedRagKnowledge } from "@/services/rag/seedRagKnowledge";
 
 type DbState = "loading" | "ready" | "error";
 
@@ -9,13 +11,22 @@ export default function App() {
   const [dbError, setDbError] = useState<string | null>(null); //两种类型，一种没错无输出，另一种直接输出错误
 
   useEffect(() => {
-    runMigrations()
-      .then(() => setDbState("ready")) //成功条件是runMigration()函数必须返回的Promise必须是 “成功解决”
-      .catch((e) => {
+    (async () => {
+      try {
+        await runMigrations(); //成功条件是runMigration()函数必须返回的Promise必须是 “成功解决”
+        // V3.8: 启动时幂等写入 RAG 种子知识；失败不阻塞主路径。
+        try {
+          await seedRagKnowledge(new RagService());
+        } catch (seedErr) {
+          console.warn("RAG seed knowledge ingestion failed:", seedErr);
+        }
+        setDbState("ready");
+      } catch (e) {
         console.error("Database migration failed:", e);
         setDbError(String(e));
         setDbState("error");
-      });
+      }
+    })();
   }, []);
 
   if (dbState === "loading") {

@@ -5,6 +5,8 @@ import type { PlannerPort } from "@/agent/experience/PlannerPort";
 import type { MemoryAdapter } from "@/agent/memory/MemoryAdapter";
 import type { RagAdapter } from "@/agent/memory/RagAdapter";
 import type { NotificationAdapter } from "@/agent/notification/NotificationAdapter";
+import { RecommendationHandler } from "@/agent/time-management/RecommendationHandler";
+import { sanitizeRecommendation } from "@/agent/memory/sanitizeRecommendation";
 import {
   ConversationContextBuilder,
   type ConversationMemorySnapshot,
@@ -200,6 +202,10 @@ export class AgentService {
   readonly ragAdapter: RagAdapter | undefined;
   readonly notificationAdapter: NotificationAdapter | undefined;
 
+  // V3.8: 只有当至少一个 memory/rag 适配器被注入时才创建建议处理器。
+  // 主链路不强依赖；附加的 suggestion 注脚走静默降级，不影响执行结果。
+  private recommendationHandler: RecommendationHandler | undefined;
+
   private lastCreatedTaskId: string | null = null;
   private lastMentionedTaskIds: string[] = [];
   private lastScheduledTimeBlockIds: string[] = [];
@@ -270,6 +276,15 @@ export class AgentService {
       ["feedback_or_complaint", new FeedbackHandler()],
       ["low_signal", new LowSignalHandler()],
     ]);
+
+    // V3.8: 按需创建 RecommendationHandler。
+    // 任一适配器存在即可启用，便于未来分别接入真实 Memory / 真实 RAG。
+    if (this.memoryAdapter || this.ragAdapter) {
+      this.recommendationHandler = new RecommendationHandler({
+        memoryAdapter: this.memoryAdapter,
+        ragAdapter: this.ragAdapter,
+      });
+    }
 
     this.registerTools();
   }
@@ -357,8 +372,17 @@ export class AgentService {
         }
       }
 
+      // V3.8: 当存在 RecommendationHandler 且无待确认项时，附加建议注脚。
+      // 建议注脚只是消息层修饰，不创建 confirmation、不写 ActionLog、不触发刷新。
+      const finalMessage = await this.maybeAppendRecommendation(
+        handled.response.message ?? "",
+        handled.response.confirmationId,
+        experienceContext,
+        userInput,
+      );
+
       return {
-        message: handled.response.message ?? "",
+        message: finalMessage,
         intent: handled.intent,
         toolResult: handled.response.toolResults?.[0],
         refreshHints: handled.response.refreshHints,
@@ -894,6 +918,72 @@ export class AgentService {
       this.lastMentionedTaskIds,
       taskId
     );
+  }
+
+  /**
+   * V3.8: 在 time_management 主回复末尾按需追加 RecommendationHandler 注脚。
+   *
+   * 触发条件：
+   * - recommendationHandler 已初始化（即注入了 memoryAdapter 或 ragAdapter）。
+   * - 当前响应无 confirmationId（不打断确认流）。
+   *
+   * 追加条件：
+   * - rec.suggestionKind 为 "suggestion" 或 "confirmation_required" 时追加。
+   * - "executable_action"（计划合理）不追加。
+   *
+   * RAG query 构造策略（优先级递减）：
+   * 1. userInput（用户原始输入，语义最丰富）。
+   * 2. todayBlocks 标题拼接（退回上下文）。
+   * 3. 空字符串（最终退回，RAG 跳过检索）。
+   *
+   * 失败路径静默降级：任何异常都不应阻塞主响应。
+   */
+  private async maybeAppendRecommendation(
+    baseMessage: string,
+    confirmationId: string | undefined,
+    experienceContext: import("@/agent/types").AgentExperienceContext,
+    userInput?: string,
+  ): Promise<string> {
+    if (!this.recommendationHandler) return baseMessage;
+    if (confirmationId) return baseMessage;
+
+    try {
+      const today = new Date(experienceContext.currentDatetime);
+      const blocks = await this.timeBlockService.getBlocksForDate(today);
+      const lightweightBlocks = blocks.map((b) => ({
+        title: b.title,
+        start_time: b.start_time,
+        end_time: b.end_time,
+      }));
+
+      // 构建语义化 RAG query：用户输入是语义最丰富的信号，
+      // 比 currentDatetime 更有利于匹配 seed knowledge 中的时间管理理论。
+      const blockTitles = lightweightBlocks.map((b) => b.title).filter(Boolean).join(" ");
+      const ragQuery = (userInput?.trim() || blockTitles || "").trim();
+
+      const rec = await this.recommendationHandler.generateRecommendation(
+        experienceContext,
+        lightweightBlocks,
+        ragQuery,
+      );
+      if (
+        rec.suggestionKind === "executable_action" ||
+        !rec.message ||
+        !rec.message.trim()
+      ) {
+        return baseMessage;
+      }
+
+      // V3.8: sanitize 确保 RAG 内容不暴露内部名称、JSON 指令或命令口吻。
+      const safeMessage = sanitizeRecommendation(rec.message);
+      if (!safeMessage) return baseMessage;
+
+      const separator = baseMessage.trim() ? "\n\n---\n" : "";
+      return `${baseMessage}${separator}💡 ${safeMessage}`;
+    } catch (err) {
+      console.warn("maybeAppendRecommendation failed:", err);
+      return baseMessage;
+    }
   }
 
   private prependUnique(values: string[], value: string): string[] {

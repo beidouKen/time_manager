@@ -9,8 +9,25 @@ import type { ConversationMessage } from "@/types/agent.types";
 import { useTaskStore } from "@/store/taskStore";
 import { useTimeBlockStore } from "@/store/timeBlockStore";
 import { useUiStore } from "@/store/uiStore";
+import { SqliteRagAdapter } from "@/agent/memory/SqliteRagAdapter";
+import { useRagKnowledgeStore } from "@/store/ragKnowledgeStore";
+import type { RagSourceType } from "@/types/rag.types";
 
-const agentService = new AgentService();
+// V3.8.1: Chat 主路径接入真实 RAG，支持用户在 Settings 切换 user_material 开关。
+// 双门控：
+//   1) 全局 toggle (userMaterialInChatEnabled) = ON
+//   2) 文档 status='active'（由 RagService.retrieve 默认硬过滤兜底）
+// 默认仅检索 seed_knowledge；只有当 toggle 打开时才追加 user_material。
+const agentService = new AgentService({
+  ragAdapter: new SqliteRagAdapter({
+    defaultSourceTypes: ["seed_knowledge"],
+    sourceTypesProvider: (): RagSourceType[] => {
+      const allow = useRagKnowledgeStore.getState().userMaterialInChatEnabled;
+      return allow ? ["seed_knowledge", "user_material"] : ["seed_knowledge"];
+    },
+    defaultLimit: 2,
+  }),
+});
 const conversationService = new ConversationService();
 const responseBoundary = new ResponseBoundary();
 

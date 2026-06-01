@@ -237,6 +237,134 @@ const MIGRATIONS: Migration[] = [
       }
     },
   },
+  {
+    // V3.8 RAG Foundation：新建 rag_documents + rag_chunks 两张表。
+    // 安全边界：
+    // - RAG 表只存储可检索资料，不参与 Task / TimeBlock 写入决策。
+    // - external_context 的 actionItems 永远是 candidate，必须走 Import
+    //   Proposal -> 用户确认 -> ToolRouter，不允许从 RAG 短路到执行层。
+    // 幂等模式：两张表都已存在则直接返回。
+    version: 6,
+    async run(db) {
+      const docsExist = await tableExists(db, "rag_documents");
+      const chunksExist = await tableExists(db, "rag_chunks");
+      if (docsExist && chunksExist) return;
+
+      if (!docsExist) {
+        await db.execute(
+          `CREATE TABLE IF NOT EXISTS rag_documents (
+            id          TEXT PRIMARY KEY,
+            source_type TEXT NOT NULL CHECK(source_type IN (
+              'seed_knowledge','external_context','user_material',
+              'memory_summary','system_guidance'
+            )),
+            title       TEXT NOT NULL,
+            summary     TEXT,
+            source_ref  TEXT,
+            tags_json   TEXT NOT NULL DEFAULT '[]',
+            metadata_json TEXT,
+            created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
+            deleted_at  TEXT
+          )`,
+        );
+        await db.execute(
+          `CREATE INDEX IF NOT EXISTS idx_rag_documents_source_type ON rag_documents(source_type)`,
+        );
+        await db.execute(
+          `CREATE INDEX IF NOT EXISTS idx_rag_documents_created_at ON rag_documents(created_at)`,
+        );
+      }
+
+      if (!chunksExist) {
+        await db.execute(
+          `CREATE TABLE IF NOT EXISTS rag_chunks (
+            id          TEXT PRIMARY KEY,
+            document_id TEXT NOT NULL REFERENCES rag_documents(id) ON DELETE CASCADE,
+            chunk_index INTEGER NOT NULL,
+            content     TEXT NOT NULL,
+            tags_json   TEXT NOT NULL DEFAULT '[]',
+            source_ref  TEXT,
+            metadata_json TEXT,
+            token_count INTEGER,
+            created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+          )`,
+        );
+        await db.execute(
+          `CREATE INDEX IF NOT EXISTS idx_rag_chunks_document_id ON rag_chunks(document_id)`,
+        );
+      }
+    },
+  },
+  {
+    // V3.8.1 RAG Knowledge Manager：为 rag_documents 引入资料治理三件套
+    //   - status:      draft / active / archived，draft 默认对 Agent 不可见
+    //   - trust_level: low / medium / high，给未来排序/过滤留位
+    //   - reviewed_at: 人工 review 通过的时间戳
+    // SQLite 的 ALTER TABLE 不支持新增 CHECK 约束，枚举校验改在 Service 层做。
+    // 幂等模式：以 status 列是否存在为判定标志。
+    // 顺手把已有的 seed_knowledge 记录回填为 active + high，保证升级后 Chat 主路径仍能命中。
+    version: 7,
+    async run(db) {
+      const hasStatus = await tableHasColumn(db, "rag_documents", "status");
+      if (!hasStatus) {
+        try {
+          await db.execute(
+            `ALTER TABLE rag_documents ADD COLUMN status TEXT NOT NULL DEFAULT 'draft'`,
+          );
+        } catch (e: unknown) {
+          const msg = e instanceof Error ? e.message : String(e);
+          if (!msg.includes("duplicate column name")) throw e;
+        }
+      }
+
+      const hasTrustLevel = await tableHasColumn(
+        db,
+        "rag_documents",
+        "trust_level",
+      );
+      if (!hasTrustLevel) {
+        try {
+          await db.execute(
+            `ALTER TABLE rag_documents ADD COLUMN trust_level TEXT NOT NULL DEFAULT 'medium'`,
+          );
+        } catch (e: unknown) {
+          const msg = e instanceof Error ? e.message : String(e);
+          if (!msg.includes("duplicate column name")) throw e;
+        }
+      }
+
+      const hasReviewedAt = await tableHasColumn(
+        db,
+        "rag_documents",
+        "reviewed_at",
+      );
+      if (!hasReviewedAt) {
+        try {
+          await db.execute(
+            `ALTER TABLE rag_documents ADD COLUMN reviewed_at TEXT`,
+          );
+        } catch (e: unknown) {
+          const msg = e instanceof Error ? e.message : String(e);
+          if (!msg.includes("duplicate column name")) throw e;
+        }
+      }
+
+      await db.execute(
+        `CREATE INDEX IF NOT EXISTS idx_rag_documents_status ON rag_documents(status)`,
+      );
+
+      // 旧 seed_knowledge 记录回填：保持 active + high，并打上 reviewed_at。
+      await db.execute(
+        `UPDATE rag_documents
+            SET status = 'active',
+                trust_level = 'high',
+                reviewed_at = COALESCE(reviewed_at, datetime('now'))
+          WHERE source_type = 'seed_knowledge'
+            AND (status IS NULL OR status = 'draft')`,
+      );
+    },
+  },
 ];
 
 export async function runMigrations(): Promise<void> {

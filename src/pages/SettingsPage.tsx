@@ -1,6 +1,11 @@
-import { Settings, Database, Info, Bell } from "lucide-react";
+import { Settings, Database, Info, Bell, BookOpen } from "lucide-react";
+import { useState } from "react";
 import { useHeartbeatStore } from "@/store/heartbeatStore";
+import { useRagKnowledgeStore } from "@/store/ragKnowledgeStore";
+import { RagKnowledgeManagerDialog } from "@/components/rag/RagKnowledgeManagerDialog";
 import { cn } from "@/lib/utils";
+
+const RAG_ADMIN_ENABLED = import.meta.env.VITE_ENABLE_RAG_ADMIN === "true";
 
 function Toggle({
   checked,
@@ -37,6 +42,14 @@ export function SettingsPage() {
     autoFeedbackPromptEnabled,
     updateSettings,
   } = useHeartbeatStore();
+
+  const userMaterialInChatEnabled = useRagKnowledgeStore(
+    (s) => s.userMaterialInChatEnabled,
+  );
+  const setUserMaterialInChat = useRagKnowledgeStore(
+    (s) => s.setUserMaterialInChat,
+  );
+  const [ragDialogOpen, setRagDialogOpen] = useState(false);
 
   return (
     <div className="h-full overflow-y-auto bg-gray-50">
@@ -144,6 +157,68 @@ export function SettingsPage() {
             </div>
           </div>
         </section>
+
+        {/* Knowledge Base section (V3.8.1) */}
+        <section className="bg-white rounded-xl border border-gray-200 p-6 mb-6">
+          <div className="flex items-center gap-2 mb-5">
+            <BookOpen size={18} className="text-amber-600" />
+            <h2 className="text-base font-semibold text-gray-800">知识库 / RAG 资料</h2>
+          </div>
+
+          <div className="space-y-5">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm font-medium text-gray-700">
+                  允许 user_material 进入 Chat 检索
+                </p>
+                <p className="text-xs text-gray-500 mt-0.5">
+                  打开后，状态为 active 的"user_material"资料才会参与对话检索。
+                  仍需要文档自身处于 active 状态，双门控才生效。
+                </p>
+              </div>
+              <Toggle
+                checked={userMaterialInChatEnabled}
+                onChange={setUserMaterialInChat}
+              />
+            </div>
+
+            {RAG_ADMIN_ENABLED && (
+              <>
+                <div className="border-t border-gray-100" />
+
+                <div className="flex items-center justify-between">
+                  <div>
+                    <p className="text-sm font-medium text-gray-700">资料管理</p>
+                    <p className="text-xs text-gray-500 mt-0.5">
+                      录入 / 启用 / 归档语料；仅在 VITE_ENABLE_RAG_ADMIN=true 时显示。
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => setRagDialogOpen(true)}
+                    className="px-3 py-1.5 text-sm font-medium text-white bg-amber-600 rounded-lg hover:bg-amber-700 focus:outline-none focus:ring-2 focus:ring-amber-400"
+                  >
+                    打开知识库管理器
+                  </button>
+                </div>
+              </>
+            )}
+
+            <div className="p-3 bg-amber-50 rounded-lg">
+              <p className="text-xs text-amber-700">
+                Chat 主路径默认只检索 seed_knowledge（内置时间管理理论）。
+                external_context 暂不进入对话，system_guidance 不开放 UI 写入。
+                RAG 结果只读，不会直接生成任务或修改时间块。
+              </p>
+            </div>
+          </div>
+        </section>
+
+        {RAG_ADMIN_ENABLED && (
+          <RagKnowledgeManagerDialog
+            open={ragDialogOpen}
+            onClose={() => setRagDialogOpen(false)}
+          />
+        )}
 
         {/* Data section */}
         <section className="bg-white rounded-xl border border-gray-200 p-6 mb-6">

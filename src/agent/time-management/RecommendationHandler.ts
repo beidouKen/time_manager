@@ -55,15 +55,26 @@ export class RecommendationHandler {
   constructor(private deps: RecommendationHandlerDeps) {}
 
   /**
-   * 基于 mock 历史数据生成建议。
-   * 不直接修改任何计划或任务。
+   * 基于历史数据和当前日程生成建议。
+   *
+   * @param ragQuery 可选语义化查询词，用于 RAG 检索。
+   *   调用方应优先传入用户输入 + 当前任务标题等语义信息；
+   *   不传时退回到基于 todayBlocks 标题的最小 query。
+   *   不要传 currentDatetime 等无语义值。
    */
   async generateRecommendation(
     context: AgentExperienceContext,
-    todayBlocks: Array<{ title: string; start_time: string; end_time: string }>
+    todayBlocks: Array<{ title: string; start_time: string; end_time: string }>,
+    ragQuery?: string,
   ): Promise<RecommendationResult> {
     const density = this.detectScheduleDensity(todayBlocks);
-    const historyInsights = await this.fetchHistoryInsights(context);
+    // 构建最终 query：优先使用调用方提供的语义 query，
+    // 退回到 todayBlocks 标题拼接，最后兜底为空字符串。
+    const resolvedQuery =
+      ragQuery?.trim() ||
+      todayBlocks.map((b) => b.title).filter(Boolean).join(" ") ||
+      "";
+    const historyInsights = await this.fetchHistoryInsights(context, resolvedQuery);
 
     // Overload detection: too many blocks or too long
     if (density.density === "overload") {
@@ -146,7 +157,16 @@ export class RecommendationHandler {
     };
   }
 
-  private async fetchHistoryInsights(context: AgentExperienceContext): Promise<string> {
+  /**
+   * 从 Memory 和 RAG adapter 汇聚洞察文本。
+   *
+   * @param _context 当前 agent 上下文（保留参数，供未来扩展使用）。
+   * @param ragQuery 语义化查询词；不应使用 currentDatetime 等无语义值。
+   */
+  private async fetchHistoryInsights(
+    _context: AgentExperienceContext,
+    ragQuery: string,
+  ): Promise<string> {
     const parts: string[] = [];
 
     // From memory adapter
@@ -165,11 +185,10 @@ export class RecommendationHandler {
       }
     }
 
-    // From RAG adapter
-    if (this.deps.ragAdapter) {
-      const { snippets } = await this.deps.ragAdapter.retrieveRelatedHistory(
-        context.currentDatetime
-      );
+    // From RAG adapter — 使用语义化 query 而非 currentDatetime。
+    // 若 query 为空字符串，RagService.retrieve 会因 tokenize 得到空数组而直接返回 []。
+    if (this.deps.ragAdapter && ragQuery) {
+      const { snippets } = await this.deps.ragAdapter.retrieveRelatedHistory(ragQuery);
       for (const snippet of snippets.slice(0, 1)) {
         if (snippet.content) {
           parts.push(snippet.content);

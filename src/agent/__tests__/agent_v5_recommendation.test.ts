@@ -165,7 +165,13 @@ describe("Phase 4 Agent V5 Tests", () => {
       lastToolResults: [],
     };
 
-    const result = await handler.generateRecommendation(context, []);
+    // V3.8 修正：必须传入语义化 ragQuery，RAG 才会被调用。
+    // 不传 ragQuery 且 blocks 为空时，resolvedQuery 为空字符串，ragAdapter 不会被调用。
+    const result = await handler.generateRecommendation(
+      context,
+      [],
+      "写作任务安排",  // 语义化 query，触发 RAG 检索
+    );
     expect(result.message).toContain("写作类任务");
   });
 
