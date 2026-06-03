@@ -1,5 +1,5 @@
 // ============================================================
-// ragKnowledgeStore.ts — V3.8.1 RAG Knowledge Manager 状态层
+// ragKnowledgeStore.ts — V3.8.1+ RAG Knowledge Manager / V3.8.2 Demo Library 状态层
 //
 // 职责：
 // - 暴露 RAG 资料治理给 SettingsPage / RagKnowledgeManagerDialog。
@@ -14,11 +14,24 @@
 
 import { create } from "zustand";
 import { RagIngestionService } from "@/services/rag/RagIngestionService";
+import { SqliteFtsKeywordSearch } from "@/services/rag/keyword/SqliteFtsKeywordSearch";
+import { RagService } from "@/services/rag/RagService";
+import { buildSelfHostedHybridRetriever } from "@/services/rag/retrieval/buildSelfHostedHybridRetriever";
+import {
+  RagDemoLibraryService,
+  type CozeExportOptions,
+} from "@/services/rag/RagDemoLibraryService";
+import { VectorRagService } from "@/services/rag/VectorRagService";
 import type {
+  CozeLikeDatasetPreview,
   IngestDocumentInput,
+  LocalRagStats,
   RagDocument,
+  RagPreviewRetrieveMode,
   RagSourceType,
   RagStatus,
+  RetrievePreviewHit,
+  VectorRagChunkHit,
 } from "@/types/rag.types";
 
 const LS_KEY_USER_MATERIAL = "rag.userMaterialInChatEnabled";
@@ -52,6 +65,12 @@ interface RagKnowledgeState {
    * 双门控的第 1 道，第 2 道是文档的 status='active'。
    */
   userMaterialInChatEnabled: boolean;
+  /** V3.8.2：知识库统计。 */
+  stats: LocalRagStats | null;
+  previewQuery: string;
+  previewHits: RetrievePreviewHit[];
+  exportPreview: CozeLikeDatasetPreview | null;
+  demoLoading: boolean;
 }
 
 interface RagKnowledgeActions {
@@ -78,18 +97,48 @@ interface RagKnowledgeActions {
 
   selectDocument: (id: string | null) => void;
   setUserMaterialInChat: (v: boolean) => void;
+
+  loadStats: () => Promise<void>;
+  runPreview: (
+    query: string,
+    opts?: {
+      sourceTypes?: RagSourceType[];
+      limit?: number;
+      mode?: RagPreviewRetrieveMode;
+    },
+  ) => Promise<void>;
+  buildExport: (opts?: CozeExportOptions) => Promise<void>;
+  clearPreview: () => void;
+  clearExport: () => void;
 }
 
-// 单例 Ingestion 服务；不在 store 构造时实例化以保持轻量
+// 单例服务；不在 store 构造时实例化以保持轻量
 let ingestionService: RagIngestionService | null = null;
 function getIngestion(): RagIngestionService {
-  if (!ingestionService) ingestionService = new RagIngestionService();
+  if (!ingestionService) {
+    const rag = new RagService();
+    ingestionService = new RagIngestionService(
+      rag,
+      new VectorRagService(rag),
+      new SqliteFtsKeywordSearch(rag),
+    );
+  }
   return ingestionService;
+}
+
+let demoService: RagDemoLibraryService | null = null;
+function getDemo(): RagDemoLibraryService {
+  if (!demoService) demoService = new RagDemoLibraryService();
+  return demoService;
 }
 
 /** 仅测试使用：注入自定义 service，便于断言不写库。 */
 export function __setRagIngestionServiceForTest(svc: RagIngestionService | null): void {
   ingestionService = svc;
+}
+
+export function __setRagDemoServiceForTest(svc: RagDemoLibraryService | null): void {
+  demoService = svc;
 }
 
 export const useRagKnowledgeStore = create<RagKnowledgeState & RagKnowledgeActions>(
@@ -99,6 +148,11 @@ export const useRagKnowledgeStore = create<RagKnowledgeState & RagKnowledgeActio
     error: null,
     selectedDocumentId: null,
     userMaterialInChatEnabled: readUserMaterialFlag(),
+    stats: null,
+    previewQuery: "",
+    previewHits: [],
+    exportPreview: null,
+    demoLoading: false,
 
     loadDocuments: async (opts) => {
       set({ loading: true, error: null });
@@ -173,5 +227,81 @@ export const useRagKnowledgeStore = create<RagKnowledgeState & RagKnowledgeActio
       writeUserMaterialFlag(v);
       set({ userMaterialInChatEnabled: v });
     },
+
+    loadStats: async () => {
+      set({ demoLoading: true, error: null });
+      try {
+        const stats = await getDemo().getStats();
+        set({ stats, demoLoading: false });
+      } catch (e) {
+        set({ demoLoading: false, error: String(e) });
+      }
+    },
+
+    runPreview: async (query, opts) => {
+      set({ demoLoading: true, error: null, previewQuery: query });
+      try {
+        const mode = opts?.mode ?? "hybrid";
+        const limit = opts?.limit ?? 8;
+        const sourceTypes = opts?.sourceTypes;
+        let hits: RetrievePreviewHit[] = [];
+
+        const rag = new RagService();
+        let chunkHits: VectorRagChunkHit[] = [];
+
+        if (mode === "keyword") {
+          const keyword = new SqliteFtsKeywordSearch(rag);
+          chunkHits = await keyword.search(query, { sourceTypes, limit });
+        } else {
+          if (mode === "vector") {
+            const vector = new VectorRagService(rag);
+            chunkHits = await vector.retrieveVector(query, { sourceTypes, limit });
+          } else {
+            const retriever = buildSelfHostedHybridRetriever();
+            if (retriever) {
+              chunkHits = await retriever.retrieve(query, { sourceTypes, limit });
+            } else {
+              chunkHits = await new VectorRagService(rag).retrieveHybrid(query, {
+                sourceTypes,
+                limit,
+              });
+            }
+          }
+        }
+
+        const titleCache = new Map<string, string>();
+        for (const h of chunkHits) {
+          let title = titleCache.get(h.documentId);
+          if (!title) {
+            title = (await rag.getDocumentTitle(h.documentId)) ?? h.documentId;
+            titleCache.set(h.documentId, title);
+          }
+          hits.push({
+            documentId: h.documentId,
+            title,
+            sourceType: h.sourceType,
+            content: h.content,
+            score: h.score,
+          });
+        }
+
+        set({ previewHits: hits, demoLoading: false });
+      } catch (e) {
+        set({ previewHits: [], demoLoading: false, error: String(e) });
+      }
+    },
+
+    buildExport: async (opts) => {
+      set({ demoLoading: true, error: null });
+      try {
+        const preview = await getDemo().buildCozeLikeDatasetPreview(opts);
+        set({ exportPreview: preview, demoLoading: false });
+      } catch (e) {
+        set({ exportPreview: null, demoLoading: false, error: String(e) });
+      }
+    },
+
+    clearPreview: () => set({ previewQuery: "", previewHits: [] }),
+    clearExport: () => set({ exportPreview: null }),
   }),
 );

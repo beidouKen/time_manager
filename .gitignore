@@ -28,3 +28,12 @@ dist-ssr
 
 # Tauri
 src-tauri/target/
+
+# v3-external-context-plugin runtime outputs
+v3-external-context-plugin/outputs/raw/
+v3-external-context-plugin/outputs/runs/
+v3-external-context-plugin/outputs/demo/web-live/
+v3-external-context-plugin/outputs/demo/wechat-live/
+v3-external-context-plugin/state/
+v3-external-context-plugin/__pycache__/
+v3-external-context-plugin/*.pyc

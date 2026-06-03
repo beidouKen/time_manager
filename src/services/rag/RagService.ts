@@ -444,6 +444,132 @@ export class RagService {
     return rows[0] ? rowToDocument(rows[0]) : null;
   }
 
+  /** V3.8.2：统计 rag_chunks 总行数（Demo Library stats）。 */
+  async countChunks(): Promise<number> {
+    const db = await this.db();
+    const rows = await db.select<Array<{ cnt: number }>>(
+      "SELECT COUNT(*) as cnt FROM rag_chunks",
+      [],
+    );
+    return Number(rows[0]?.cnt) || 0;
+  }
+
+  /** V3.8.2：按 document_id 列出 chunks，按 chunk_index 升序（用于导出拼合正文）。 */
+  async listChunksForDocument(documentId: string): Promise<RagChunk[]> {
+    const db = await this.db();
+    const rows = await db.select<ChunkRow[]>(
+      `SELECT * FROM rag_chunks
+       WHERE document_id = $1
+       ORDER BY chunk_index ASC`,
+      [documentId],
+    );
+    return rows.map(rowToChunk);
+  }
+
+  /**
+   * V3.8.3：列出 active 且未软删文档下的全部 chunks（供 embed / vector 检索基线）。
+   * sourceTypes 非空时做硬过滤。
+   */
+  async listChunksForActiveDocuments(
+    sourceTypes?: RagSourceType[],
+  ): Promise<RagChunk[]> {
+    const db = await this.db();
+    const where: string[] = [
+      "d.deleted_at IS NULL",
+      "d.status = 'active'",
+    ];
+    const params: unknown[] = [];
+    if (sourceTypes && sourceTypes.length > 0) {
+      const placeholders = sourceTypes
+        .map((_, i) => `$${i + 1}`)
+        .join(", ");
+      where.push(`d.source_type IN (${placeholders})`);
+      params.push(...sourceTypes);
+    }
+    const rows = await db.select<ChunkRow[]>(
+      `SELECT c.*
+         FROM rag_chunks c
+         JOIN rag_documents d ON d.id = c.document_id
+        WHERE ${where.join(" AND ")}
+        ORDER BY c.document_id, c.chunk_index`,
+      params,
+    );
+    return rows.map(rowToChunk);
+  }
+
+  /**
+   * V3.8.5：按 chunk id 拉取 chunk + 文档 sourceType（Hybrid 向量通道 hydration）。
+   */
+  async getChunksWithDocByIds(
+    chunkIds: string[],
+    opts: {
+      sourceTypes?: RagSourceType[];
+      includeNonActive?: boolean;
+    } = {},
+  ): Promise<
+    Array<
+      RagChunk & {
+        sourceType: RagSourceType;
+      }
+    >
+  > {
+    if (chunkIds.length === 0) return [];
+    const db = await this.db();
+    const placeholders = chunkIds.map((_, i) => `$${i + 1}`).join(", ");
+    const params: unknown[] = [...chunkIds];
+    const where: string[] = ["d.deleted_at IS NULL", `c.id IN (${placeholders})`];
+
+    if (!opts.includeNonActive) {
+      where.push("d.status = 'active'");
+    }
+    if (opts.sourceTypes && opts.sourceTypes.length > 0) {
+      const st = opts.sourceTypes
+        .map((_, i) => `$${params.length + i + 1}`)
+        .join(", ");
+      where.push(`d.source_type IN (${st})`);
+      params.push(...opts.sourceTypes);
+    }
+
+    const rows = await db.select<
+      Array<ChunkRow & { doc_source_type: RagSourceType }>
+    >(
+      `SELECT c.*, d.source_type AS doc_source_type
+         FROM rag_chunks c
+         JOIN rag_documents d ON d.id = c.document_id
+        WHERE ${where.join(" AND ")}`,
+      params,
+    );
+
+    return rows.map((row) => ({
+      ...rowToChunk(row),
+      sourceType: row.doc_source_type,
+    }));
+  }
+
+  /** V3.8.5：按 document id 查标题（评测用）。 */
+  async getDocumentTitle(documentId: string): Promise<string | null> {
+    const doc = await this.getDocument(documentId);
+    return doc?.title ?? null;
+  }
+
+  /**
+   * V3.8.3：删除某文档在指定 model/version 下的全部 embeddings（refresh 前清理）。
+   */
+  async deleteEmbeddingsForDocument(
+    documentId: string,
+    embeddingModel: string,
+    embeddingVersion: string,
+  ): Promise<void> {
+    const db = await this.db();
+    await db.execute(
+      `DELETE FROM rag_embeddings
+        WHERE document_id = $1
+          AND embedding_model = $2
+          AND embedding_version = $3`,
+      [documentId, embeddingModel, embeddingVersion],
+    );
+  }
+
   private resolveChunkContents(
     input: IngestDocumentInput,
   ): IngestChunkInput[] {

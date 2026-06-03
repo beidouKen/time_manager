@@ -298,8 +298,9 @@ V3.7 P0 hotfix 已覆盖：
 当前 Memory 与 RAG 已经分化：
 
 - **Memory** 仍是 mock-first 骨架，等待 ProductionMemoryAdapter。
-- **RAG** 已进入 V3.8 / V3.8.1 Foundation：本地 SQLite 实表、seed knowledge、Chat 主路径只读接入、Settings 知识库维护入口已经存在。
-- 仍未接入真正 embedding / vector store，因此还不是完整向量 RAG。
+- **RAG** 已进入 V3.8 / … / V3.8.6 Scaffold / **V3.8.7 Production Pack**（可配置 embedding、VectorStoreFactory、ScoreReranker、Eval dataset、Admin UI）。Chat 默认 V3.8.3 legacy；`VITE_RAG_ENGINE=self_hosted` 启用自建栈；`VITE_ENABLE_RAG_ADMIN=true` 显示引擎管理 Tab。
+- V3.8.3 `DeterministicEmbeddingProvider` + `rag_embeddings` 仅作 **dev fallback**，不是生产向量方案。
+- **正式部署策略（V3.8.4）**：**自建 Self-hosted RAG Engine**；Coze Dataset 路线已废弃为正式核心（V3.8.2 仅保留演示）。详见 `docs/V3.8/V3.8.4_SELF_HOSTED_RAG_ENGINE_PLAN.md`。V3.9 留给真向量库 / 多模型 / Reranker 封板。
 
 ### Memory 当前能做什么
 
@@ -321,13 +322,15 @@ V3.7 P0 hotfix 已覆盖：
 
 ### RAG 当前能做什么
 
-RAG 当前是 **SQLite keyword RAG**，不是向量库。
+RAG 当前是 **SQLite hybrid RAG**：Chat 主路径为 vector + keyword fallback；管理 UI 检索预览仍为 keyword 调试。
 
 已落地：
 
 - `rag_documents / rag_chunks` 实表。
 - `RagService.ingestDocument / retrieve / listDocuments / deleteDocument`。
-- `SqliteRagAdapter` 接入 `RecommendationHandler`。
+- `SqliteRagAdapter` 接入 `RecommendationHandler`（V3.8.3 注入 `VectorRagService` hybrid）。
+- `rag_embeddings`（migration v8）+ App 启动 `embedMissingChunks()`。
+- `DeterministicEmbeddingProvider`：chunk/query 嵌入 + 内存 cosine topK。
 - 5 条 `seed_knowledge` 时间管理理论，App 启动时幂等写入。
 - Chat 主路径默认只检索 `seed_knowledge`。
 - Settings 中有 `user_material` 进入 Chat 的总开关。
@@ -339,8 +342,8 @@ RAG 当前是 **SQLite keyword RAG**，不是向量库。
 
 当前仍不做：
 
-- 暂不接真实向量库。
-- 暂不调用真实 embedding API。
+- 不接 sqlite-vec / pgvector 等大型向量库。
+- 生产路径默认不调用 OpenAI embedding API（草案类可显式启用）。
 - 暂不直接参与主排程写入。
 - 暂不让 RAG 结果直接生成 ToolRouter action。
 
@@ -349,6 +352,12 @@ RAG 当前是 **SQLite keyword RAG**，不是向量库。
 - `VITE_ENABLE_RAG_ADMIN=true` 时，Settings 显示“知识库管理器”。
 - false 或未设置时隐藏该维护入口，适合语料灌入完成后封藏。
 - 隐藏入口不影响已 active 的知识被检索。
+
+V3.8.2 Demo Library（`VITE_ENABLE_RAG_ADMIN=true` 时 Dialog 内 Tab）：
+
+- **统计**：文档/chunk 数量与 sourceType 分布。
+- **检索预览**：本地 **keyword** 命中预览（仅 active）；Chat 主路径已 vector/hybrid，本 Tab 用于调试。
+- **导出预览**：生成 Coze-like Dataset JSON 形态，**不调用 Coze API**。
 
 适合放入：
 
@@ -563,11 +572,11 @@ python review.py dry-run
 
 推荐顺序：
 
-1. **V3.8.x RAG Foundation 收口**：维护 seed_knowledge / user_material，必要时用 `VITE_ENABLE_RAG_ADMIN=true` 打开知识库管理器；默认封藏维护入口。
+1. **V3.8.x RAG Foundation**：V3.8.7 Production Pack（embedding/vector/rerank 工厂、reindex 增强、评测集、Admin UI）；V3.8.6 骨架；`VITE_RAG_ENGINE=self_hosted`；`VITE_RAG_EMBEDDING_PROVIDER` / `VITE_RAG_RERANKER` 可选；`VITE_ENABLE_RAG_ADMIN=true` 打开知识库 + 引擎管理。
 2. **Product V4 Import Foundation**：先做粘贴文本 / ICS / CSV 导入，生成可编辑 proposal，不直接写 Timeline。
 3. **Product V5 Production Memory**：把 mock memory 换成本地生产适配器，基于 ActionLog / Task / TimeBlock 做后验统计。
 4. **Memory 指导标准**：沉淀面向 LLM 的用户偏好摘要与排期准则，而不是只给统计数字。
-5. **V3.9 Vector RAG**：等资料入口、状态治理、权限边界稳定后，再接 EmbeddingProvider / VectorStore / HybridRetriever。
+5. **V3.9 真向量库 / 多模型 / Reranker（封板）**：在 V3.8.3 最小向量管线稳定后，再接 sqlite-vec / pgvector、生产 embedding、复杂 hybrid 融合与 rerank。
 6. **Product V6 Plan Mode**：多步骤计划先生成 proposal，用户编辑确认后再执行。
 7. **Product V7 Local Workspace Agent**：只读本地 workspace 索引，权限边界独立于 Time Manager 数据。
 8. **Product V8 Executor Plugin System**：把内置 ToolRouter 演进为插件式 executor，但继续保留 ConfirmationPolicy 和审计。

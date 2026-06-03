@@ -126,3 +126,100 @@ export interface RagQueryOptions {
    */
   includeNonActive?: boolean;
 }
+
+// ─── V3.8.2 Local Coze-like RAG Demo Library（类型层，无 migration） ─────────
+
+/** 本地隐式 Dataset，对应 Coze Dataset 的简化形态。 */
+export interface LocalRagDataset {
+  id: "default_time_manager_context";
+  name: string;
+  description: string;
+}
+
+/** 知识库统计摘要，供 Demo Library 统计面板使用。 */
+export interface LocalRagStats {
+  totalDocuments: number;
+  activeCount: number;
+  draftCount: number;
+  archivedCount: number;
+  totalChunks: number;
+  bySourceType: Record<RagSourceType, number>;
+}
+
+/** 导出预览专用文档视图（不含 id / 时间戳等内部字段）。 */
+export interface LocalRagDocumentView {
+  title: string;
+  /** 由 chunks 按 chunk_index 拼合；无 chunk 时回退 summary/title。 */
+  content: string;
+  sourceType: RagSourceType;
+  tags: string[];
+  status: RagStatus;
+  trustLevel: RagTrustLevel;
+}
+
+/** Coze-like Dataset 导出预览 JSON 结构（仅本地预览，不调用 Coze API）。 */
+export interface CozeLikeDatasetPreview {
+  dataset: {
+    name: string;
+    description: string;
+    documents: LocalRagDocumentView[];
+  };
+  meta: {
+    generatedAt: string;
+    documentCount: number;
+    includedSourceTypes: RagSourceType[];
+    /** 被跳过的 sourceType 或规则说明，便于调试。 */
+    excludedReason: Record<string, string>;
+  };
+}
+
+/** 检索预览命中项（管理 UI 展示用）。 */
+export interface RetrievePreviewHit {
+  documentId: string;
+  title: string;
+  sourceType: RagSourceType;
+  content: string;
+  score: number;
+}
+
+// ─── V3.8.3 Minimal Local Vector RAG ─────────────────────────────────────────
+
+export type EmbeddingVector = number[];
+
+export interface EmbeddingProviderConfig {
+  model: string;
+  version: string;
+  dimensions: number;
+  /** OpenAI 兼容草案；本轮不强制在生产路径读取 */
+  apiKey?: string;
+  baseUrl?: string;
+}
+
+export interface RagEmbeddingRecord {
+  id: string;
+  chunkId: string;
+  documentId: string;
+  embeddingModel: string;
+  embeddingVersion: string;
+  vector: EmbeddingVector;
+  dimensions: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface VectorRetrieveOptions {
+  sourceTypes?: RagSourceType[];
+  limit?: number;
+  /** 默认仅 active；管理路径可显式 includeNonActive */
+  includeNonActive?: boolean;
+}
+
+/** 向量 / hybrid 检索命中；在 RagChunkHit 基础上标注检索模式。 */
+export interface VectorRagChunkHit extends RagChunkHit {
+  retrieveMode: "vector" | "keyword" | "hybrid";
+  /** V3.8.5：RRF 融合时标注命中的检索通道 */
+  retrievalSources?: Array<"vector" | "keyword">;
+}
+
+/** V3.8.5：Demo 检索预览模式 */
+export type RagPreviewRetrieveMode = "keyword" | "vector" | "hybrid";

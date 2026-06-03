@@ -3,6 +3,9 @@ import { runMigrations } from "@/db/migrations";
 import { AppLayout } from "@/components/layout/AppLayout";
 import { RagService } from "@/services/rag/RagService";
 import { seedRagKnowledge } from "@/services/rag/seedRagKnowledge";
+import { SqliteFtsKeywordSearch } from "@/services/rag/keyword/SqliteFtsKeywordSearch";
+import { isSelfHostedRagEngineEnabled } from "@/services/rag/retrieval/buildSelfHostedHybridRetriever";
+import { VectorRagService } from "@/services/rag/VectorRagService";
 
 type DbState = "loading" | "ready" | "error";
 
@@ -16,9 +19,16 @@ export default function App() {
         await runMigrations(); //成功条件是runMigration()函数必须返回的Promise必须是 “成功解决”
         // V3.8: 启动时幂等写入 RAG 种子知识；失败不阻塞主路径。
         try {
-          await seedRagKnowledge(new RagService());
+          const rag = new RagService();
+          await seedRagKnowledge(rag);
+          const vector = new VectorRagService(rag);
+          await vector.embedMissingChunks();
+          if (isSelfHostedRagEngineEnabled()) {
+            const kw = new SqliteFtsKeywordSearch(rag);
+            await kw.rebuildIndex?.();
+          }
         } catch (seedErr) {
-          console.warn("RAG seed knowledge ingestion failed:", seedErr);
+          console.warn("RAG seed/embed failed:", seedErr);
         }
         setDbState("ready");
       } catch (e) {

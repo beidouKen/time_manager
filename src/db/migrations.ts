@@ -365,6 +365,61 @@ const MIGRATIONS: Migration[] = [
       );
     },
   },
+  {
+    // V3.8.3 Minimal Local Vector RAG：chunk 向量存储（vector_json，内存 cosine）。
+    // 本轮不引入 sqlite-vec；资料规模小，单机演示足够。
+    version: 8,
+    async run(db) {
+      if (await tableExists(db, "rag_embeddings")) return;
+
+      await db.execute(
+        `CREATE TABLE IF NOT EXISTS rag_embeddings (
+          id                TEXT PRIMARY KEY,
+          chunk_id          TEXT NOT NULL REFERENCES rag_chunks(id) ON DELETE CASCADE,
+          document_id       TEXT NOT NULL,
+          embedding_model   TEXT NOT NULL,
+          embedding_version TEXT NOT NULL,
+          vector_json       TEXT NOT NULL,
+          dimensions        INTEGER NOT NULL,
+          created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
+        )`,
+      );
+      await db.execute(
+        `CREATE INDEX IF NOT EXISTS idx_rag_embeddings_chunk ON rag_embeddings(chunk_id)`,
+      );
+      await db.execute(
+        `CREATE INDEX IF NOT EXISTS idx_rag_embeddings_doc ON rag_embeddings(document_id)`,
+      );
+      await db.execute(
+        `CREATE INDEX IF NOT EXISTS idx_rag_embeddings_model ON rag_embeddings(embedding_model)`,
+      );
+      await db.execute(
+        `CREATE UNIQUE INDEX IF NOT EXISTS uniq_rag_embeddings_chunk_model
+           ON rag_embeddings(chunk_id, embedding_model, embedding_version)`,
+      );
+    },
+  },
+  {
+    // V3.8.5 Self-hosted RAG Engine MVP：FTS5 全文索引（启动时 rebuildIndex 同步）。
+    version: 9,
+    async run(db) {
+      if (await tableExists(db, "rag_chunks_fts")) return;
+      try {
+        await db.execute(
+          `CREATE VIRTUAL TABLE IF NOT EXISTS rag_chunks_fts USING fts5(
+            content,
+            chunk_id UNINDEXED,
+            document_id UNINDEXED,
+            tokenize = 'unicode61 remove_diacritics 2'
+          )`,
+        );
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        console.warn("[migration v9] FTS5 unavailable, keyword search will use LIKE fallback:", msg);
+      }
+    },
+  },
 ];
 
 export async function runMigrations(): Promise<void> {

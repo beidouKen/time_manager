@@ -325,6 +325,23 @@ describe("RagIngestionService 资料状态", () => {
     expect(db.docs[0].reviewed_at).toBeTruthy();
   });
 
+  it("activateDocument 后刷新该文档 embedding", async () => {
+    const db = buildFakeDb();
+    const indexer = {
+      refreshEmbeddingForDocument: vi.fn(async () => undefined),
+    };
+    const ingestion = new RagIngestionService(new RagService(db), indexer);
+    const doc = await ingestion.createDraftDocument({
+      sourceType: "user_material",
+      title: "需要建索引",
+      fullText: "番茄工作法",
+    });
+
+    await ingestion.activateDocument(doc.id);
+
+    expect(indexer.refreshEmbeddingForDocument).toHaveBeenCalledWith(doc.id);
+  });
+
   it("archiveDocument 把 status 推到 archived", async () => {
     const db = buildFakeDb();
     const ingestion = new RagIngestionService(new RagService(db));

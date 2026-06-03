@@ -12,6 +12,9 @@
 
 import type { RagAdapter, RagSnippet } from "@/agent/memory/RagAdapter";
 import { RagService } from "@/services/rag/RagService";
+import type { RagEngine } from "@/services/rag/engine/RagEngine";
+import type { HybridRetriever } from "@/services/rag/retrieval/HybridRetriever";
+import type { VectorRagService } from "@/services/rag/VectorRagService";
 import type { RagSourceType } from "@/types/rag.types";
 
 export interface SqliteRagAdapterOptions {
@@ -34,6 +37,12 @@ export interface SqliteRagAdapterOptions {
   defaultLimit?: number;
   /** 偏好 tags（影响排序加权，不影响过滤）。 */
   defaultPreferredTags?: string[];
+  /** V3.8.3：可选向量服务；若提供则优先 hybrid retrieve。 */
+  vectorService?: VectorRagService;
+  /** V3.8.5：Self-hosted RAG Engine；优先于 vectorService。 */
+  hybridRetriever?: HybridRetriever;
+  /** V3.8.6：统一 RagEngine 入口；优先于 hybridRetriever。 */
+  ragEngine?: RagEngine;
 }
 
 export class SqliteRagAdapter implements RagAdapter {
@@ -42,6 +51,9 @@ export class SqliteRagAdapter implements RagAdapter {
   private sourceTypesProvider: (() => RagSourceType[]) | undefined;
   private defaultLimit: number;
   private defaultPreferredTags: string[] | undefined;
+  private vectorService: VectorRagService | undefined;
+  private hybridRetriever: HybridRetriever | undefined;
+  private ragEngine: RagEngine | undefined;
 
   constructor(opts: SqliteRagAdapterOptions = {}) {
     this.service = opts.service ?? new RagService();
@@ -49,6 +61,9 @@ export class SqliteRagAdapter implements RagAdapter {
     this.sourceTypesProvider = opts.sourceTypesProvider;
     this.defaultLimit = opts.defaultLimit ?? 3;
     this.defaultPreferredTags = opts.defaultPreferredTags;
+    this.vectorService = opts.vectorService;
+    this.hybridRetriever = opts.hybridRetriever;
+    this.ragEngine = opts.ragEngine;
   }
 
   /** V3.8.1：每次检索解析当前生效的 sourceTypes。 */
@@ -67,11 +82,59 @@ export class SqliteRagAdapter implements RagAdapter {
   async retrieveRelatedHistory(
     query: string,
   ): Promise<{ snippets: RagSnippet[] }> {
+    const sourceTypes = this.resolveSourceTypes();
+    const limit = this.defaultLimit;
+
+    if (this.ragEngine) {
+      try {
+        const result = await this.ragEngine.retrieve(query, {
+          sourceTypes,
+          limit,
+        });
+        return { snippets: result.snippets };
+      } catch {
+        // engine 失败降级 hybrid / vector / keyword
+      }
+    }
+
+    if (this.hybridRetriever) {
+      try {
+        const hits = await this.hybridRetriever.retrieve(query, {
+          sourceTypes,
+          limit,
+        });
+        const snippets: RagSnippet[] = hits.map((h) => ({
+          content: h.content,
+          relevance: h.score,
+          source: `${h.sourceType}:${h.documentId}`,
+        }));
+        return { snippets };
+      } catch {
+        // self-hosted 失败降级 V3.8.3 / keyword
+      }
+    }
+
+    if (this.vectorService) {
+      try {
+        const hits = await this.vectorService.retrieveHybrid(query, {
+          sourceTypes,
+          limit,
+        });
+        const snippets: RagSnippet[] = hits.map((h) => ({
+          content: h.content,
+          relevance: h.score,
+          source: `${h.sourceType}:${h.documentId}`,
+        }));
+        return { snippets };
+      } catch {
+        // vector 失败降级 keyword，不阻塞主响应
+      }
+    }
+
     const hits = await this.service.retrieve(query, {
-      sourceTypes: this.resolveSourceTypes(),
+      sourceTypes,
       tags: this.defaultPreferredTags,
-      limit: this.defaultLimit,
-      // 严格遵循"只检索 active"的主路径约定；管理 UI 走 RagIngestionService.listDocuments。
+      limit,
     });
 
     const snippets: RagSnippet[] = hits.map((h) => ({

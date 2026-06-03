@@ -593,7 +593,7 @@ AgentService.processInput → 以"---\n💡"注脚追加到 time_management 回�
 |---|---|
 | SQLite 实表 | ✅ rag_documents / rag_chunks（migration v6） |
 | 内置 seed_knowledge | ✅ 5 条时间管理理论，App 启动幂等写入 |
-| 检索算法 | ✅ keyword + tag + sourceType；纯 SQL LIKE + 内存评分 |
+| 检索算法 | ✅ Chat 主路径：**hybrid**（vector cosine topK → keyword fallback）；管理预览仍为 keyword |
 | 生产 Adapter | ✅ `SqliteRagAdapter`（实现现有 `RagAdapter` 接口） |
 | Chat 主路径接入 | ✅ chatStore.ts 注入 `SqliteRagAdapter`，`sourceTypes: ["seed_knowledge"]` |
 | RAG query 语义化 | ✅ 使用 userInput + blockTitles，不再使用 currentDatetime |
@@ -606,10 +606,32 @@ AgentService.processInput → 以"---\n💡"注脚追加到 time_management 回�
 | **双门控（user_material）** | **✅ V3.8.1：全局 toggle AND 文档 active 双满足才进入 Chat 检索** |
 | **retrieve 默认 active-only** | **✅ V3.8.1：`RagService.retrieve` 默认硬过滤 `status='active'`** |
 | external_context 写入端 | ❌ 自动导入仍未实现；UI 可手动录入但被 Policy 强制 draft |
-| 向量库 / FTS5 / EmbeddingProvider | ❌ 接口稳定，留给 V3.9（待真正向量 RAG 闭环再启用版本号） |
+| **vector retrieve / hybrid** | **✅ V3.8.3：`VectorRagService.retrieveVector` + `retrieveHybrid`；`SqliteRagAdapter` 注入** |
+| **EmbeddingProvider** | **✅ V3.8.3：`DeterministicEmbeddingProvider`（dim=64）；OpenAI 草案默认不启用** |
+| **rag_embeddings** | **✅ V3.8.3：migration v8；`vector_json` + 内存 cosine** |
+| **VectorStore 接口** | **✅ V3.8.4 接口；V3.8.5 `SqliteVectorStore` 可运行** |
+| **HybridRetriever** | **✅ V3.8.5 `SelfHostedHybridRetriever`（RRF）；V3.8.4 `LegacyHybridRetriever` 仍可用** |
+| **Keyword FTS5** | **✅ V3.8.5：`SqliteFtsKeywordSearch` + migration v9** |
+| **Reranker** | **✅ `NoopReranker` hook；生产 reranker 未接** |
+| **RAG Evaluation** | **✅ V3.8.5：`RagEvaluationService`（测试 harness）** |
+| **Chat self_hosted flag** | **✅ `VITE_RAG_ENGINE=self_hosted`（默认 off）** |
+| **RagEngine（统一入口）** | **✅ V3.8.6：`RagEngine` + `RagEngineFactory`** |
+| **RagIndexManager** | **✅ V3.8.6：keyword/vector rebuild + document refresh + job 环** |
+| **RagRetrievalPipeline** | **✅ V3.8.6：QueryStrategy → retrieve → rerank → diagnostics** |
+| **RagAdminActions** | **✅ V3.8.6 服务层；V3.8.7 Admin UI Tab** |
+| **Production Embedding** | **✅ V3.8.7：env 可配置 + 缺 key fallback deterministic** |
+| **VectorStoreFactory** | **✅ V3.8.7：sqlite_json / disabled + 维护 API** |
+| **ScoreReranker** | **✅ V3.8.7：规则加权；`VITE_RAG_RERANKER=score`** |
+| **Evaluation Dataset** | **✅ V3.8.7：defaultRagEvalCases + 多指标** |
+| **MemoryToRagBridge** | **✅ V3.8.7：预留；未接入 App** |
+| 大型向量库 / 生产 Reranker | ❌ 留给 V3.9 封板 |
 | Memory 生产化 | ❌ 仍为 `MockMemoryAdapter`，Product V5 后续步骤 |
 | Heartbeat AgentService | ❌ 未注入 RAG（刻意保留，避免污染） |
 | system_guidance UI 写入 | ❌ Policy 拒绝；只能由系统内部路径写入 |
+| **Demo Library 统计** | **✅ V3.8.2：`RagDemoLibraryService.getStats` + Dialog Tab「统计」** |
+| **检索预览** | **✅ V3.8.2：`previewRetrieve` + Tab「检索预览」（仅 active，可选 sourceTypes）** |
+| **Coze-like 导出预览** | **✅ V3.8.2：JSON 预览不调 Coze API；默认排除 external_context / system_guidance / memory_summary** |
+| **正式部署 RAG 策略** | **V3.8.4 Self-hosted RAG Engine（自建完整引擎）；Coze 路线已废弃为正式核心；V3.8.2 仅历史演示层** |
 
 安全边界（在 RAG 实表落地与 V3.8.1 治理后依然成立）：
 
@@ -620,7 +642,70 @@ AgentService.processInput → 以"---\n💡"注脚追加到 time_management 回�
 - V3.8.1：新文档默认 `status='draft'`，未激活不会被 retrieve；external_context 经 UI 写入被 Policy 强制 draft；system_guidance UI 写入/激活直接拒绝。
 - V3.8.1：memory_summary 仅预留给未来 Memory 系统，UI 写入/激活直接拒绝。
 - V3.8.1：user_material 进入 Chat 检索需"全局 toggle ON + 文档 active"双门控。
-- 测试覆盖：21 files / **237 tests** all green（含 V3.8.1 治理用例）。
+- 测试覆盖：45 files / **358 tests** all green（含 V3.8.7 Production Pack）。
+
+### V3.8.7 RAG Production Pack 概览
+
+- 可配置 Embedding Provider（默认 deterministic，不联网）
+- VectorStoreFactory + DisabledVectorStore + Sqlite 维护接口
+- Reindex：`durationMs` / `warnings` / `clearVectorIndex` / `reindexForEmbeddingModelChange`
+- ScoreReranker + Evaluation 固定 dataset + Admin Panel（`VITE_ENABLE_RAG_ADMIN`）
+- MemoryToRagBridge 预留（system-only ingest）
+
+详见 [`docs/V3.8/V3.8.7_RAG_PRODUCTION_PACK_PLAN.md`](../V3.8/V3.8.7_RAG_PRODUCTION_PACK_PLAN.md)。
+
+### V3.8.6 RAG Engine Scaffold 概览
+
+- `RagEngine`：retrieve / ingest / activate / rebuild / health / evaluate
+- `RagRetrievalPipeline` + `DefaultRagQueryStrategy`（无 LLM）
+- `RagIndexManager`：同步 job + 内存 ring buffer
+- `SqliteRagAdapter`：`ragEngine` > hybrid > vector > keyword
+- `RagAdminActions`：rebuild / evaluation / health（Settings UI 后续）
+
+详见 [`docs/V3.8/V3.8.6_RAG_ENGINE_SCAFFOLD_PLAN.md`](../V3.8/V3.8.6_RAG_ENGINE_SCAFFOLD_PLAN.md)。
+
+### V3.8.5 Self-hosted RAG Engine MVP 概览
+
+- FTS5 `rag_chunks_fts` + `SqliteFtsKeywordSearch`
+- `SqliteVectorStore`（`rag_embeddings` + cosine）
+- `SelfHostedHybridRetriever`：并行召回 + RRF + `NoopReranker`
+- `VITE_RAG_ENGINE=self_hosted` 启用 Chat 新栈；默认仍 V3.8.3
+
+详见 [`docs/V3.8/V3.8.5_SELF_HOSTED_RAG_ENGINE_MVP_PLAN.md`](../V3.8/V3.8.5_SELF_HOSTED_RAG_ENGINE_MVP_PLAN.md)。
+
+### V3.8.4 Self-hosted RAG Engine 路线概览
+
+- 路线从「Coze 优先」切换为 **自建完整 RAG Engine**
+- 接口骨架：`VectorStore`、`HybridRetriever`（`LegacyHybridRetriever`）、`Reranker`（`NoopReranker`）
+- Chat 主路径仍用 V3.8.3 `VectorRagService`（dev fallback），**未改** `SqliteRagAdapter` 接线
+
+详见 [`docs/V3.8/V3.8.4_SELF_HOSTED_RAG_ENGINE_PLAN.md`](../V3.8/V3.8.4_SELF_HOSTED_RAG_ENGINE_PLAN.md)。
+
+### V3.8.3 Minimal Local Vector RAG 概览
+
+```mermaid
+flowchart LR
+    App["App.tsx seed + embedMissingChunks"] --> Emb["rag_embeddings v8"]
+    Chat["chatStore SqliteRagAdapter"] --> Hybrid["retrieveHybrid"]
+    Hybrid --> Vec["cosine topK"]
+    Hybrid --> Kw["RagService.retrieve keyword"]
+```
+
+详见 [`docs/V3.8/V3.8.3_MINIMAL_LOCAL_VECTOR_RAG_PLAN.md`](../V3.8/V3.8.3_MINIMAL_LOCAL_VECTOR_RAG_PLAN.md)。
+
+> **路线已调整（V3.8.4）**：正式 RAG 不再优先 Coze，见 [V3.8.4_SELF_HOSTED_RAG_ENGINE_PLAN.md](../V3.8/V3.8.4_SELF_HOSTED_RAG_ENGINE_PLAN.md)。以下 V3.8.2 为历史演示层说明。
+
+### V3.8.2 Local Coze-like Demo Library 概览
+
+```mermaid
+flowchart LR
+    Dialog["RagKnowledgeManagerDialog<br/>Tab: 统计 / 检索预览 / 导出预览"]
+    Dialog --> Demo["RagDemoLibraryService"]
+    Demo --> RagSvc["RagService"]
+    Demo --> Preview["CozeLikeDatasetPreview JSON<br/>仅本地预览"]
+```
+
+详见 [`docs/V3.8/V3.8.2_LOCAL_COZE_LIKE_RAG_DEMO_PLAN.md`](../V3.8/V3.8.2_LOCAL_COZE_LIKE_RAG_DEMO_PLAN.md)。
 
 ### V3.8.1 Knowledge Manager 概览
 

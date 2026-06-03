@@ -26,6 +26,14 @@ import type {
   RagStatus,
 } from "@/types/rag.types";
 
+export interface RagVectorIndexer {
+  refreshEmbeddingForDocument(documentId: string): Promise<void>;
+}
+
+export interface RagKeywordIndexer {
+  rebuildIndex(): Promise<void>;
+}
+
 /** Policy 调用方：UI 路径默认 'ui'，未来 Memory→RAG 自动写入会传 'system'。 */
 export type RagPolicyActor = "ui" | "system";
 
@@ -74,7 +82,20 @@ export function validateSourceTypePolicy(
 }
 
 export class RagIngestionService {
-  constructor(private readonly rag: RagService = new RagService()) {}
+  constructor(
+    private readonly rag: RagService = new RagService(),
+    private readonly vectorIndexer?: RagVectorIndexer,
+    private readonly keywordIndexer?: RagKeywordIndexer,
+  ) {}
+
+  private async refreshKeywordIndex(): Promise<void> {
+    if (!this.keywordIndexer) return;
+    try {
+      await this.keywordIndexer.rebuildIndex();
+    } catch (e) {
+      console.warn("[RagIngestionService] refresh keyword index failed:", e);
+    }
+  }
 
   /**
    * 创建一篇文档；UI 路径强制 status='draft'，需要管理员显式激活。
@@ -92,10 +113,12 @@ export class RagIngestionService {
       throw new Error(`[RagIngestionService] ${policy.reason ?? "policy rejected"}`);
     }
     const finalStatus: RagStatus = policy.forcedStatus ?? "draft";
-    return this.rag.ingestDocument({
+    const doc = await this.rag.ingestDocument({
       ...input,
       status: finalStatus,
     });
+    await this.refreshKeywordIndex();
+    return doc;
   }
 
   /**
@@ -109,12 +132,21 @@ export class RagIngestionService {
       throw new Error(`[RagIngestionService] ${policy.reason ?? "policy rejected"}`);
     }
     await this.rag.activateDocument(id);
+    if (this.vectorIndexer) {
+      try {
+        await this.vectorIndexer.refreshEmbeddingForDocument(id);
+      } catch (e) {
+        console.warn("[RagIngestionService] refresh embedding failed:", e);
+      }
+    }
+    await this.refreshKeywordIndex();
   }
 
   async archiveDocument(id: string): Promise<void> {
     const doc = await this.rag.getDocument(id);
     if (!doc) throw new Error(`[RagIngestionService] document not found: ${id}`);
     await this.rag.archiveDocument(id);
+    await this.refreshKeywordIndex();
   }
 
   /**
@@ -122,6 +154,7 @@ export class RagIngestionService {
    */
   async softDeleteDocument(id: string): Promise<void> {
     await this.rag.deleteDocument(id);
+    await this.refreshKeywordIndex();
   }
 
   /**
@@ -154,5 +187,6 @@ export class RagIngestionService {
     patch: Parameters<RagService["updateDocument"]>[1],
   ): Promise<void> {
     await this.rag.updateDocument(id, patch);
+    await this.refreshKeywordIndex();
   }
 }
