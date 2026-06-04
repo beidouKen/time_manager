@@ -28,7 +28,16 @@ import {
   MemoryScheduleService,
   MemoryConfirmationRepository,
   MemoryActionLogPort,
+  MemorySemanticEventRepository,
+  MemoryActiveContextRepository,
+  MemoryTraceStepRepository,
 } from "@/agent/testing/memoryServices";
+import { SemanticEventService } from "@/services/SemanticEventService";
+import { ActiveContextService } from "@/services/ActiveContextService";
+import { TurnService } from "@/services/TurnService";
+import { ConversationService } from "@/services/ConversationService";
+import { ContextTraceService } from "@/services/ContextTraceService";
+import { MemoryConversationRepository, MemoryTurnRepository } from "@/agent/testing/memoryServices";
 
 export interface MockAgentHarness {
   agent: AgentService;
@@ -39,6 +48,22 @@ export interface MockAgentHarness {
   memory: MockMemoryAdapter;
   rag: MockRagAdapter;
   notifier: MockNotificationAdapter;
+  /** C2: 内存语义事件仓库，供测试断言 */
+  eventRepo: MemorySemanticEventRepository;
+  /** C2: 语义事件服务 */
+  semanticEventService: SemanticEventService;
+  /** C1: 对话服务 */
+  conversationService: ConversationService;
+  /** C1: 回合服务 */
+  turnService: TurnService;
+  /** C3: 内存 active context 仓库，供测试断言 */
+  activeContextRepo: MemoryActiveContextRepository;
+  /** C3: active context 服务 */
+  activeContextService: ActiveContextService;
+  /** C6: 内存 trace step 仓库，供测试断言 */
+  traceStepRepo: MemoryTraceStepRepository;
+  /** C6: trace 服务 */
+  contextTraceService: ContextTraceService;
 }
 
 export interface MockAgentHarnessOptions {
@@ -56,6 +81,14 @@ export interface MockAgentHarnessOptions {
   ragAdapter?: RagAdapter;
   /** 覆盖 NotificationAdapter（默认 MockNotificationAdapter）。 */
   notificationAdapter?: NotificationAdapter;
+  /**
+   * C3: 覆盖 ActiveContextService（用于 B1 场景：两个 agent 实例共享同一 repo 模拟持久化 DB）。
+   */
+  activeContextService?: ActiveContextService;
+  /** C3: 覆盖 ConversationService（同 B1 场景：两个 agent 共享同一会话） */
+  conversationService?: ConversationService;
+  /** C3: 覆盖 ConfirmationService（同 B1 场景：两个 agent 共享同一确认记录） */
+  confirmationService?: ConfirmationService;
 }
 
 /**
@@ -69,8 +102,29 @@ export function createMockAgentHarness(
   const blocks = new MemoryTimeBlockService();
   const schedule = new MemoryScheduleService(tasks, blocks);
   const confirmRepo = new MemoryConfirmationRepository();
-  const confirmService = new ConfirmationService(confirmRepo);
+  const confirmService =
+    options.confirmationService ?? new ConfirmationService(confirmRepo);
   const logs = new MemoryActionLogPort();
+
+  // C2: SemanticEvent
+  const eventRepo = new MemorySemanticEventRepository();
+  const semanticEventService = new SemanticEventService(eventRepo);
+
+  // C3: ActiveContext（可由 options 覆盖，用于 B1 共享 repo 场景）
+  const activeContextRepo = new MemoryActiveContextRepository();
+  const activeContextService =
+    options.activeContextService ?? new ActiveContextService(activeContextRepo);
+
+  // C1: Conversation + Turn（内存实现；conversationService 可由 options 覆盖）
+  const convRepo = new MemoryConversationRepository();
+  const turnRepo = new MemoryTurnRepository();
+  const conversationService =
+    options.conversationService ?? new ConversationService(convRepo);
+  const turnService = new TurnService(turnRepo);
+
+  // C6: TraceStep
+  const traceStepRepo = new MemoryTraceStepRepository();
+  const contextTraceService = new ContextTraceService(traceStepRepo);
 
   const memory = (options.memoryAdapter as MockMemoryAdapter | undefined) ?? new MockMemoryAdapter();
   const rag = (options.ragAdapter as MockRagAdapter | undefined) ?? new MockRagAdapter();
@@ -82,16 +136,25 @@ export function createMockAgentHarness(
     scheduleService: schedule,
     logService: logs,
     confirmService,
+    semanticEventService,
+    activeContextService,
+    conversationService,
+    turnService,
+    contextTraceService,
     plannerPort: options.plannerPort,
     // V3.7: 默认禁用 LLM（null），避免测试依赖真实 API。
-    // 若需要测试 LLM 路径，显式传入 MockLLMClient。
     llmClient: options.llmClient ?? null,
     memoryAdapter: memory,
     ragAdapter: rag,
     notificationAdapter: notifier,
   });
 
-  return { agent, tasks, blocks, confirmRepo, logs, memory, rag, notifier };
+  return {
+    agent, tasks, blocks, confirmRepo, logs, memory, rag, notifier,
+    eventRepo, semanticEventService, conversationService, turnService,
+    activeContextRepo, activeContextService,
+    traceStepRepo, contextTraceService,
+  };
 }
 
 /**

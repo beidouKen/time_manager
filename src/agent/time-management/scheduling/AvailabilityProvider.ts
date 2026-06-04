@@ -30,43 +30,47 @@ function zonedDayBounds(
 /**
  * Convert a local date + hour/minute in a given timezone to a UTC Date.
  */
+/**
+ * Convert "year-month-day hour:minute (local in `timezone`)" to a UTC Date.
+ *
+ * V3.8+ fix: previous impl only compared hour/minute. When the local time crosses the UTC
+ * day boundary (e.g. 上海 22:00 = UTC 14:00 same day, but Date.UTC(...,22) in UTC+8 is
+ * next-day 06:00 local), the day diff was ignored and the answer was off by 24h.
+ * We now read the full Y/M/D/H/M parts and compute the true offset using two Date.UTC values.
+ */
 function localStringToUtc(
   dateKey: string, // "YYYY-MM-DD"
   hour: number,
   minute: number,
   timezone: string
 ): Date {
-  // Build a rough ISO string, then correct with Intl offset detection
   const [year, month, day] = dateKey.split("-").map(Number);
+  const roughUtc = Date.UTC(year, month - 1, day, hour, minute, 0);
 
-  // Create a Date representing midnight UTC on that date, then find the
-  // timezone offset at that instant to compute the correct UTC time.
-  const utcMidnight = new Date(Date.UTC(year, month - 1, day, hour, minute, 0));
-
-  // Get the local time string in that timezone for utcMidnight
-  const localParts = new Intl.DateTimeFormat("en-US", {
+  const localParts = new Intl.DateTimeFormat("en-CA", {
     timeZone: timezone,
     year: "numeric",
-    month: "numeric",
-    day: "numeric",
-    hour: "numeric",
-    minute: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
     hour12: false,
   })
-    .formatToParts(utcMidnight)
+    .formatToParts(new Date(roughUtc))
     .reduce<Record<string, string>>((acc, p) => {
       acc[p.type] = p.value;
       return acc;
     }, {});
 
-  const localHour = Number(localParts.hour ?? 0);
-  const localMinute = Number(localParts.minute ?? 0);
+  const gotYear = Number(localParts.year ?? year);
+  const gotMonth = Number(localParts.month ?? 1) - 1;
+  const gotDay = Number(localParts.day ?? day);
+  const gotHour = Number(localParts.hour ?? 0) % 24;
+  const gotMinute = Number(localParts.minute ?? 0);
 
-  // Offset in minutes: what we got vs what we wanted
-  const offsetMinutes =
-    (localHour - hour) * 60 + (localMinute - minute);
-
-  return new Date(utcMidnight.getTime() - offsetMinutes * 60 * 1000);
+  const localAsUtc = Date.UTC(gotYear, gotMonth, gotDay, gotHour, gotMinute, 0);
+  const offsetMs = localAsUtc - roughUtc;
+  return new Date(roughUtc - offsetMs);
 }
 
 export class AvailabilityProvider {

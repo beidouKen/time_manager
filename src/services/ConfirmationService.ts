@@ -16,13 +16,29 @@ export class ConfirmationService {
   async createConfirmation(
     input: CreateConfirmationInput
   ): Promise<PendingConfirmation> {
+    // C2/G11: CreateConfirmationSchema 已含 conversation_id/turn_id/message_id 等
+    // 直接透传给 repo，schema.parse 保留可选字段
     const validated = CreateConfirmationSchema.parse(input);
-    return this.repo.create(validated);
+    // schema.parse 会丢弃 schema 未定义的 key，但新字段已在 schema 中定义
+    // 需要把原始 input 中的绑定字段合并回去（schema.parse strips unknown by default）
+    return this.repo.create({
+      ...validated,
+      conversation_id: input.conversation_id,
+      turn_id: input.turn_id,
+      message_id: input.message_id,
+      proposal_id: input.proposal_id,
+      related_task_id: input.related_task_id,
+      related_time_block_id: input.related_time_block_id,
+      metadata_json: input.metadata_json,
+    });
   }
 
   async confirm(id: string): Promise<PendingConfirmation> {
     const existing = await this.repo.findById(id);
     if (!existing) throw new Error("确认记录不存在");
+    if (existing.status === "invalidated") {
+      throw new Error("确认已失效（会话已删除），无法执行");
+    }
     if (existing.status !== "pending") {
       throw new Error(`确认记录状态为 ${existing.status}，无法确认`);
     }
@@ -36,6 +52,9 @@ export class ConfirmationService {
   async reject(id: string): Promise<PendingConfirmation> {
     const existing = await this.repo.findById(id);
     if (!existing) throw new Error("确认记录不存在");
+    if (existing.status === "invalidated") {
+      throw new Error("确认已失效（会话已删除），无法拒绝");
+    }
     if (existing.status !== "pending") {
       throw new Error(`确认记录状态为 ${existing.status}，无法拒绝`);
     }
@@ -58,5 +77,13 @@ export class ConfirmationService {
   async expireStale(): Promise<number> {
     const now = new Date().toISOString();
     return this.repo.expireOld(now);
+  }
+
+  /**
+   * C5: 批量失效会话下所有 pending 确认（会话删除时调用）。
+   * 仅由 ContextInvalidationService 调用，不对外直接暴露给 chatStore / Agent。
+   */
+  async invalidateByConversation(conversationId: string): Promise<number> {
+    return this.repo.invalidateByConversation(conversationId);
   }
 }

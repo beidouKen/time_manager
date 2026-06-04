@@ -5,6 +5,7 @@ import type {
   AgentHandlerResult,
 } from "@/agent/types";
 import type { LLMChatExecutor } from "@/agent/llm/LLMChatExecutor";
+import type { WorkingMemoryPacket } from "@/agent/context/WorkingMemoryPacket";
 
 type LLMDirectDomain = "general_chat" | "knowledge_qa" | "writing_assistant";
 
@@ -26,7 +27,8 @@ export class LLMDirectHandler implements AgentHandler {
 
   async handle(
     userInput: string,
-    context: AgentExperienceContext
+    context: AgentExperienceContext,
+    packet?: WorkingMemoryPacket
   ): Promise<AgentHandlerResult> {
     if (/^(你好|您好|哈喽|hello|hi)[！!。.\s]*$/i.test(userInput.trim())) {
       return {
@@ -36,12 +38,14 @@ export class LLMDirectHandler implements AgentHandler {
     }
 
     // V3.7: 若 LLM executor 可用，调用真实 LLM 获取文本回复
+    // C4: 传入 packet 使用已过滤软删除 / 统一截断的 recent_messages
     if (this.llmExecutor?.isAvailable()) {
       try {
         const text = await this.llmExecutor.execute(
           this.domain,
           userInput,
-          context.recentMessages
+          context.recentMessages,
+          packet
         );
         return {
           domain: this.domain,

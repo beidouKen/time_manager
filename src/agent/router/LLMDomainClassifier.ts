@@ -14,6 +14,7 @@
 import { z } from "zod";
 import type { LLMClient } from "@/agent/llm/LLMClient";
 import type { AgentDomain, DomainRoutingDecision } from "@/agent/types";
+import type { WorkingMemoryPacket } from "@/agent/context/WorkingMemoryPacket";
 
 // ─── 合法 domain 白名单 ──────────────────────────────────────────────────────
 
@@ -101,6 +102,44 @@ function buildContextSummary(ctx: ClassifierContext): string {
   return parts.length > 0 ? `上下文：${parts.join("；")}` : "";
 }
 
+/**
+ * C4: 从 WorkingMemoryPacket 构建分类器上下文字符串，
+ * 使用 active_context_summary 和 pending_confirmation_summary 替代 buildContextSummary 的朴素实现。
+ */
+function buildContextSummaryFromPacket(
+  packet: WorkingMemoryPacket,
+  ctx: ClassifierContext
+): string {
+  const parts: string[] = [];
+  const ac = packet.activeContextSummary;
+
+  if (ac.status === "pending_confirmation" && ac.confirmationId) {
+    const desc = packet.pendingConfirmationSummary
+      ? `（${packet.pendingConfirmationSummary.actionType}，风险：${packet.pendingConfirmationSummary.riskLevel}）`
+      : "";
+    parts.push(`当前有待确认操作${desc}（ID: ${ac.confirmationId}）`);
+  } else if (ac.status === "pending_proposal" && ac.confirmationId) {
+    const title = ac.proposal?.title ? `「${ac.proposal.title}」` : "";
+    parts.push(`当前有待确认推荐方案${title}（ID: ${ac.confirmationId}）`);
+  } else if (ctx.pendingConfirmationId) {
+    parts.push(`当前有待确认操作（ID: ${ctx.pendingConfirmationId}）`);
+  }
+
+  if (ctx.pendingClarification) {
+    parts.push("用户正在补充澄清信息");
+  }
+
+  // 取 packet 最后一条 assistant 消息（已去软删，更可靠）
+  const recentMsgs = packet.conversationSummary.recentMessages;
+  const lastAssistant = [...recentMsgs].reverse().find((m) => m.role === "assistant");
+  const assistantText = lastAssistant?.content ?? ctx.lastAssistantText;
+  if (assistantText) {
+    parts.push(`上一条助手消息：「${assistantText.slice(0, 80)}」`);
+  }
+
+  return parts.length > 0 ? `上下文：${parts.join("；")}` : "";
+}
+
 // ─── LLMDomainClassifier ─────────────────────────────────────────────────────
 
 export class LLMDomainClassifier {
@@ -119,14 +158,19 @@ export class LLMDomainClassifier {
 
   /**
    * 调用 LLM 分类域，返回 DomainRoutingDecision 或 null（需要 fallback）。
+   * C4: 可传入 WorkingMemoryPacket，使用 active_context_summary 替代 buildContextSummary。
    */
   async classify(
     userInput: string,
-    context: ClassifierContext = {}
+    context: ClassifierContext = {},
+    packet?: WorkingMemoryPacket
   ): Promise<DomainRoutingDecision | null> {
     if (!this.client.isAvailable()) return null;
 
-    const contextSummary = buildContextSummary(context);
+    // C4: 优先用 packet 提供的 active_context_summary 和 pending_confirmation_summary
+    const contextSummary = packet
+      ? buildContextSummaryFromPacket(packet, context)
+      : buildContextSummary(context);
     const userContent = contextSummary
       ? `${contextSummary}\n\n用户输入：${userInput}`
       : `用户输入：${userInput}`;

@@ -11,6 +11,11 @@ export interface ScheduleTaskInput {
   title: string;
   startTime: string;
   endTime: string;
+  /**
+   * V3.8+: 补记模式时传入 "done"，创建历史已完成记录。
+   * 默认 undefined → 沿用原有 "scheduled" 逻辑。
+   */
+  initialStatus?: "scheduled" | "done";
 }
 
 export interface MoveBackResult {
@@ -46,13 +51,15 @@ export class ScheduleService {
    * Creates a TimeBlock linked to the task and updates task status to 'scheduled'.
    */
   async scheduleTaskToTimeBlock(input: ScheduleTaskInput): Promise<TimeBlock> {
-    const { taskId, title, startTime, endTime } = input;
+    const { taskId, title, startTime, endTime, initialStatus } = input;
+    const isBackfill = initialStatus === "done";
 
     // Validate task exists
     const task = await this.taskRepo.findById(taskId);
     if (!task) throw new Error("任务不存在");
     if (task.deleted_at) throw new Error("任务已删除");
-    if (task.status === "done" || task.status === "cancelled") {
+    // V3.8+: 补记模式允许对任何状态的任务追加历史时间块
+    if (!isBackfill && (task.status === "done" || task.status === "cancelled")) {
       throw new Error(`任务状态为 ${task.status}，无法安排时间块`);
     }
 
@@ -61,7 +68,7 @@ export class ScheduleService {
       throw new Error("结束时间必须晚于开始时间");
     }
 
-    // Check conflicts
+    // Check conflicts（补记历史记录同样检查冲突，避免数据混乱）
     const conflictResult = await this.checkConflicts(startTime, endTime);
     if (conflictResult.hasConflict) {
       const conflictTitles = conflictResult.conflictingBlocks
@@ -80,8 +87,8 @@ export class ScheduleService {
       source: "manual",
     });
 
-    // Update task status to scheduled
-    await this.taskRepo.update(taskId, { status: "scheduled" });
+    // V3.8+: 补记模式 → 将任务标记为已完成；普通安排 → 标记为 scheduled
+    await this.taskRepo.update(taskId, { status: isBackfill ? "done" : "scheduled" });
 
     return block;
   }

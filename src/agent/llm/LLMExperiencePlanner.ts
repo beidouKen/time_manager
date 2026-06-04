@@ -33,6 +33,7 @@ import type {
 } from "@/agent/types";
 import { PlanSafetyValidator } from "@/agent/validators/PlanSafetyValidator";
 import type { ToolRouter } from "@/agent/ToolRouter";
+import type { WorkingMemoryPacket } from "@/agent/context/WorkingMemoryPacket";
 
 // ─── 错误类型 ────────────────────────────────────────────────────────────────
 
@@ -74,7 +75,8 @@ export class LLMExperiencePlanner implements PlannerPort {
 
   async plan(
     frame: SemanticFrame,
-    context: AgentExperienceContext
+    context: AgentExperienceContext,
+    packet?: WorkingMemoryPacket
   ): Promise<ExperienceActionPlan> {
     if (!this.client.isAvailable()) {
       throw new LLMUnavailableError("disabled", "LLM 客户端不可用（未配置 API key 或已禁用）");
@@ -84,17 +86,27 @@ export class LLMExperiencePlanner implements PlannerPort {
       new Date().toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })
     );
 
-    // 构造精简上下文（不调 DB，直接从 context 中提取可用信息）
-    const llmContext = this.buildLLMContext(context);
+    // C4: 若有 WorkingMemoryPacket 则从 packet 取 context，否则降级到 buildLLMContext
+    const llmContext = packet
+      ? this.buildLLMContextFromPacket(packet, context)
+      : this.buildLLMContext(context);
     const contextBlock = formatContextBlock(llmContext);
+
+    // C4: 从 packet 取 recent_messages（已截断 / 已过滤软删除），否则降级到 context.recentMessages
+    const recentMsgs = packet
+      ? packet.conversationSummary.recentMessages
+      : context.recentMessages.slice(-6).map((m) => ({
+          role: m.role as "user" | "assistant" | "system",
+          content: m.content.length > 300 ? m.content.slice(0, 300) + "…" : m.content,
+        }));
 
     const messages = [
       { role: "system" as const, content: systemPrompt },
-      ...context.recentMessages
+      ...recentMsgs
         .slice(-6)
         .map((m) => ({
           role: m.role as "user" | "assistant" | "system",
-          content: m.content.length > 300 ? m.content.slice(0, 300) + "…" : m.content,
+          content: m.content,
         })),
       {
         role: "user" as const,
@@ -157,6 +169,39 @@ export class LLMExperiencePlanner implements PlannerPort {
       })),
       todayTasks: [],
       todayBlocks: [],
+      lastTaskId: context.lastCreatedTaskId,
+      lastTimeBlockId: context.lastScheduledTimeBlockIds[0] ?? null,
+      currentDate,
+    };
+  }
+
+  /**
+   * C4: 从 WorkingMemoryPacket 构建 LLMContext，
+   * 真实接通 DB 获取的 tasks / blocks（修复 G14 硬置空问题）。
+   */
+  private buildLLMContextFromPacket(
+    packet: WorkingMemoryPacket,
+    context: AgentExperienceContext
+  ): LLMContext {
+    const currentDate = context.currentDatetime.slice(0, 10);
+    return {
+      recentMessages: packet.conversationSummary.recentMessages.map((m) => ({
+        role: m.role,
+        content: m.content,
+      })),
+      todayTasks: packet.relatedBusinessState.tasks.map((t) => ({
+        id: t.id,
+        title: t.title,
+        status: t.status,
+        priority: t.priority,
+      })),
+      todayBlocks: packet.relatedBusinessState.timeBlocks.map((b) => ({
+        id: b.id,
+        title: b.title,
+        start_time: b.startTime,
+        end_time: b.endTime,
+        status: b.status,
+      })),
       lastTaskId: context.lastCreatedTaskId,
       lastTimeBlockId: context.lastScheduledTimeBlockIds[0] ?? null,
       currentDate,

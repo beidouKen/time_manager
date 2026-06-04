@@ -14,6 +14,7 @@
 
 import type { LLMClient } from "@/agent/llm/LLMClient";
 import { LLMError } from "@/agent/llm/LLMClient";
+import type { WorkingMemoryPacket } from "@/agent/context/WorkingMemoryPacket";
 
 export type ChatDomain = "general_chat" | "knowledge_qa" | "writing_assistant";
 
@@ -38,18 +39,25 @@ export class LLMChatExecutor {
 
   /**
    * 执行只读 LLM 对话，返回纯文本字符串。
+   * C4: 可传入 WorkingMemoryPacket 使用 recent_messages（已过滤软删除 / 统一截断口径）。
    * @throws LLMError / Error 若调用失败
    */
   async execute(
     domain: ChatDomain,
     userInput: string,
-    recentMessages: Array<{ role: string; content: string }> = []
+    recentMessages: Array<{ role: string; content: string }> = [],
+    packet?: WorkingMemoryPacket
   ): Promise<string> {
     const systemPrompt = SYSTEM_PROMPTS[domain];
 
+    // C4: 优先使用 packet 的 recent_messages（已过滤软删除，统一截断 300 字）
+    const sourceMsgs = packet
+      ? packet.conversationSummary.recentMessages
+      : recentMessages;
+
     const messages: Array<{ role: "system" | "user" | "assistant"; content: string }> = [
       { role: "system", content: systemPrompt },
-      ...recentMessages
+      ...sourceMsgs
         .slice(-4)
         .filter((m) => m.role === "user" || m.role === "assistant")
         .map((m) => ({

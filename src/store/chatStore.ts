@@ -1,10 +1,12 @@
 import { create } from "zustand";
 import { AgentService } from "@/agent/AgentService";
 import type { AgentResponse } from "@/agent/AgentService";
-import type { ChatMessageMetadata } from "@/agent/types";
+import type { ChatMessageMetadata, PendingProposalSnapshot } from "@/agent/types";
 import type { AgentExperienceContext, ExperienceActionPlan, SemanticFrame } from "@/agent/types";
 import { ResponseBoundary } from "@/agent/experience/ResponseBoundary";
 import { ConversationService } from "@/services/ConversationService";
+import { ActiveContextService } from "@/services/ActiveContextService";
+import { ContextInvalidationService } from "@/services/ContextInvalidationService";
 import type { ConversationMessage } from "@/types/agent.types";
 import { useTaskStore } from "@/store/taskStore";
 import { useTimeBlockStore } from "@/store/timeBlockStore";
@@ -12,6 +14,8 @@ import { useUiStore } from "@/store/uiStore";
 
 const agentService = new AgentService();
 const conversationService = new ConversationService();
+const activeContextService = new ActiveContextService();
+const contextInvalidationService = new ContextInvalidationService();
 const responseBoundary = new ResponseBoundary();
 
 // ─── ChatMessage 类型（前端运行时状态） ──────────────────────────────────────
@@ -38,6 +42,18 @@ interface ChatState {
   messages: ChatMessage[];
   isProcessing: boolean;
   error: string | null;
+  /**
+   * C1: 当前活跃会话 ID。
+   * init/loadHistory 时由 ensureDefaultConversation 赋值。
+   */
+  currentConversationId: string | null;
+  /**
+   * V3.8: 当前存在的推荐类待确认提案快照（内存缓存）。
+   * 由 TimeManagementAgent 写入 metadata.pendingProposal，
+   * chatStore 回流时缓存，下一轮 sendMessage 时透传给 AgentService。
+   * confirmAction / rejectAction 后清空。
+   */
+  pendingProposal: PendingProposalSnapshot | null;
 }
 
 interface ChatActions {
@@ -46,6 +62,8 @@ interface ChatActions {
   rejectAction: (confirmationId: string) => Promise<void>;
   loadHistory: () => Promise<void>;
   clearHistory: () => Promise<void>;
+  /** C5: 仅失效当前会话（不新建新会话），供未来"归档"按钮复用 */
+  invalidateCurrentConversation: () => Promise<void>;
 }
 
 // ─── 辅助：从 AgentResponse 提取 metadata_json 字符串 ────────────────────
@@ -122,11 +140,6 @@ export function shouldShowConfirmationButtons(message: ChatMessage): boolean {
 
 /**
  * V3.7 P0-1: 计算 patch 旧消息的结果，纯函数，便于单测。
- * - 找到 role=assistant 且 metadata.confirmationId 命中的所有消息（理论上只有 1 条）。
- * - 仅当原 resultType 为 undefined / "pending_confirmation" 时 patch；
- *   已经是终态（success/failure/rejected）的不再变更。
- *
- * 返回 patched messages 列表 + 需要持久化的 patch 信息。
  */
 export function applyConfirmationPatch(
   messages: ChatMessage[],
@@ -158,13 +171,6 @@ export function applyConfirmationPatch(
 
 /**
  * V3.7 P0-1: confirmAction / rejectAction 的副作用收尾流程。
- *
- * 1. 在内存里 patch 同 confirmationId 的旧 assistant 消息的 resultType；
- * 2. append 新的「执行结果」消息；
- * 3. 通过 ConversationService.updateMessageMetadata 把 patch 持久化到 DB；
- * 4. 持久化新消息。
- *
- * 这样既能保证当前 session 中按钮立即消失，也能保证页面刷新后旧消息上的按钮不复活。
  */
 async function runConfirmationFinalize(
   set: (
@@ -172,12 +178,14 @@ async function runConfirmationFinalize(
       state: ChatState & ChatActions
     ) => Partial<ChatState & ChatActions>
   ) => void,
+  get: () => ChatState & ChatActions,
   confirmationId: string,
   response: AgentResponse,
   newResultType: "success" | "failure" | "rejected"
 ): Promise<void> {
   const newMsgId = crypto.randomUUID();
   let collectedPatches: Array<{ id: string; metadataJson: string }> = [];
+  const conversationId = get().currentConversationId ?? undefined;
 
   set((state) => {
     const { messages: patched, patches } = applyConfirmationPatch(
@@ -215,6 +223,7 @@ async function runConfirmationFinalize(
 
   await conversationService.createMessage({
     id: newMsgId,
+    conversation_id: conversationId,
     role: "assistant",
     content: response.message,
     metadata_json: buildMetadataJson(response),
@@ -227,23 +236,45 @@ export const useChatStore = create<ChatState & ChatActions>((set, _get) => ({
   messages: [],
   isProcessing: false,
   error: null,
+  currentConversationId: null,
+  pendingProposal: null,
 
   loadHistory: async () => {
     try {
-      const history = await conversationService.loadRecent(50);
+      // C1: 确保 default conversation 存在，并拿到 conversationId
+      let conversationId: string | null = null;
+      try {
+        const conv = await conversationService.ensureDefaultConversation();
+        conversationId = conv.id;
+        set({ currentConversationId: conversationId });
+      } catch {
+        // DB 不可用时降级
+      }
+
+      const history = await conversationService.loadRecent(50, conversationId ?? undefined);
       const messages: ChatMessage[] = history.map((m: ConversationMessage) => {
         const meta = parseMetadata(m.metadata_json);
         return {
           id: m.id,
-          role: m.role,
+          role: m.role as ChatMessage["role"],
           content: m.content,
           metadata: meta,
-          // 向后兼容：旧数据的 confirmationId 可能直接存在 metadata_json 顶层
           confirmationId: meta?.confirmationId,
           timestamp: m.created_at,
         };
       });
       set({ messages });
+
+      // C3 B1 修复：从 DB 还原 pendingProposal（页面刷新后 loadHistory 重建内存状态）
+      if (conversationId) {
+        try {
+          const active = await activeContextService.findActiveByConversation(conversationId);
+          if (active?.proposal_snapshot_json) {
+            const snapshot = JSON.parse(active.proposal_snapshot_json) as PendingProposalSnapshot;
+            set({ pendingProposal: snapshot });
+          }
+        } catch { /* 降级：保持 null */ }
+      }
     } catch (e) {
       set({ error: String(e) });
     }
@@ -252,36 +283,49 @@ export const useChatStore = create<ChatState & ChatActions>((set, _get) => ({
   sendMessage: async (content: string) => {
     set({ isProcessing: true, error: null });
 
-    // V3.5 fix: 先取历史消息（不含当前输入），再 append userMsg
-    // 这样 recentMessages 只包含历史，当前输入仅通过 userInput 传入 AgentService
+    // C1: 确保 conversationId
+    let conversationId = _get().currentConversationId;
+    if (!conversationId) {
+      try {
+        const conv = await conversationService.ensureDefaultConversation();
+        conversationId = conv.id;
+        set({ currentConversationId: conversationId });
+      } catch {
+        // DB 不可用时降级
+      }
+    }
+
     const recentMessages = _get()
       .messages.slice(-6)
       .map((m) => ({ role: m.role, content: m.content }));
 
+    // C1: 预生成 userMessageId 和 assistantMessageId
+    const userMessageId = crypto.randomUUID();
+    const assistantMessageId = crypto.randomUUID();
+
     const userMsg: ChatMessage = {
-      id: crypto.randomUUID(),
+      id: userMessageId,
       role: "user",
       content,
       timestamp: new Date().toISOString(),
     };
     set((s) => ({ messages: [...s.messages, userMsg] }));
 
-    // 持久化用户消息（无 metadata），用同一 id 让 in-memory 与 DB 行 id 对齐。
+    // 持久化用户消息，带 conversation_id
     await conversationService.createMessage({
-      id: userMsg.id,
+      id: userMessageId,
+      conversation_id: conversationId ?? undefined,
       role: "user",
       content,
     });
 
     try {
-
       const currentTimelineDate = formatLocalDateKey(
         useTimeBlockStore.getState().currentDate
       );
       const timezone =
         Intl.DateTimeFormat().resolvedOptions().timeZone || "Asia/Shanghai";
 
-      // 从最近一条 assistant 消息提取 pending 状态，供路由器做上下文感知。
       const allMessages = _get().messages;
       const lastAssistantMsg = [...allMessages].reverse().find(m => m.role === "assistant");
       const lastResultType = lastAssistantMsg?.metadata?.resultType;
@@ -293,6 +337,17 @@ export const useChatStore = create<ChatState & ChatActions>((set, _get) => ({
         lastAssistantMsg?.metadata?.llmResponseType === "clarification" ||
         (!!lastAssistantMsg?.metadata?.confirmationId && lastResultType !== "success" && lastResultType !== "failure" && lastResultType !== "rejected");
 
+      // C3: 内存空时从 DB 兜底补 pendingProposal（保护 sendMessage 先于 loadHistory 的 race 窗口）
+      let pendingProposal = _get().pendingProposal ?? undefined;
+      if (!pendingProposal && conversationId) {
+        try {
+          const activeCtx = await activeContextService.findActiveByConversation(conversationId);
+          if (activeCtx?.proposal_snapshot_json) {
+            pendingProposal = JSON.parse(activeCtx.proposal_snapshot_json) as PendingProposalSnapshot;
+          }
+        } catch { /* 降级：保持 undefined */ }
+      }
+
       const response: AgentResponse = await agentService.processInput(content, {
         recentMessages,
         timezone,
@@ -301,10 +356,20 @@ export const useChatStore = create<ChatState & ChatActions>((set, _get) => ({
         currentScreen: useUiStore.getState().activePage,
         pendingConfirmationId: pendingConfirmationId ?? undefined,
         pendingClarification,
+        pendingProposal,
+        // C1: ID 贯穿
+        conversationId: conversationId ?? undefined,
+        userMessageId,
+        assistantMessageId,
       });
 
+      // C3 G5 修复：仅当本轮显式产出新提案才覆盖；否则保留旧值（DB 才是权威）。
+      // 旧逻辑：非 pending_confirmation 响应会清空 pendingProposal，导致跨话题插入后丢失。
+      const newPendingProposal =
+        response.metadata?.pendingProposal ?? _get().pendingProposal;
+
       const assistantMsg: ChatMessage = {
-        id: crypto.randomUUID(),
+        id: assistantMessageId,
         role: "assistant",
         content: response.message,
         metadata: response.metadata,
@@ -315,11 +380,14 @@ export const useChatStore = create<ChatState & ChatActions>((set, _get) => ({
       set((s) => ({
         messages: [...s.messages, assistantMsg],
         isProcessing: false,
+        pendingProposal: newPendingProposal,
       }));
 
-      // 持久化 assistant 消息，复用 in-memory id；后续 updateMetadata 才能命中同一行。
+      // 持久化 assistant 消息，带 conversation_id 和 turn_id
       await conversationService.createMessage({
-        id: assistantMsg.id,
+        id: assistantMessageId,
+        conversation_id: conversationId ?? undefined,
+        turn_id: response.metadata?.turnId,
         role: "assistant",
         content: response.message,
         metadata_json: buildMetadataJson(response),
@@ -366,27 +434,43 @@ export const useChatStore = create<ChatState & ChatActions>((set, _get) => ({
           responseKind: "tool_failure",
         },
       });
+      const errorMsgId = crypto.randomUUID();
       const errorMsg: ChatMessage = {
-        id: crypto.randomUUID(),
+        id: errorMsgId,
         role: "assistant",
         content: safeMessage,
         timestamp: new Date().toISOString(),
+        metadata: { resultType: "failure", source: "llm" },
       };
       set((s) => ({
         messages: [...s.messages, errorMsg],
         isProcessing: false,
         error: String(e),
       }));
+      // G7: 持久化 error assistant 消息
+      try {
+        await conversationService.createMessage({
+          id: errorMsgId,
+          conversation_id: conversationId ?? undefined,
+          role: "assistant",
+          content: safeMessage,
+          metadata_json: JSON.stringify({ resultType: "failure", error: String(e) }),
+        });
+      } catch (persistErr) {
+        console.warn("[chatStore] Failed to persist error message:", persistErr);
+      }
     }
   },
 
   confirmAction: async (confirmationId: string) => {
     set({ isProcessing: true });
     try {
-      const response = await agentService.confirmAction(confirmationId);
+      const conversationId = _get().currentConversationId ?? undefined;
+      const response = await agentService.confirmAction(confirmationId, { conversationId });
       const newResultType: "success" | "failure" =
         response.metadata?.resultType === "failure" ? "failure" : "success";
-      await runConfirmationFinalize(set, confirmationId, response, newResultType);
+      await runConfirmationFinalize(set, _get, confirmationId, response, newResultType);
+      set({ pendingProposal: null });
       await applyRefreshHints(response);
     } catch (e) {
       set({ isProcessing: false, error: String(e) });
@@ -396,15 +480,45 @@ export const useChatStore = create<ChatState & ChatActions>((set, _get) => ({
   rejectAction: async (confirmationId: string) => {
     set({ isProcessing: true });
     try {
-      const response = await agentService.rejectAction(confirmationId);
-      await runConfirmationFinalize(set, confirmationId, response, "rejected");
+      const conversationId = _get().currentConversationId ?? undefined;
+      const response = await agentService.rejectAction(confirmationId, { conversationId });
+      await runConfirmationFinalize(set, _get, confirmationId, response, "rejected");
+      set({ pendingProposal: null });
     } catch (e) {
       set({ isProcessing: false, error: String(e) });
     }
   },
 
+  // C5: clearHistory → 调统一入口 ContextInvalidationService 完整四层级联失效 + 新建会话
   clearHistory: async () => {
-    await conversationService.clearAll();
-    set({ messages: [] });
+    const oldId = _get().currentConversationId;
+
+    let newConvId: string | null = null;
+    try {
+      const newConv = await conversationService.createConversation();
+      newConvId = newConv.id;
+    } catch { /* ignore */ }
+
+    // 先进入新会话（UI 不卡顿），再后台 invalidate 旧会话
+    set({ messages: [], currentConversationId: newConvId, pendingProposal: null });
+
+    if (oldId) {
+      try {
+        await contextInvalidationService.invalidateConversation(oldId, { reason: "user_clear" });
+      } catch (e) {
+        console.warn("[chatStore] clearHistory cascade invalidate failed:", e);
+      }
+    }
+  },
+
+  // C5: 仅失效当前会话（不新建新会话），供未来"归档"等按钮复用
+  invalidateCurrentConversation: async () => {
+    const convId = _get().currentConversationId;
+    if (!convId) return;
+    try {
+      await contextInvalidationService.invalidateConversation(convId, { reason: "archive" });
+    } catch (e) {
+      console.warn("[chatStore] invalidateCurrentConversation failed:", e);
+    }
   },
 }));

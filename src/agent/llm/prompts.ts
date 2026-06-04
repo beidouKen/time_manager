@@ -77,7 +77,7 @@ actions 格式（batch_action / defer_task 时必填）：
 userGoal 可选值：
 ask_current_time | create_and_schedule_task | create_reminder | delete_task | query_schedule |
 general_chat | unsupported_intent | query_schedule_range | batch_delete_tasks |
-batch_reschedule_day | defer_task
+batch_reschedule_day | defer_task | update_recent_duration
 `.trim();
 
 /**

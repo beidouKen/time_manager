@@ -13,8 +13,11 @@ export class SqliteActionLogRepository implements IActionLogRepository {
     const now = new Date().toISOString();
 
     await db.execute(
-      `INSERT INTO agent_action_logs (id, user_input, detected_intent, tool_name, tool_args_json, tool_result_json, status, error_message, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      `INSERT INTO agent_action_logs
+        (id, user_input, detected_intent, tool_name, tool_args_json,
+         tool_result_json, status, error_message, created_at,
+         conversation_id, turn_id, message_id, confirmation_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
       [
         id,
         data.user_input,
@@ -25,6 +28,10 @@ export class SqliteActionLogRepository implements IActionLogRepository {
         data.status ?? "pending",
         data.error_message ?? null,
         now,
+        data.conversation_id ?? null,
+        data.turn_id ?? null,
+        data.message_id ?? null,
+        data.confirmation_id ?? null,
       ]
     );
 
@@ -38,6 +45,10 @@ export class SqliteActionLogRepository implements IActionLogRepository {
       status: data.status ?? "pending",
       error_message: data.error_message,
       created_at: now,
+      conversation_id: data.conversation_id,
+      turn_id: data.turn_id,
+      message_id: data.message_id,
+      confirmation_id: data.confirmation_id,
     };
   }
 

@@ -1,5 +1,6 @@
 import type { PlannerPort } from "@/agent/experience/PlannerPort";
 import type { CompositePlanner } from "@/agent/CompositePlanner";
+import { ContextAssembler } from "@/agent/context/ContextAssembler";
 import {
   ConversationContextBuilder,
   type ConversationMemorySnapshot,
@@ -12,6 +13,7 @@ import { AvailabilityProvider } from "@/agent/time-management/scheduling/Availab
 import { RecommendationPlanner } from "@/agent/time-management/scheduling/RecommendationPlanner";
 import { SchedulingReasoner } from "@/agent/time-management/scheduling/SchedulingReasoner";
 import { PlanSafetyValidator } from "@/agent/validators/PlanSafetyValidator";
+import { applyPastTimeDisambiguationGuard } from "@/agent/experience/pastTimeDisambiguationGuard";
 import type {
   AgentExperienceContext,
   AgentHandlerResult,
@@ -27,7 +29,11 @@ import { TimeBlockService } from "@/services/TimeBlockService";
 import { ConfirmationService } from "@/services/ConfirmationService";
 
 interface ActionLogPort {
-  logRequest(userInput: string, detectedIntent?: string): Promise<{ id: string }>;
+  logRequest(
+    userInput: string,
+    detectedIntent?: string,
+    binding?: { conversation_id?: string; turn_id?: string; message_id?: string; confirmation_id?: string }
+  ): Promise<{ id: string }>;
   logToolExecution(
     logId: string,
     toolName: string,
@@ -95,14 +101,20 @@ export class TimeManagementAgent {
     userInput: string;
     context: AgentExperienceContext;
     semanticFrame: SemanticFrame;
+    /** C4: 统一上下文包，供 LLMExperiencePlanner 使用 */
+    packet?: import("@/agent/context/WorkingMemoryPacket").WorkingMemoryPacket;
   }): Promise<TimeManagementHandleResult> {
-    const { userInput, context, semanticFrame } = args;
-    const rawPlan = await this.deps.plannerPort.plan(semanticFrame, context);
+    const { userInput, context, semanticFrame, packet } = args;
+    const rawPlan = await this.deps.plannerPort.plan(semanticFrame, context, packet);
 
     // V3.7: 所有 planner 输出都经过 PlanSafetyValidator 统一校验
     const safetyResult = this.safetyValidator.validate(rawPlan);
     if (!safetyResult.ok) {
-      const log = await this.deps.logService.logRequest(userInput, semanticFrame.userGoal);
+      const log = await this.deps.logService.logRequest(userInput, semanticFrame.userGoal, {
+        conversation_id: context.conversationId,
+        turn_id: context.turnId,
+        message_id: context.messageId,
+      });
       await this.deps.logService.logFailure(log.id, safetyResult.reason);
       const fallbackResponse = this.deps.responseBoundary.finalize({
         context,
@@ -153,12 +165,24 @@ export class TimeManagementAgent {
     }
 
     const actionPlan = safetyResult.plan;
+
+    // V3.8+ Guard: 保证 LLM 路径也能正确注入 Past Time Disambiguation 参数。
+    // 规则路径（ActionPlanner）已设置 allowShiftToNextDay → guard 幂等跳过；
+    // LLM 路径产生的 plan 缺少这些字段 → guard 从 frame 或 userInput 推断。
+    if (actionPlan.kind === "request_recommendation") {
+      applyPastTimeDisambiguationGuard(actionPlan.params, semanticFrame, userInput);
+    }
+
     const toolResults: AgentToolResult[] = [];
     let queryBlocks: TimeBlock[] | undefined;
     let actionLogId: string | undefined;
     let confirmationId: string | undefined;
 
-    const log = await this.deps.logService.logRequest(userInput, semanticFrame.userGoal);
+    const log = await this.deps.logService.logRequest(userInput, semanticFrame.userGoal, {
+      conversation_id: context.conversationId,
+      turn_id: context.turnId,
+      message_id: context.messageId,
+    });
     actionLogId = log.id;
 
     if (actionPlan.kind === "tool" && actionPlan.toolName) {
@@ -173,6 +197,11 @@ export class TimeManagementAgent {
           tool_args_json: JSON.stringify(actionPlan.params),
           risk_level: toLegacyRiskLevel(policyRisk),
           description: actionPlan.summary,
+          // C2/G11: 绑定会话上下文
+          conversation_id: context.conversationId,
+          turn_id: context.turnId,
+          message_id: context.messageId,
+          related_task_id: typeof actionPlan.params.taskId === "string" ? actionPlan.params.taskId : undefined,
         });
         confirmationId = pending.id;
         await this.deps.logService.logSuccess(log.id, {
@@ -287,35 +316,69 @@ export class TimeManagementAgent {
       const timeOfDay = actionPlan.params.timeOfDay as
         | import("@/agent/experience/SemanticFrameParser").TimeOfDayRange
         | undefined;
-      const candidates = await this.recommendationPlanner.plan({
-        date: now,
+
+      // V3.8+ Past Time Disambiguation: 读取 ActionPlanner 标注的决策参数
+      const allowShiftToNextDay = Boolean(actionPlan.params.allowShiftToNextDay ?? true);
+      const allowPastTime = Boolean(actionPlan.params.allowPastTime ?? false);
+      const dateOffsetDays = Number(actionPlan.params.dateOffsetDays ?? 0);
+      // 若用户说"明天"，推荐基准日期向后偏移 1 天
+      const baseDate =
+        dateOffsetDays > 0
+          ? new Date(now.getTime() + dateOffsetDays * 24 * 60 * 60 * 1000)
+          : now;
+
+      const planResult = await this.recommendationPlanner.planWithMeta({
+        date: baseDate,
         durationMinutes: Number.isFinite(duration) ? duration : 30,
         timezone: context.timezone,
         now,
         timeOfDay,
+        allowShiftToNextDay,
+        allowPastTime,
       });
+      const candidates = planResult.candidates;
+      // V3.8+: 记录顺延 / 追问元数据，供 composeRecommendationMessage 使用
+      actionPlan.params.shiftedToNextDay = planResult.shiftedToNextDay;
+      actionPlan.params.needsPastTimeClarification =
+        planResult.needsPastTimeClarification ?? false;
+
       if (candidates.length > 0) {
         const recommendation = candidates[0];
         actionPlan.params.recommendation = recommendation;
+
+        // V3.8+: 补记路径 → 创建历史已完成记录（initialStatus: "done"），
+        // 不允许静默创建普通 scheduled 时间块
+        const isBackfill = Boolean(actionPlan.params.possibleBackfill) && allowPastTime;
+        const taskTitle =
+          String(actionPlan.params.title ?? semanticFrame.extractedTitle ?? "新任务");
         const pending = await this.deps.confirmationService.createConfirmation({
           action_type: semanticFrame.userGoal,
           tool_name: "schedule_task",
           tool_args_json: JSON.stringify({
-            title: actionPlan.params.title ?? semanticFrame.extractedTitle ?? "新任务",
+            title: taskTitle,
             category: actionPlan.params.category,
             duration,
             estimated_duration_minutes: duration,
             start_time: recommendation.start,
             end_time: recommendation.end,
+            ...(isBackfill ? { initialStatus: "done" } : {}),
           }),
           risk_level: "low",
-          description: `按推荐时间安排「${actionPlan.params.title ?? "新任务"}」`,
+          description: isBackfill
+            ? `补记已完成任务「${taskTitle}」（历史记录）`
+            : `按推荐时间安排「${taskTitle}」`,
+          // C2/G11: 绑定会话上下文 + proposal_id
+          conversation_id: context.conversationId,
+          turn_id: context.turnId,
+          message_id: context.messageId,
         });
         confirmationId = pending.id;
       }
       await this.deps.logService.logSuccess(log.id, {
         kind: actionPlan.kind,
         recommendationCount: candidates.length,
+        shiftedToNextDay: planResult.shiftedToNextDay,
+        needsPastTimeClarification: planResult.needsPastTimeClarification,
         confirmationId,
       });
     } else if (actionPlan.kind === "batch_action" || actionPlan.kind === "defer_task") {
@@ -327,6 +390,10 @@ export class TimeManagementAgent {
         tool_args_json: JSON.stringify(actionPlan.params),
         risk_level: toLegacyRiskLevel(actionPlan.riskLevel),
         description: actionPlan.summary,
+        // C2/G11: 绑定会话上下文
+        conversation_id: context.conversationId,
+        turn_id: context.turnId,
+        message_id: context.messageId,
       });
       confirmationId = pending.id;
       await this.deps.logService.logSuccess(log.id, {
@@ -348,9 +415,20 @@ export class TimeManagementAgent {
 
     if (actionPlan.kind === "request_recommendation") {
       finalResponseKind = "clarification";
+      const timeOfDay = actionPlan.params.timeOfDay as
+        | import("@/agent/experience/SemanticFrameParser").TimeOfDayRange
+        | undefined;
       finalResponseMessage = this.composeRecommendationMessage(
         actionPlan.params.recommendation as { start: string; end: string } | undefined,
-        context.timezone
+        context.timezone,
+        {
+          shiftedToNextDay: Boolean(actionPlan.params.shiftedToNextDay),
+          timeOfDayLabel: timeOfDay?.label,
+          needsPastTimeClarification: Boolean(
+            actionPlan.params.needsPastTimeClarification
+          ),
+          possibleBackfill: Boolean(actionPlan.params.possibleBackfill),
+        }
       );
     } else if (actionPlan.kind === "batch_action") {
       finalResponseMessage = `已收到批量操作请求（${actionPlan.summary}），请确认是否继续。`;
@@ -403,6 +481,10 @@ export class TimeManagementAgent {
       toolResults,
       finalResponse,
       planSummary: actionPlan.summary,
+      // C4: 写入 workingMemorySnapshot 供 dev 期调试
+      workingMemorySnapshot: packet
+        ? ContextAssembler.toSnapshot(packet)
+        : undefined,
     };
 
     const primaryResult = toolResults[0];
@@ -414,6 +496,29 @@ export class TimeManagementAgent {
     // request_recommendation：用户还未确认，resultType 应为 "pending_confirmation"
     const isRecommendationPending =
       actionPlan.kind === "request_recommendation" && !!confirmationId;
+
+    // V3.8: 构造 pendingProposal 快照，供 chatStore 缓存并在下一轮传给路由器
+    let pendingProposal: import("@/agent/types").PendingProposalSnapshot | undefined;
+    if (isRecommendationPending) {
+      const rec = actionPlan.params.recommendation as
+        | { start: string; end: string }
+        | undefined;
+      if (rec && confirmationId) {
+        const timeOfDay = actionPlan.params.timeOfDay as
+          | import("@/agent/experience/SemanticFrameParser").TimeOfDayRange
+          | undefined;
+        pendingProposal = {
+          confirmationId,
+          kind: "recommendation",
+          title: String(actionPlan.params.title ?? semanticFrame.extractedTitle ?? "新任务"),
+          duration: Number(actionPlan.params.duration ?? 30),
+          category: actionPlan.params.category as string | undefined,
+          start: rec.start,
+          end: rec.end,
+          timeOfDayLabel: timeOfDay?.label,
+        };
+      }
+    }
 
     const metadata: ChatMessageMetadata = {
       intent: semanticFrame.userGoal,
@@ -433,6 +538,7 @@ export class TimeManagementAgent {
       confidence: semanticFrame.confidence,
       llmResponseType: traceMode === "chitchat" ? "chitchat" : traceMode === "clarification" ? "clarification" : "tool_plan",
       agentTrace: trace,
+      pendingProposal,
     };
 
     return {
@@ -465,13 +571,52 @@ export class TimeManagementAgent {
 
   private composeRecommendationMessage(
     recommendation: { start: string; end: string } | undefined,
-    timezone: string
+    timezone: string,
+    meta: {
+      shiftedToNextDay?: boolean;
+      timeOfDayLabel?: string;
+      /** V3.8+ Past Time Disambiguation: 用户说了"今天"但时段已过、非补记 */
+      needsPastTimeClarification?: boolean;
+      /** V3.8+ 补记模式：推荐的是今天已过的时段 */
+      possibleBackfill?: boolean;
+    } = {}
   ): string {
+    // ── Case 1: 用户明确说了"今天"，但时段已过，且不是补记 ──────────────────
+    // 不能静默给明天，需追问意图
+    if (meta.needsPastTimeClarification) {
+      const todPart = meta.timeOfDayLabel
+        ? `今天${meta.timeOfDayLabel}`
+        : "今天这个时段";
+      const tomorrowPart = meta.timeOfDayLabel
+        ? `明天${meta.timeOfDayLabel}`
+        : "明天同一时段";
+      return `${todPart}已经过去了。你是想补记${todPart}的记录，还是想把它安排到${tomorrowPart}？`;
+    }
+
     if (!recommendation) {
+      // 用户显式指定了时段但仍无候选 → 给一个更具体的解释
+      if (meta.timeOfDayLabel) {
+        return `${meta.timeOfDayLabel}已经过去了或没有可用时段。要不要换一个时段，比如今晚、明天${meta.timeOfDayLabel}，或者直接告诉我从几点开始？`;
+      }
       return "我还需要一个更具体的时间偏好。比如今天上午、下午，或者从几点开始。";
     }
+
     const startStr = formatTimeInZone(recommendation.start, timezone);
     const endStr = formatTimeInZone(recommendation.end, timezone);
+
+    // ── Case 2: 自动顺延到次日（无明确日期，时段已过） ────────────────────
+    if (meta.shiftedToNextDay) {
+      const todPart = meta.timeOfDayLabel ?? "";
+      return `今天${todPart || "已选时段"}已经过了，我建议改到明天${todPart} ${startStr} - ${endStr}，可以吗？`;
+    }
+
+    // ── Case 3: 补记模式，推荐今天已过的时段 ─────────────────────────────
+    // 明确告知将创建"已完成记录"，不允许当作普通未完成计划
+    if (meta.possibleBackfill) {
+      return `好的，我可以帮你补记为今天已完成的记录，时间是 ${startStr} - ${endStr}。确认后将作为已完成历史记录，是否确认？`;
+    }
+
+    // ── Case 4: 正常推荐（时段未过 / 无时段约束） ──────────────────────────
     return `我建议安排在 ${startStr} - ${endStr}，需要我按这个时间来安排吗？`;
   }
 }

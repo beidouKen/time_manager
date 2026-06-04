@@ -47,6 +47,7 @@ export const SemanticUserGoalSchema = z.enum([
   "batch_delete_tasks",
   "batch_reschedule_day",
   "defer_task",
+  "update_recent_duration",
 ]);
 
 // ─── LLMExperiencePlanResponse schema ────────────────────────────────────────

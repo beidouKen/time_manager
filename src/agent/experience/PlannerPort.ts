@@ -13,10 +13,12 @@
 // ============================================================
 
 import type { AgentExperienceContext, ExperienceActionPlan, SemanticFrame } from "@/agent/types";
+import type { WorkingMemoryPacket } from "@/agent/context/WorkingMemoryPacket";
 
 export interface PlannerPort {
   plan(
     frame: SemanticFrame,
-    context: AgentExperienceContext
+    context: AgentExperienceContext,
+    packet?: WorkingMemoryPacket
   ): Promise<ExperienceActionPlan>;
 }

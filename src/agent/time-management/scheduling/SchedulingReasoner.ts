@@ -13,16 +13,32 @@ export interface RecommendationCandidate {
  * - bufferMinutes: 默认 15 分钟，避免推荐刚刚到不及反应的时间点。
  * - timeOfDay: 用户指定的时段（如"下午"），仅在该时段内推荐。
  * - timezone: 用于将 timeOfDay 的小时范围转换为 UTC。
+ * - dateAnchor: V3.8+，计算 timeOfDay 窗口边界使用的"日期锚点"。
+ *   默认等于 `now`。当 RecommendationPlanner 因为今日时段已过而切换到次日
+ *   时，会传入次日 Date，避免 todWindow 还停留在今天。
  */
 export interface SchedulingRankOptions {
   now?: Date;
   bufferMinutes?: number;
   timeOfDay?: TimeOfDayRange;
   timezone?: string;
+  dateAnchor?: Date;
 }
 
 const DEFAULT_BUFFER_MINUTES = 15;
 const DEFAULT_TIMEZONE = "Asia/Shanghai";
+const MS_PER_MINUTE = 60 * 1000;
+
+/**
+ * V3.8: 把毫秒时间戳向上对齐到下一个分钟边界。
+ * 避免 18:00:36 这种带秒的 effectiveStart 被显示为 "18:00" 但实际比整点晚 36 秒，
+ * 也避免下一次 refine 时刻递增 1 分钟（18:00 → 18:01 → 18:02）。
+ */
+function ceilToMinute(ms: number): number {
+  if (ms === -Infinity || ms === Infinity) return ms;
+  const remainder = ms % MS_PER_MINUTE;
+  return remainder === 0 ? ms : ms + (MS_PER_MINUTE - remainder);
+}
 
 export class SchedulingReasoner {
   rank(
@@ -37,11 +53,13 @@ export class SchedulingReasoner {
       : -Infinity;
     const timezone = options.timezone ?? DEFAULT_TIMEZONE;
 
-    // 将 timeOfDay 的本地小时范围转换为当日 UTC 时间戳边界
+    // 将 timeOfDay 的本地小时范围转换为目标日期的 UTC 时间戳边界。
+    // dateAnchor（若提供）优先于 now，使 RecommendationPlanner 顺延到次日时
+    // 能用次日日期作为窗口锚点（否则窗口仍停在今天就会被 effectiveStart 一脚踢飞）。
     let todWindowStart = -Infinity;
     let todWindowEnd = Infinity;
-    if (options.timeOfDay && options.now) {
-      const anchor = options.now;
+    if (options.timeOfDay && (options.dateAnchor || options.now)) {
+      const anchor = options.dateAnchor ?? options.now!;
       todWindowStart = this.localHourToUtcMs(anchor, options.timeOfDay.startHour, timezone);
       todWindowEnd = this.localHourToUtcMs(anchor, options.timeOfDay.endHour, timezone);
     }
@@ -53,11 +71,13 @@ export class SchedulingReasoner {
       const slotEnd = new Date(slot.end).getTime();
 
       // V3.7 P0-3：把 slot 起点抬升到 now+buffer 之后。
-      let effectiveStart = Math.max(slotStart, earliestAllowedMs);
+      // V3.8：进一步向上对齐到下一分钟边界，避免推荐出现 18:00:36 这种碎秒，
+      // 同时让连续 refine 不会每次漂 1 分钟。
+      let effectiveStart = ceilToMinute(Math.max(slotStart, earliestAllowedMs));
 
       // 时段约束：effectiveStart 不得早于 todWindowStart。
       if (options.timeOfDay) {
-        effectiveStart = Math.max(effectiveStart, todWindowStart);
+        effectiveStart = ceilToMinute(Math.max(effectiveStart, todWindowStart));
         // slot 在时段窗口之后，跳过
         if (effectiveStart >= todWindowEnd) continue;
         // slot 结束不得晚于时段窗口结束
@@ -89,9 +109,12 @@ export class SchedulingReasoner {
 
   /**
    * 将某天（由 anchorDate 确定日期）+ 本地小时 转换为 UTC 毫秒时间戳。
+   *
+   * V3.8+ 修复：旧实现仅比较小时分钟，遇到本地时刻越过 UTC 日界（如上海 18:00 = 同日 UTC 10:00，
+   * 但 Date.UTC(year, m, d, 18) 在 UTC+8 看到的是次日 02:00）时偏差一整天。
+   * 这里改用全 Y/M/D/H/M 字段计算 "locally-as-UTC - 真实-UTC" 的偏移量，避免跨日 bug。
    */
   private localHourToUtcMs(anchorDate: Date, localHour: number, timezone: string): number {
-    // 取 anchorDate 在目标时区的年月日
     const parts = new Intl.DateTimeFormat("en-CA", {
       timeZone: timezone,
       year: "numeric",
@@ -101,23 +124,31 @@ export class SchedulingReasoner {
       .formatToParts(anchorDate)
       .reduce<Record<string, string>>((acc, p) => { acc[p.type] = p.value; return acc; }, {});
 
-    const dateStr = `${parts.year}-${parts.month}-${parts.day}`;
-    // 构造一个"假 UTC"然后用 Intl 校正偏移量
-    const [year, month, day] = dateStr.split("-").map(Number);
-    const roughUtc = new Date(Date.UTC(year, month - 1, day, localHour, 0, 0));
+    const year = Number(parts.year);
+    const month = Number(parts.month) - 1;
+    const day = Number(parts.day);
+    const roughUtc = Date.UTC(year, month, day, localHour, 0, 0);
 
-    const localParts = new Intl.DateTimeFormat("en-US", {
+    const localParts = new Intl.DateTimeFormat("en-CA", {
       timeZone: timezone,
-      hour: "numeric",
-      minute: "numeric",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
       hour12: false,
     })
-      .formatToParts(roughUtc)
+      .formatToParts(new Date(roughUtc))
       .reduce<Record<string, string>>((acc, p) => { acc[p.type] = p.value; return acc; }, {});
 
-    const gotHour = Number(localParts.hour ?? 0);
+    const gotYear = Number(localParts.year ?? year);
+    const gotMonth = Number(localParts.month ?? 1) - 1;
+    const gotDay = Number(localParts.day ?? day);
+    const gotHour = Number(localParts.hour ?? 0) % 24;
     const gotMinute = Number(localParts.minute ?? 0);
-    const offsetMs = ((gotHour - localHour) * 60 + gotMinute) * 60 * 1000;
-    return roughUtc.getTime() - offsetMs;
+
+    const localAsUtc = Date.UTC(gotYear, gotMonth, gotDay, gotHour, gotMinute, 0);
+    const offsetMs = localAsUtc - roughUtc;
+    return roughUtc - offsetMs;
   }
 }

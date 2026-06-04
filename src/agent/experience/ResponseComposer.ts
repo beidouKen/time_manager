@@ -123,13 +123,52 @@ export class ResponseComposer {
     plan: ExperienceActionPlan,
     queryBlocks?: TimeBlock[]
   ): string {
+    // V3.8+: 时长调整成功的反馈（"更改为 X 分钟"）
+    if (frame.userGoal === "update_recent_duration" || plan.params._newDurationMinutes) {
+      // ActionPlanner 在无最近时间块时会返回 missingRecentBlock=true 的 direct_response
+      if (plan.params.missingRecentBlock) {
+        const minutes = Number(plan.params.durationMinutes);
+        if (Number.isFinite(minutes) && minutes > 0) {
+          return `我还不知道你想把哪个任务改成 ${minutes} 分钟。可以告诉我任务名称，或者先创建/安排一个任务。`;
+        }
+        return "我还没有可以调整时长的任务。可以先告诉我任务名称，或者先安排一个任务。";
+      }
+      const minutes = Number(plan.params._newDurationMinutes ?? plan.params.duration);
+      const title = String(plan.params.title ?? "该任务");
+      const end = String(plan.params.end_time ?? "");
+      if (Number.isFinite(minutes) && minutes > 0 && this.isValidIso(end)) {
+        return `已把「${title}」时长改成 ${minutes} 分钟，结束时间是 ${formatTimeInZone(end, context.timezone)}。`;
+      }
+      if (Number.isFinite(minutes) && minutes > 0) {
+        return `已把「${title}」时长改成 ${minutes} 分钟。`;
+      }
+      return `已为你调整「${title}」的时长。`;
+    }
+
     if (frame.userGoal === "create_and_schedule_task") {
-      const start = String(plan.params.start_time);
-      const end = String(plan.params.end_time);
-      const duration = Number(plan.params.duration);
-      const title = String(plan.params.title);
+      const start = String(plan.params.start_time ?? "");
+      const end = String(plan.params.end_time ?? "");
+      const duration = Number(plan.params.duration ?? plan.params.estimated_duration_minutes);
+      const title = String(plan.params.title ?? frame.extractedTitle ?? "新任务");
       const startLabel = String(plan.params.start_label ?? "现在开始");
-      return `我已把\u2018${title}\u2019安排到${startLabel}，预计 ${duration} 分钟，时间段是 ${formatTimeInZone(start, context.timezone)} - ${formatTimeInZone(end, context.timezone)}。`;
+
+      // V3.8+: 防御缺参数情况（LLM 可能产出不带时间字段的 tool plan）。
+      // 旧实现会把 Number(undefined) 渲染成 "NaN"，formatTimeInZone(undefined) 渲染成 "--:--"，
+      // 表现为 "我已把'NaN' 安排到 ...，预计 NaN 分钟，时间段是 --:-- - --:--"。
+      const startOk = this.isValidIso(start);
+      const endOk = this.isValidIso(end);
+      const durationOk = Number.isFinite(duration) && duration > 0;
+
+      if (!startOk || !endOk) {
+        // 缺时间字段：退化为不暴露 NaN/--:-- 的安全文案
+        if (durationOk) {
+          return `已为你创建任务「${title}」，预计 ${duration} 分钟，稍后再为它安排具体时间。`;
+        }
+        return `已为你创建任务「${title}」，稍后再为它安排具体时间。`;
+      }
+
+      const durationText = durationOk ? `预计 ${duration} 分钟，` : "";
+      return `我已把\u2018${title}\u2019安排到${startLabel}，${durationText}时间段是 ${formatTimeInZone(start, context.timezone)} - ${formatTimeInZone(end, context.timezone)}。`;
     }
 
     if (frame.userGoal === "create_reminder") {
@@ -148,5 +187,12 @@ export class ResponseComposer {
     }
 
     return "已处理完成。";
+  }
+
+  /** ISO 字符串能被 Date 正确解析才视为有效，避免下游显示 "--:--" */
+  private isValidIso(value: string | undefined | null): value is string {
+    if (!value) return false;
+    const d = new Date(value);
+    return !Number.isNaN(d.getTime());
   }
 }

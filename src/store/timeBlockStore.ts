@@ -5,6 +5,7 @@ import { HeartbeatService } from "@/services/HeartbeatService";
 import { ActionLogService } from "@/services/ActionLogService";
 import type { TimeBlock, CreateTimeBlockInput, UpdateTimeBlockInput } from "@/types/timeblock.types";
 import { startOfDay } from "date-fns";
+import { useChatStore } from "@/store/chatStore";
 
 // 模块级单例，避免每次 render 重复 new
 const timeBlockService = new TimeBlockService();
@@ -23,7 +24,11 @@ async function logTimelineAction(
   try {
     const intentStr = `timeline_${action}`;
     const userInput = `[timeline:${action}] ${block.title}`;
-    const log = await actionLogService.logRequest(userInput, intentStr);
+    // C2/G10: 透传当前会话 ID（system trigger）
+    const currentConversationId = useChatStore.getState().currentConversationId;
+    const log = await actionLogService.logRequest(userInput, intentStr, {
+      conversation_id: currentConversationId ?? undefined,
+    });
     await actionLogService.logToolExecution(log.id, intentStr, {
       blockId: block.id,
       taskId: block.task_id ?? null,

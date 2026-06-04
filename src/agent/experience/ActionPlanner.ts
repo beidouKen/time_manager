@@ -7,12 +7,20 @@ import type {
 import { formatDateKey } from "@/agent/experience/dateFormatting";
 import type { PlannerPort } from "@/agent/experience/PlannerPort";
 import { TaskService } from "@/services/TaskService";
+import { TimeBlockService } from "@/services/TimeBlockService";
 
 const DEFAULT_DURATION_MINUTES = 30;
 const REMINDER_DEFAULT_DURATION_MINUTES = 10;
 
 export class ActionPlanner implements PlannerPort {
-  constructor(private taskService: TaskService) {}
+  private timeBlockService: TimeBlockService;
+
+  constructor(
+    private taskService: TaskService,
+    timeBlockService?: TimeBlockService
+  ) {
+    this.timeBlockService = timeBlockService ?? new TimeBlockService();
+  }
 
   async plan(
     frame: SemanticFrame,
@@ -51,6 +59,20 @@ export class ActionPlanner implements PlannerPort {
         if (!hasStartNow && !absoluteStart) {
           const title = frame.extractedTitle ?? "新任务";
           const timeOfDay = frame.constraints.timeOfDay;
+
+          // ── V3.8+ Past Time Disambiguation ─────────────────────────────────
+          // 用户明确说"今天"→ 不允许静默顺延；补记 → 允许历史时间；明天 → 锁定次日
+          const isExplicitToday = Boolean(frame.isExplicitToday);
+          const isExplicitTomorrow = frame.explicitDateAnchor === "tomorrow";
+          const possibleBackfill = Boolean(frame.possibleBackfill);
+
+          // 有明确日期时禁止顺延；否则允许（默认行为）
+          const allowShiftToNextDay = !isExplicitToday && !isExplicitTomorrow;
+          // 补记模式：允许推荐已过去的时间段（忽略 now 过滤）
+          const allowPastTime = possibleBackfill && isExplicitToday;
+          // 明天的日期偏移（交给 TimeManagementAgent 用 context.currentDatetime 算实际 date）
+          const dateOffsetDays = isExplicitTomorrow ? 1 : 0;
+
           return {
             ...base,
             kind: "request_recommendation",
@@ -59,6 +81,13 @@ export class ActionPlanner implements PlannerPort {
               duration,
               category: frame.category,
               ...(timeOfDay ? { timeOfDay } : {}),
+              // Past Time Disambiguation flags
+              isExplicitToday,
+              isExplicitTomorrow,
+              possibleBackfill,
+              allowShiftToNextDay,
+              allowPastTime,
+              dateOffsetDays,
             },
             summary: "request recommendation",
             traceLabel: "create_and_schedule_task:fuzzy_recommendation",
@@ -237,6 +266,86 @@ export class ActionPlanner implements PlannerPort {
         };
       }
 
+      // V3.8+: 调整最近时间块的时长（无需再次提任务名）
+      case "update_recent_duration": {
+        const minutes = this.parseDurationFromFrame(frame);
+        const blockId = context.lastScheduledTimeBlockIds[0];
+        const taskId =
+          context.lastCreatedTaskId ?? context.lastMentionedTaskIds[0] ?? null;
+
+        if (!minutes || minutes <= 0) {
+          return {
+            ...base,
+            kind: "direct_response",
+            params: { currentDatetime: context.currentDatetime },
+            summary: "update_recent_duration:missing_duration",
+            traceLabel: "update_recent_duration:missing_duration",
+            replayKey: "update_recent_duration:missing_duration",
+          };
+        }
+
+        if (!blockId) {
+          return {
+            ...base,
+            kind: "direct_response",
+            params: {
+              currentDatetime: context.currentDatetime,
+              missingRecentBlock: true,
+              durationMinutes: minutes,
+            },
+            summary: "update_recent_duration:no_recent_block",
+            traceLabel: "update_recent_duration:no_recent_block",
+            replayKey: `update_recent_duration:no_block:${minutes}`,
+          };
+        }
+
+        // 取出现存 block 计算 new end_time
+        let block: import("@/types/timeblock.types").TimeBlock | null = null;
+        try {
+          block = await this.timeBlockService.getBlockById(blockId);
+        } catch {
+          block = null;
+        }
+
+        if (!block) {
+          return {
+            ...base,
+            kind: "direct_response",
+            params: {
+              currentDatetime: context.currentDatetime,
+              missingRecentBlock: true,
+              durationMinutes: minutes,
+            },
+            summary: "update_recent_duration:block_missing",
+            traceLabel: "update_recent_duration:block_missing",
+            replayKey: `update_recent_duration:block_missing:${blockId}`,
+          };
+        }
+
+        const newEnd = new Date(
+          new Date(block.start_time).getTime() + minutes * 60 * 1000
+        );
+
+        return {
+          ...base,
+          kind: "tool",
+          toolName: "update_time_block",
+          params: {
+            timeBlockId: blockId,
+            end_time: newEnd.toISOString(),
+            // 仅用于 composeToolSuccess / trace 阅读，不传入 ToolRouter 的核心字段
+            _newDurationMinutes: minutes,
+            _previousEnd: block.end_time,
+            taskId: taskId ?? undefined,
+            title: block.title,
+          },
+          summary: `将「${block.title}」时长调整为 ${minutes} 分钟`,
+          refreshHints: { timeline: true },
+          traceLabel: "update_recent_duration:resize",
+          replayKey: `update_recent_duration:${blockId}:${minutes}`,
+        };
+      }
+
       // V4+: 延期任务（建议，不直接改原计划）— V3.7 预先分解 actions[]
       case "defer_task": {
         const title = frame.extractedTitle ?? frame.objectReferences[0]?.keyword ?? "该任务";
@@ -278,6 +387,16 @@ export class ActionPlanner implements PlannerPort {
     keyword: string | undefined
   ): Promise<string | null> {
     return this.findSingleTaskId(keyword);
+  }
+
+  /**
+   * V3.8+: 从 SemanticFrame.durationExpressions 取分钟数（优先），
+   * 再从原文中兜底解析 "半小时/一刻钟" 等中文表达。
+   */
+  private parseDurationFromFrame(frame: SemanticFrame): number | undefined {
+    const fromExpr = frame.durationExpressions[0]?.minutes;
+    if (fromExpr && Number.isFinite(fromExpr) && fromExpr > 0) return fromExpr;
+    return undefined;
   }
 
   private async findSingleTaskId(

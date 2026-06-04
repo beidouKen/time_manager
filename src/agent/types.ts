@@ -129,12 +129,65 @@ export interface AgentRouteResult {
   /** V3.7 P1: LLM 决策子类型（assistant_meta 细分等） */
   subtype?: string;
   /**
-   * V3.7 P1: ContextualPreRouter 检测到 pending confirmation 回复时填充。
-   * AgentService.processInput 直接转发给 confirmAction / rejectAction。
+   * V3.7 P1 / V3.8: ContextualPreRouter 或 PendingProposalInterpreter 检测到
+   * pending confirmation 回复时填充。
+   * - confirm/reject: AgentService.processInput 直接转发
+   * - refine: 携带 refinements，由 refineRecommendation 合并参数后重新推荐
    */
   pendingAction?: {
-    kind: "confirm" | "reject" | "adjust_later" | "adjust_earlier";
+    kind: "confirm" | "reject" | "refine";
     confirmationId: string;
+    refinements?: RefinementDecision["refinements"];
+  };
+}
+
+// ─── V3.8 Pending Proposal（推荐类待确认提案快照） ──────────────────────────
+
+/**
+ * 推荐类待确认提案的结构化快照。
+ * 由 TimeManagementAgent 在 request_recommendation 成功后写入 metadata，
+ * chatStore 缓存在内存中，供下一轮用户输入时作为路由器上下文。
+ */
+export interface PendingProposalSnapshot {
+  confirmationId: string;
+  kind: "recommendation";
+  title: string;
+  /**
+   * C3: 提案自身的 UUID，由 TimeManagementAgent 在 request_recommendation 时生成。
+   * 用于 ActiveContext.active_proposal_id，以及跨话题 / 刷新后从 DB 还原 pendingProposal 的关联键。
+   */
+  proposalId?: string;
+  /** 时长（分钟） */
+  duration: number;
+  category?: string;
+  /** 推荐开始时间 ISO */
+  start: string;
+  /** 推荐结束时间 ISO */
+  end: string;
+  /** 时段标签（如"下午"），供解释器上下文使用 */
+  timeOfDayLabel?: string;
+}
+
+/**
+ * PendingProposalInterpreter 输出的结构化决策。
+ * - confirm/reject: 直接转发
+ * - refine: 携带细化参数，由 refineRecommendation 合并
+ * - topic_change: 用户已切换话题，路由器继续走 LLMDomainClassifier
+ */
+export interface RefinementDecision {
+  intent: "confirm" | "reject" | "refine" | "topic_change";
+  confidence: number;
+  refinements?: {
+    /** 覆盖时长 */
+    durationMinutes?: number;
+    /** 覆盖时段约束（如"下午"） */
+    timeOfDay?: import("@/agent/experience/SemanticFrameParser").TimeOfDayRange;
+    /** 方向调整（不改时长，只移动时间窗口） */
+    direction?: "later" | "earlier";
+    /** 绝对时间锚点（直接以此时间安排，跳过 planner） */
+    anchorTime?: { iso: string; sourceText: string };
+    /** 日期偏移（0=今天，1=明天，-1=昨天） */
+    dateOffsetDays?: number;
   };
 }
 
@@ -161,7 +214,9 @@ export type SemanticUserGoal =
   | "query_schedule_range"
   | "batch_delete_tasks"
   | "batch_reschedule_day"
-  | "defer_task";
+  | "defer_task"
+  // V3.8+: 在没有重新提及任务名的情况下，修改最近一次创建/安排的时间块时长
+  | "update_recent_duration";
 
 export interface SemanticFrame {
   userGoal: SemanticUserGoal;
@@ -196,6 +251,25 @@ export interface SemanticFrame {
     to: string;
     sourceText: string;
   };
+  // ─── V3.8+ Past Time Disambiguation ────────────────────────────────────────
+  /**
+   * 用户是否明确提到了"今天/今晚/今早"等今日日期词。
+   * 为 true 时，时段约束不得被静默顺延到明天；应追问用户意图。
+   */
+  isExplicitToday?: boolean;
+  /**
+   * 用户明确给出的日期锚点。
+   * - 'today'        → 今天（今天/今晚/今早）
+   * - 'tomorrow'     → 明天
+   * - 'specific_date'→ 后天/具体日期
+   * - null           → 未明确指定日期（只有时段词，如"早上/下午"）
+   */
+  explicitDateAnchor?: "today" | "tomorrow" | "specific_date" | null;
+  /**
+   * 是否包含补记/记录语义（补上/补记/刚才/已经/之前做了 等）。
+   * 为 true 时，即使时段已过，也应允许按历史时间创建记录，不做顺延或追问。
+   */
+  possibleBackfill?: boolean;
 }
 
 export interface AgentExperienceContext {
@@ -209,6 +283,12 @@ export interface AgentExperienceContext {
   lastMentionedTaskIds: string[];
   lastScheduledTimeBlockIds: string[];
   lastToolResults: AgentToolResult[];
+  /** C2/G11: 会话 ID（供 TimeManagementAgent 透传给 createConfirmation / logRequest） */
+  conversationId?: string;
+  /** C2/G11: 回合 ID（供 TimeManagementAgent 透传） */
+  turnId?: string;
+  /** C2/G11: 用户消息 ID（供 TimeManagementAgent 透传） */
+  messageId?: string;
 }
 
 export interface AgentRefreshHints {
@@ -386,6 +466,15 @@ export interface ChatMessageMetadata {
   // V3.5 新增
   /** Agent 执行追踪（LLM 路径写入，用于调试与 UI 展示） */
   agentTrace?: AgentTrace;
+  /**
+   * V3.8: request_recommendation 成功后写入，供 chatStore 缓存为 pendingProposal state，
+   * 使下一轮对话能通过 PendingProposalInterpreter 做结构化细化。
+   */
+  pendingProposal?: PendingProposalSnapshot;
+  /** C1: 所属会话 ID */
+  conversationId?: string;
+  /** C1: 所属回合 ID */
+  turnId?: string;
 }
 
 // ─── V3.7 SinglePlanAction（batch/defer 分解后的原子操作） ──────────────────
@@ -408,6 +497,11 @@ export interface SinglePlanAction {
  * - errorKind: 仅 mode=error 时填充，标识具体错误原因
  */
 export interface AgentTrace {
+  /**
+   * C6: trace 聚合 key，等同于 turn_id（step 行通过 turn_id 关联到 AgentTrace）。
+   * 不单独建 agent_traces 头表；头记录仍寄生在 conversation_messages.metadata_json。
+   */
+  traceId?: string;
   planner: "llm" | "experience" | "router";
   /** V3.7 P1: 三段式路由器来源（planner=router 时填充） */
   routerSource?: "contextual" | "llm" | "fallback";
@@ -458,6 +552,69 @@ export interface AgentTrace {
    * V5+: 建议类响应的分类。
    */
   suggestionKind?: "suggestion" | "confirmation_required" | "executable_action";
+  /**
+   * C4: working memory 摘要（历史格式，C6 前含完整 slotSummaries）。
+   * C6: 语义降级为 { traceStepIds: string[] }（step 行包含完整摘要；metadata 仅保引用）。
+   * 向后兼容：读取时检查 traceStepIds 是否存在；无则回退到旧 slotSummaries 格式。
+   */
+  workingMemorySnapshot?:
+    | import("@/agent/context/WorkingMemoryPacket").WorkingMemorySnapshot
+    | { traceStepIds: string[] };
+}
+
+// ─── C6 AgentTraceStep ───────────────────────────────────────────────────────
+
+/**
+ * C6: Agent 内部决策阶段类型（开放枚举，DB 不加 CHECK）。
+ * 初始覆盖 10 个阶段；后续新增阶段无需 migration。
+ */
+export type AgentTraceStepType =
+  | "context_resolve"   // Stage 0 ActiveContextResolver 出口
+  | "context_assemble"  // ContextAssembler.assemble 出口（C4 packet 摘要迁此）
+  | "route"             // DomainRoutingService.classify 出口
+  | "parse"             // SemanticFrameParser 出口（time_management 路径）
+  | "plan"              // LLMExperiencePlanner / CompositePlanner 出口
+  | "execute"           // ToolRouter.execute 后（强制 latency_ms）
+  | "confirm_create"    // ConfirmationService.createConfirmation 后
+  | "confirm_resolve"   // confirmAction 成功后
+  | "reject"            // rejectAction 后
+  | "refine"            // refineRecommendation 后
+  | string;             // 允许扩展
+
+/**
+ * C6: Agent 单次 turn 内某个阶段的决策快照（行级审计事件）。
+ * append-only，写入后不可修改或删除。
+ */
+export interface AgentTraceStep {
+  id: string;
+  turn_id: string;
+  conversation_id: string;
+  message_id?: string;
+  step_type: AgentTraceStepType;
+  /** turn 内按写入顺序的序号，用于稳定时间线展示 */
+  step_order: number;
+  /** 阶段入参关键字段（不存全 packet，仅记关键字段） */
+  input_snapshot_json?: string;
+  /** 阶段输出关键字段 */
+  output_snapshot_json?: string;
+  /** 执行延迟（仅 execute step 强制填充，其他可选） */
+  latency_ms?: number;
+  /** step 内部报错的简要 message（避免存全 stack） */
+  error?: string;
+  created_at: string;
+}
+
+export interface CreateTraceStepInput {
+  id?: string;
+  turn_id: string;
+  conversation_id: string;
+  message_id?: string;
+  step_type: AgentTraceStepType;
+  step_order: number;
+  input_snapshot_json?: string;
+  output_snapshot_json?: string;
+  latency_ms?: number;
+  error?: string;
 }
 
 // ─── V3.5 AgentMessage ──────────────────────────────────────────────────────

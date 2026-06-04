@@ -33,6 +33,8 @@ export class ScheduleTaskTool extends BaseTool {
         | number
         | undefined;
       const category = args.category as string | undefined;
+      // V3.8+: 补记模式传入 "done"，创建历史已完成记录
+      const initialStatus = args.initialStatus as "scheduled" | "done" | undefined;
 
       if (!startTime || !endTime) {
         return this.failure("缺少开始或结束时间");
@@ -47,6 +49,7 @@ export class ScheduleTaskTool extends BaseTool {
           title: title || task.title,
           startTime,
           endTime,
+          initialStatus,
         });
         return this.success(
           `已将任务「${task.title}」安排到时间轴`,
@@ -66,6 +69,7 @@ export class ScheduleTaskTool extends BaseTool {
           title,
           startTime,
           endTime,
+          initialStatus,
         });
         return this.success(
           `已创建任务「${title}」并安排到时间轴`,

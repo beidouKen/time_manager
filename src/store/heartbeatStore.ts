@@ -6,6 +6,7 @@ import { ActionLogService } from "@/services/ActionLogService";
 import { DEFAULT_HEARTBEAT_SETTINGS } from "@/types/heartbeat.types";
 import type { HeartbeatSettings } from "@/types/heartbeat.types";
 import type { TimeBlock } from "@/types/timeblock.types";
+import { useChatStore } from "@/store/chatStore";
 
 // 模块级单例，避免每次 action 重复 new
 const timeBlockService = new TimeBlockService();
@@ -29,7 +30,11 @@ async function logHeartbeatAction(
   try {
     const intentStr = `heartbeat_${action}`;
     const userInput = `[heartbeat:${action}] ${block.title}`;
-    const log = await actionLogService.logRequest(userInput, intentStr);
+    // C2/G10: 透传当前会话 ID（system trigger）
+    const currentConversationId = useChatStore.getState().currentConversationId;
+    const log = await actionLogService.logRequest(userInput, intentStr, {
+      conversation_id: currentConversationId ?? undefined,
+    });
     await actionLogService.logToolExecution(log.id, intentStr, {
       blockId: block.id,
       taskId: block.task_id ?? null,

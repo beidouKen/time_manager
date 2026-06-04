@@ -2,6 +2,20 @@ import type { SemanticFrame, SemanticUserGoal } from "@/agent/types";
 
 const DEFAULT_DURATION_MINUTES = 30;
 
+/**
+ * V3.8+ Past Time Disambiguation helpers
+ * ──────────────────────────────────────
+ * BACKFILL_RE  : 补记/记录/刚才/已经做了 等语义。
+ * TODAY_RE     : 明确提到"今天/今晚/今早"（不含"明天/后天"）。
+ * TOMORROW_RE  : 明确提到"明天"（不含"后天"）。
+ * DAY_AFTER_RE : 后天 / 具体日期（yyyy-mm-dd 格式）。
+ */
+const BACKFILL_RE =
+  /补上|补记|记录一下|记一下|记上|刚才|刚刚|已经.*做|已经.*完成|之前做|先前做|做完了|完成了/u;
+const TODAY_RE = /今天|今晚|今早/u;
+const TOMORROW_RE = /明天/u;
+const DAY_AFTER_RE = /后天|\d{4}[-/]\d{1,2}[-/]\d{1,2}/u;
+
 export interface TimeOfDayRange {
   /** 本地小时（含），0-23 */
   startHour: number;
@@ -21,6 +35,21 @@ export class SemanticFrameParser {
     const timeAnchor = this.parseTimeAnchor(normalized);
     const dateRange = this.parseDateRange(normalized);
     const timeOfDay = timeAnchor ? undefined : this.parseTimeOfDay(normalized);
+
+    // ── V3.8+ Past Time Disambiguation ──────────────────────────────────────
+    const possibleBackfill = BACKFILL_RE.test(normalized);
+    // isExplicitToday: user said "今天/今晚/今早" AND did NOT say "明天/后天"
+    const hasToday = TODAY_RE.test(normalized);
+    const hasTomorrow = TOMORROW_RE.test(normalized);
+    const hasDayAfter = DAY_AFTER_RE.test(normalized);
+    const isExplicitToday = hasToday && !hasTomorrow && !hasDayAfter;
+    const explicitDateAnchor: SemanticFrame["explicitDateAnchor"] = hasDayAfter
+      ? "specific_date"
+      : hasTomorrow
+        ? "tomorrow"
+        : hasToday
+          ? "today"
+          : null;
 
     const timeExpressions: SemanticFrame["timeExpressions"] = [];
     if (startNow) {
@@ -58,6 +87,10 @@ export class SemanticFrameParser {
       extractedTitle: title,
       category: normalized.includes("写作") ? "writing" : undefined,
       dateRange: dateRange ?? undefined,
+      // Past Time Disambiguation
+      isExplicitToday,
+      explicitDateAnchor,
+      possibleBackfill,
     };
   }
 
@@ -87,6 +120,22 @@ export class SemanticFrameParser {
   private detectGoal(input: string): SemanticUserGoal {
     if (/现在.*(时候|时间|几点)|几点了|几点啊|当前时间/.test(input)) {
       return "ask_current_time";
+    }
+
+    // V3.8+: 调整最近时间块的时长。
+    // 典型："更改为15分钟"、"改成 30 分钟"、"时长调整为 1 小时"、"改半小时"。
+    // 这里只识别"纯时长调整"语义；带任务名的（如"把开会改成 30 分钟"）由 LLM/其它路径处理。
+    // 注意：不能在中文 `分钟/小时` 后面加 `\b`，JS 的 `\b` 仅识别 ASCII 词边界，会导致整条正则不匹配。
+    if (
+      /^(把?(刚才|刚刚|那个|这个|它))?\s*(更改|改|调整|修改)\s*(为|成|到|至)?\s*\d+\s*(分钟|分|min|小时|h)/iu.test(
+        input
+      ) ||
+      /^(把?(刚才|刚刚|那个|这个|它))?\s*(更改|改|调整|修改)\s*(为|成|到|至)?\s*(半小时|半个小时|一个半小时|一刻钟)/u.test(
+        input
+      ) ||
+      /^时长\s*(更改|改|调整|修改)\s*(为|成|到|至)?\s*(\d+|半个?|一刻钟)/u.test(input)
+    ) {
+      return "update_recent_duration";
     }
 
     // V4+: 批量删除（整天/多日）
@@ -126,7 +175,8 @@ export class SemanticFrameParser {
       return "query_schedule";
     }
 
-    if (/(任务|待办|安排|排一下|写作)/.test(input)) {
+    // "帮我记录一下/记一下" 与 "帮我安排" 语义等价，归入任务创建路径
+    if (/(任务|待办|安排|排一下|写作|帮我记录|记录一下|记一下|帮我记一)/.test(input)) {
       return "create_and_schedule_task";
     }
 
@@ -301,21 +351,45 @@ export class SemanticFrameParser {
     const taskMatch = input.match(/(.+?)(?:任务|待办)/);
     let raw = (taskMatch?.[1] ?? "").trim();
 
+    // 动作/语气填充词
     const FILLERS = [
       "我", "现在", "有一个", "有个", "有", "一个", "个",
       "临时的", "临时", "帮我", "给我", "创建", "安排",
       "排一个", "排个", "新建", "添加", "删除", "删掉",
+      "在",
     ];
-    let changed = true;
-    while (changed) {
-      changed = false;
+    // 时段/日期词：用户可能写"早上""今天下午"等放在标题前，需要剥离避免污染标题
+    const TIME_OF_DAY_WORDS = [
+      "今天", "明天", "后天", "今晚", "今早", "明早",
+      "早上", "上午", "中午", "午后", "下午", "傍晚", "晚上", "夜里", "凌晨",
+      "周一", "周二", "周三", "周四", "周五", "周六", "周日", "周末",
+      "稍后", "等会", "一会儿", "一会",
+    ];
+
+    const stripOnce = (s: string): { s: string; changed: boolean } => {
       for (const f of FILLERS) {
-        if (raw.startsWith(f)) {
-          raw = raw.slice(f.length).trimStart();
-          changed = true;
+        if (s.startsWith(f)) return { s: s.slice(f.length).trimStart(), changed: true };
+      }
+      for (const t of TIME_OF_DAY_WORDS) {
+        if (s.startsWith(t)) {
+          let rest = s.slice(t.length).trimStart();
+          // 允许吞掉一个连接词 "的"，使 "下午的吃饭" → "吃饭"
+          if (rest.startsWith("的")) rest = rest.slice(1).trimStart();
+          return { s: rest, changed: true };
         }
       }
+      return { s, changed: false };
+    };
+
+    let changed = true;
+    while (changed) {
+      const r = stripOnce(raw);
+      raw = r.s;
+      changed = r.changed;
     }
+
+    // 收尾再剥掉可能残留的连接词（前后都剥）
+    raw = raw.replace(/^的+/, "").replace(/的+$/, "").trim();
 
     return raw ? `${raw}任务` : "新任务";
   }

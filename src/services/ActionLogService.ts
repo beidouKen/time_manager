@@ -2,6 +2,7 @@ import { SqliteActionLogRepository } from "@/repositories/sqlite/SqliteActionLog
 import type { IActionLogRepository } from "@/repositories/interfaces/IActionLogRepository";
 import type {
   ActionLog,
+  ActionLogBinding,
   ActionLogStatus,
   CreateActionLogInput,
 } from "@/types/agent.types";
@@ -16,12 +17,18 @@ export class ActionLogService {
 
   async logRequest(
     userInput: string,
-    detectedIntent?: string
+    detectedIntent?: string,
+    binding?: ActionLogBinding
   ): Promise<ActionLog> {
     const input: CreateActionLogInput = {
       user_input: userInput,
       detected_intent: detectedIntent,
       status: "pending",
+      // C2/G10: 透传绑定字段
+      conversation_id: binding?.conversation_id,
+      turn_id: binding?.turn_id,
+      message_id: binding?.message_id,
+      confirmation_id: binding?.confirmation_id,
     };
     const validated = CreateActionLogSchema.parse(input);
     return this.repo.create(validated);

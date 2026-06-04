@@ -47,9 +47,17 @@ import { formatTime } from "@/lib/dateUtils";
 import type { TimeBlock } from "@/types/timeblock.types";
 import { ActionLogService } from "@/services/ActionLogService";
 import { ConfirmationService } from "@/services/ConfirmationService";
+import { ConversationService } from "@/services/ConversationService";
+import { TurnService } from "@/services/TurnService";
+import { SemanticEventService } from "@/services/SemanticEventService";
+import { ActiveContextService } from "@/services/ActiveContextService";
 import { ScheduleService } from "@/services/ScheduleService";
 import { TaskService } from "@/services/TaskService";
 import { TimeBlockService } from "@/services/TimeBlockService";
+import { ContextAssembler } from "@/agent/context/ContextAssembler";
+import type { WorkingMemoryPacket } from "@/agent/context/WorkingMemoryPacket";
+import { ContextTraceService } from "@/services/ContextTraceService";
+import type { RecordStepInput } from "@/services/ContextTraceService";
 
 import { AvailabilityProvider } from "@/agent/time-management/scheduling/AvailabilityProvider";
 import { RecommendationPlanner } from "@/agent/time-management/scheduling/RecommendationPlanner";
@@ -139,10 +147,26 @@ export interface ProcessInputContext {
    * V3.7 P1: 当前是否处于 pending clarification 状态。
    */
   pendingClarification?: boolean;
+  /**
+   * V3.8: 当前存在的推荐类待确认提案快照。
+   * chatStore 从 state.pendingProposal 取出并传入，
+   * 供 DomainRoutingService Stage 2 PendingProposalInterpreter 使用。
+   */
+  pendingProposal?: import("@/agent/types").PendingProposalSnapshot;
+  /** C1: 所属会话 ID（chatStore 传入；缺省时 AgentService fallback 到 ensureDefault） */
+  conversationId?: string;
+  /** C1: chatStore 预生成的用户消息 ID */
+  userMessageId?: string;
+  /** C1: chatStore 预生成的 assistant 消息 ID，用于 completeTurn 绑定 */
+  assistantMessageId?: string;
 }
 
 interface ActionLogPort {
-  logRequest(userInput: string, detectedIntent?: string): Promise<{ id: string }>;
+  logRequest(
+    userInput: string,
+    detectedIntent?: string,
+    binding?: { conversation_id?: string; turn_id?: string; message_id?: string; confirmation_id?: string }
+  ): Promise<{ id: string }>;
   logToolExecution(
     logId: string,
     toolName: string,
@@ -159,6 +183,16 @@ interface AgentServiceOptions {
   scheduleService?: ScheduleService;
   logService?: ActionLogPort;
   confirmService?: ConfirmationService;
+  /** C1: Turn 生命周期服务（不传则使用 SqliteTurnRepository） */
+  turnService?: TurnService;
+  /** C1: Conversation 服务（不传则使用 SqliteConversationRepository） */
+  conversationService?: ConversationService;
+  /** C2: 语义事件服务（不传则使用 SqliteSemanticEventRepository） */
+  semanticEventService?: SemanticEventService;
+  /** C3: ActiveContext 服务（不传则使用 SqliteActiveContextRepository） */
+  activeContextService?: ActiveContextService;
+  /** C6: trace step 服务（不传则不写入 trace step） */
+  contextTraceService?: ContextTraceService;
   /** Phase 1+: 可替换的 Planner 实现（默认使用 CompositePlanner）。测试时可注入 StubPlanner。 */
   plannerPort?: PlannerPort;
   /**
@@ -176,15 +210,39 @@ interface AgentServiceOptions {
   notificationAdapter?: NotificationAdapter;
 }
 
+// ─── C5: Sentinel Errors ──────────────────────────────────────────────────────
+
+export class ConversationDeletedError extends Error {
+  constructor(conversationId: string) {
+    super(`会话已删除（id=${conversationId}），请新建会话再试`);
+    this.name = "ConversationDeletedError";
+  }
+}
+
+export class ConfirmationStaleError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ConfirmationStaleError";
+  }
+}
+
 // ─── AgentService ───────────────────────────────────────────────────────────
 
 export class AgentService {
   private router: ToolRouter;
   private logService: ActionLogPort;
   private confirmService: ConfirmationService;
+  private turnService: TurnService;
+  private conversationService: ConversationService;
+  private semanticEventService: SemanticEventService;
+  private activeContextService: ActiveContextService;
   private taskService: TaskService;
   private timeBlockService: TimeBlockService;
   private scheduleService: ScheduleService;
+  /** C4: 统一上下文组装器 */
+  private contextAssembler: ContextAssembler;
+  /** C6: trace step 服务（可选，null 时不写入） */
+  private contextTraceService: ContextTraceService | null;
 
   // V3：LLM 相关组件
   private experienceContextBuilder: ConversationContextBuilder;
@@ -209,9 +267,23 @@ export class AgentService {
     this.router = new ToolRouter();
     this.logService = options.logService ?? new ActionLogService();
     this.confirmService = options.confirmService ?? new ConfirmationService();
+    this.turnService = options.turnService ?? new TurnService();
+    this.conversationService = options.conversationService ?? new ConversationService();
+    this.semanticEventService = options.semanticEventService ?? new SemanticEventService();
+    this.activeContextService = options.activeContextService ?? new ActiveContextService();
     this.taskService = options.taskService ?? new TaskService();
     this.timeBlockService = options.timeBlockService ?? new TimeBlockService();
     this.scheduleService = options.scheduleService ?? new ScheduleService();
+
+    this.contextAssembler = new ContextAssembler(
+      this.conversationService,
+      this.confirmService,
+      this.semanticEventService,
+      this.activeContextService,
+      this.taskService,
+      this.timeBlockService
+    );
+    this.contextTraceService = options.contextTraceService ?? null;
 
     this.experienceContextBuilder = new ConversationContextBuilder();
     this.semanticFrameParser = new SemanticFrameParser();
@@ -259,7 +331,11 @@ export class AgentService {
       : undefined;
 
     // V3.7 P1: 三段式域路由服务（DomainRoutingService 内部管理 fallback router）
-    this.domainRoutingService = new DomainRoutingService(resolvedLLMClient);
+    this.domainRoutingService = new DomainRoutingService(
+      resolvedLLMClient,
+      this.activeContextService,
+      this.confirmService,
+    );
 
     this.handlers = new Map<AgentDomain, AgentHandler>([
       ["general_chat", new LLMDirectHandler("general_chat", chatExecutor)],
@@ -272,6 +348,54 @@ export class AgentService {
     ]);
 
     this.registerTools();
+  }
+
+  // ─── C5: 入口防御层 ──────────────────────────────────────────────────────────
+
+  /**
+   * C5 §3.5: 断言会话仍然有效（deleted_at IS NULL）。
+   * 已软删时抛 ConversationDeletedError，processInput 顶层 catch 组装 boundary 响应。
+   */
+  private async assertConversationAlive(conversationId: string): Promise<void> {
+    try {
+      const conv = await this.conversationService.getConversation(conversationId);
+      if (conv?.deleted_at) {
+        throw new ConversationDeletedError(conversationId);
+      }
+    } catch (e) {
+      if (e instanceof ConversationDeletedError) throw e;
+      // DB 不可用时降级不阻塞
+    }
+  }
+
+  /**
+   * C5 §3.5: 断言 confirmation 属于指定会话且会话未软删。
+   * mismatch 或所在 conversation 已软删时抛 ConfirmationStaleError。
+   */
+  private async assertConfirmationBelongsToConversation(
+    confirmationId: string,
+    conversationId: string
+  ): Promise<void> {
+    try {
+      const conf = await this.confirmService.getById(confirmationId);
+      if (!conf) return; // 不存在的 confirmation 由下游校验处理
+      if (conf.conversation_id && conf.conversation_id !== conversationId) {
+        throw new ConfirmationStaleError(
+          `confirmation ${confirmationId} 属于会话 ${conf.conversation_id}，不属于当前会话 ${conversationId}`
+        );
+      }
+      if (conf.conversation_id) {
+        const conv = await this.conversationService.getConversation(conf.conversation_id);
+        if (conv?.deleted_at) {
+          throw new ConfirmationStaleError(
+            `confirmation ${confirmationId} 所属会话已删除，无法执行`
+          );
+        }
+      }
+    } catch (e) {
+      if (e instanceof ConfirmationStaleError) throw e;
+      // DB 不可用时降级不阻塞
+    }
   }
 
   private createDefaultLLMClient(): LLMClient | undefined {
@@ -304,43 +428,450 @@ export class AgentService {
 
   // ─── 主入口：处理用户输入（V3.5 LLM-first，无 fallback） ───────────────────
 
+  // ─── C2: SemanticEvent 聚合写入 ─────────────────────────────────────────
+
+  /**
+   * 在 turn 完成/失败后写入一条 SemanticEvent（聚合写入策略）。
+   * 失败只 warn，不影响主流程返回。
+   */
+  /** C3: 取 confirmation.expires_at，用于 active context 过期时间。失败时返回 undefined。 */
+  private async _getConfirmationExpiresAt(confirmationId: string): Promise<string | undefined> {
+    try {
+      const conf = await this.confirmService.getById(confirmationId);
+      return conf?.expires_at ?? undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async recordTurnEvents(input: {
+    conversationId: string;
+    turnId?: string;
+    messageId?: string;
+    trigger: "user_message" | "confirm_action" | "reject_action" | "refine_action";
+    response?: AgentResponse;
+    errorMessage?: string;
+    relatedConfirmationId?: string;
+    relatedProposalId?: string;
+  }): Promise<void> {
+    try {
+      const {
+        conversationId, turnId, messageId, trigger,
+        response, errorMessage, relatedConfirmationId, relatedProposalId,
+      } = input;
+
+      // ── 1. 推断 context_role ──────────────────────────────────────────────
+      let context_role: import("@/types/agent.types").SemanticEventContextRole;
+      if (trigger === "confirm_action") context_role = "confirmation_reply";
+      else if (trigger === "reject_action") context_role = "rejection_reply";
+      else if (trigger === "refine_action") context_role = "modification";
+      else if (errorMessage) context_role = "new_intent";
+      else {
+        const routerSource = response?.metadata?.agentTrace?.routerSource;
+        context_role = routerSource === "contextual" ? "continuation" : "new_intent";
+      }
+
+      // ── 2. 推断 intent ────────────────────────────────────────────────────
+      let intent: import("@/types/agent.types").SemanticEventIntent;
+      if (trigger === "confirm_action") intent = "confirm_action";
+      else if (trigger === "reject_action") intent = "reject_action";
+      else if (trigger === "refine_action") intent = "refine_action";
+      else if (errorMessage) intent = "error";
+      else {
+        const userGoal = response?.metadata?.agentTrace?.semanticFrame?.userGoal;
+        const domain = response?.metadata?.agentTrace?.domain;
+        if (userGoal === "create_and_schedule_task" || userGoal === "create_reminder")
+          intent = "create_task";
+        else if (userGoal === "query_schedule" || userGoal === "query_schedule_range")
+          intent = "query_schedule";
+        else if (userGoal === "delete_task" || userGoal === "batch_delete_tasks")
+          intent = "delete_task";
+        else if (userGoal === "batch_reschedule_day") intent = "reschedule";
+        else if (userGoal === "defer_task") intent = "reschedule";
+        else if (domain === "time_management") intent = "schedule_task";
+        else if (domain === "general_chat" || userGoal === "general_chat") intent = "casual_chat";
+        else intent = "ask_question";
+      }
+
+      // ── 3. 推断 domain ────────────────────────────────────────────────────
+      const traceDomain = response?.metadata?.agentTrace?.domain ?? response?.metadata?.intent as string | undefined;
+      let domain: import("@/types/agent.types").SemanticEventDomain;
+      if (trigger === "confirm_action" || trigger === "reject_action" || trigger === "refine_action") {
+        domain = "time_management";
+      } else if (traceDomain === "time_management") domain = "time_management";
+      else if (traceDomain === "general_chat") domain = "general_chat";
+      else if (traceDomain === "knowledge_qa") domain = "knowledge_qa";
+      else if (traceDomain === "writing_assistant") domain = "writing_assistant";
+      else if (traceDomain === "assistant_meta") domain = "assistant_meta";
+      else if (traceDomain === "feedback") domain = "feedback";
+      else if (traceDomain === "low_signal") domain = "low_signal";
+      else domain = "unknown";
+
+      // ── 4. 推断 source ────────────────────────────────────────────────────
+      const routerSource = response?.metadata?.agentTrace?.routerSource;
+      let source: import("@/types/agent.types").SemanticEventSource;
+      if (trigger === "confirm_action" || trigger === "reject_action" || trigger === "refine_action")
+        source = "tool";
+      else if (routerSource === "llm") source = "llm";
+      else source = "rule";
+
+      // ── 5. 推断 confidence ────────────────────────────────────────────────
+      const confidence =
+        response?.metadata?.agentTrace?.llmDecision?.confidence ??
+        response?.metadata?.confidence ??
+        0.5;
+
+      await this.semanticEventService.recordEvent({
+        conversation_id: conversationId,
+        turn_id: turnId,
+        message_id: messageId,
+        domain,
+        intent,
+        context_role,
+        confidence,
+        related_task_id: response?.toolResult?.relatedTaskId ?? response?.metadata?.relatedTaskId,
+        related_time_block_id: response?.toolResult?.relatedTimeBlockId ?? response?.metadata?.relatedTimeBlockId,
+        related_confirmation_id: relatedConfirmationId,
+        related_proposal_id: relatedProposalId,
+        source,
+      });
+    } catch (err) {
+      console.warn("[AgentService] recordTurnEvents failed:", err);
+    }
+  }
+
+  // ─── C6: Trace Step 聚合写入 ─────────────────────────────────────────────
+
+  /**
+   * C6: 批量写入 trace step（turn 结束前调用一次）。
+   * 失败只 warn，不影响主流程返回。
+   */
+  private async recordTraceSteps(
+    steps: RecordStepInput[],
+  ): Promise<void> {
+    if (!this.contextTraceService || steps.length === 0) return;
+    try {
+      await this.contextTraceService.recordSteps(steps);
+    } catch (err) {
+      console.warn("[AgentService] recordTraceSteps failed:", err);
+    }
+  }
+
   async processInput(
     userInput: string,
     context?: ProcessInputContext
   ): Promise<AgentResponse> {
-    const experienceContext = this.timeManagementAgent.buildContext(
+    // C1: 获取/确保 conversationId，启动 Turn
+    let conversationId = context?.conversationId;
+    if (!conversationId) {
+      try {
+        const conv = await this.conversationService.ensureDefaultConversation();
+        conversationId = conv.id;
+      } catch {
+        // DB 不可用（测试环境）时降级，不影响主流程
+      }
+    }
+
+    // C5: 防御层 — 已软删会话不处理
+    if (conversationId) {
+      try {
+        await this.assertConversationAlive(conversationId);
+      } catch (e) {
+        if (e instanceof ConversationDeletedError) {
+          return {
+            message: "该会话已删除，请新建会话再继续对话。",
+            intent: { intent: "unknown", confidence: 0, args: {}, rawInput: userInput },
+            metadata: { resultType: "failure", source: "llm" },
+          };
+        }
+      }
+    }
+
+    let turn: import("@/types/agent.types").Turn | undefined;
+    try {
+      if (conversationId) {
+        turn = await this.turnService.startTurn({
+          conversationId,
+          userMessageId: context?.userMessageId,
+          trigger: "user_message",
+        });
+      }
+    } catch {
+      // Turn 启动失败时不中断主流程
+    }
+
+    // C2: 确保始终有 userMessageId（chatStore 通常预生成；直接测试调用时此处兜底）
+    const effectiveUserMessageId = context?.userMessageId ?? crypto.randomUUID();
+
+    try {
+      const response = await this._processInputInner(userInput, context, {
+        conversationId,
+        turnId: turn?.id,
+        messageId: effectiveUserMessageId,
+      });
+      // C2: 写入 SemanticEvent（在 completeTurn 前）
+      if (conversationId) {
+        // 检测是否为细化推荐路径（user 有 pendingProposal 且 response 产出新 proposal）
+        const wasRefine =
+          !!context?.pendingProposal && !!response.metadata?.pendingProposal;
+        const trigger = wasRefine ? "refine_action" : "user_message";
+        const relatedProposalId = wasRefine
+          ? (response.confirmationId ?? undefined)
+          : undefined;
+        await this.recordTurnEvents({
+          conversationId,
+          turnId: turn?.id,
+          messageId: effectiveUserMessageId,
+          trigger,
+          response,
+          relatedProposalId,
+        });
+
+        // C3: 写入 ActiveContext（与 recordTurnEvents 同样宽容策略）
+        try {
+          if (response.confirmationId) {
+            const confirmedExpiresAt = await this._getConfirmationExpiresAt(
+              response.confirmationId,
+            );
+            const snapshot = response.metadata?.pendingProposal;
+            if (snapshot) {
+              // recommendation 类：写 proposal snapshot
+              const proposalId =
+                snapshot.proposalId ?? (snapshot.proposalId = crypto.randomUUID());
+              if (wasRefine && context?.pendingProposal?.confirmationId) {
+                // refine 路径：replaceForRefine 已在 refineRecommendation 内写；跳过
+              } else {
+                await this.activeContextService.createForProposal({
+                  conversation_id: conversationId,
+                  confirmation_id: response.confirmationId,
+                  proposal_id: proposalId,
+                  proposal_snapshot: snapshot,
+                  turn_id: turn?.id,
+                  expires_at: confirmedExpiresAt,
+                });
+              }
+            } else {
+              // destructive confirmation
+              await this.activeContextService.createForConfirmation({
+                conversation_id: conversationId,
+                confirmation_id: response.confirmationId,
+                turn_id: turn?.id,
+                expires_at: confirmedExpiresAt,
+              });
+            }
+          }
+        } catch (e) {
+          console.warn("[AgentService] C3 active context write failed:", e);
+        }
+      }
+      // C1: completeTurn
+      if (turn) {
+        try {
+          await this.turnService.completeTurn(turn.id, context?.assistantMessageId ?? "pending");
+        } catch { /* ignore */ }
+      }
+      return {
+        ...response,
+        metadata: {
+          ...response.metadata,
+          conversationId,
+          turnId: turn?.id,
+        },
+      };
+    } catch (e) {
+      // C2: 写入 error event
+      if (conversationId) {
+        await this.recordTurnEvents({
+          conversationId,
+          turnId: turn?.id,
+          messageId: effectiveUserMessageId,
+          trigger: "user_message",
+          errorMessage: String(e),
+        });
+      }
+      if (turn) {
+        try { await this.turnService.failTurn(turn.id, String(e)); } catch { /* ignore */ }
+      }
+      throw e;
+    }
+  }
+
+  private async _processInputInner(
+    userInput: string,
+    context: ProcessInputContext | undefined,
+    turnCtx: { conversationId?: string; turnId?: string; messageId?: string } | null
+  ): Promise<AgentResponse> {
+    // C6: 本 turn 内累积的 trace step（除 execute 外聚合写入）
+    const pendingSteps: RecordStepInput[] = [];
+    let stepOrder = 0;
+    const conversationId = turnCtx?.conversationId ?? context?.conversationId;
+    const turnId = turnCtx?.turnId;
+    const messageId = turnCtx?.messageId ?? context?.userMessageId;
+
+    const mkStep = (
+      step_type: string,
+      input_snapshot?: Record<string, unknown>,
+      output_snapshot?: Record<string, unknown>,
+      extra?: { latency_ms?: number; error?: string }
+    ): RecordStepInput | null => {
+      if (!conversationId || !turnId) return null;
+      return {
+        turn_id: turnId,
+        conversation_id: conversationId,
+        message_id: messageId,
+        step_type,
+        step_order: stepOrder++,
+        input_snapshot,
+        output_snapshot,
+        ...extra,
+      };
+    };
+
+    // C4: 在 startTurn 之后、classify 之前，组装一次 WorkingMemoryPacket。
+    // 同一 turn 内复用，失败时 packet 退化为最小值，不阻塞主流程。
+    let workingMemoryPacket: WorkingMemoryPacket | undefined;
+    try {
+      workingMemoryPacket = await this.contextAssembler.assemble({
+        userInput,
+        conversationId,
+        turnId,
+        pendingConfirmationId: context?.pendingConfirmationId,
+      });
+
+      // C6 §snapshot-migration: context_assemble step（取代 C4 workingMemorySnapshot 全文写 metadata）
+      const snapshot = workingMemoryPacket ? ContextAssembler.toSnapshot(workingMemoryPacket) : undefined;
+      const assembleStep = mkStep(
+        "context_assemble",
+        { userInput, pendingConfirmationId: context?.pendingConfirmationId ?? null },
+        snapshot ? { slotSummaries: snapshot.slotSummaries, assembledAt: snapshot.assembledAt } : undefined,
+      );
+      if (assembleStep) pendingSteps.push(assembleStep);
+    } catch {
+      // assemble 整体不应抛错，这里是双重保险
+    }
+
+    const baseContext = this.timeManagementAgent.buildContext(
       context,
       this.getConversationMemorySnapshot()
     );
+    const experienceContext = {
+      ...baseContext,
+      conversationId,
+      turnId,
+      messageId,
+    };
     const route = await this.domainRoutingService.classify(userInput, {
       pendingConfirmationId: context?.pendingConfirmationId,
       pendingClarification: context?.pendingClarification,
+      pendingProposal: context?.pendingProposal,
+      currentDatetime: experienceContext.currentDatetime,
       lastAssistantText: (() => {
         const assistantMsgs = context?.recentMessages?.filter((m) => m.role === "assistant") ?? [];
         return assistantMsgs[assistantMsgs.length - 1]?.content;
       })(),
       timezone: context?.timezone,
-    });
+      // C3: 透传 conversationId 给 Stage 0 ActiveContextResolver
+      conversationId,
+    }, workingMemoryPacket);
 
-    // V3.7 P1: Contextual pre-router 检测到 pending confirmation 快捷回复
+    // C6: context_resolve step（基于 DomainRoutingService 内部 Stage 0 出口信息）
+    {
+      const resolveStep = mkStep(
+        "context_resolve",
+        { rawInput: userInput, pendingConfirmationId: context?.pendingConfirmationId ?? null },
+        {
+          routerSource: route.routerSource ?? "fallback",
+          hasPendingAction: !!route.pendingAction,
+          pendingActionKind: route.pendingAction?.kind ?? null,
+        },
+      );
+      if (resolveStep) pendingSteps.push(resolveStep);
+    }
+
+    // C6: route step（DomainRoutingService.classify 出口）
+    {
+      const routeStep = mkStep(
+        "route",
+        { rawInput: userInput },
+        {
+          domain: route.domain,
+          routerSource: route.routerSource ?? "fallback",
+          confidence: route.confidence,
+          reason: route.llmDecision?.reason ?? route.fallbackReason ?? null,
+        },
+      );
+      if (routeStep) pendingSteps.push(routeStep);
+    }
+
+    // V3.7 P1 / V3.8: 路由器检测到 pending confirmation 快捷回复或细化指令
+    // 注意：这里调用内部方法，避免双重 Turn 创建
     if (route.pendingAction) {
-      const { kind, confirmationId } = route.pendingAction;
+      const { kind, confirmationId, refinements } = route.pendingAction;
+      await this.recordTraceSteps(pendingSteps);
       if (kind === "confirm") {
-        return this.confirmAction(confirmationId);
+        return this._innerConfirmAction(confirmationId);
       } else if (kind === "reject") {
-        return this.rejectAction(confirmationId);
-      } else if (kind === "adjust_later" || kind === "adjust_earlier") {
-        return this.adjustRecommendation(confirmationId, kind, experienceContext);
+        return this._innerRejectAction(confirmationId);
+      } else if (kind === "refine") {
+        return this.refineRecommendation(confirmationId, refinements ?? {}, experienceContext);
       }
     }
 
     if (route.domain === "time_management") {
       const semanticFrame = this.timeManagementAgent.parse(userInput);
+
+      // C6: parse step（SemanticFrameParser 出口）
+      {
+        const parseStep = mkStep(
+          "parse",
+          { rawInput: userInput },
+          {
+            userGoal: semanticFrame.userGoal,
+            extractedTitle: semanticFrame.extractedTitle ?? null,
+            durationMinutes: semanticFrame.durationExpressions[0]?.minutes ?? null,
+            confidence: semanticFrame.confidence,
+          },
+        );
+        if (parseStep) pendingSteps.push(parseStep);
+      }
+
       const handled = await this.timeManagementAgent.handle({
         userInput,
         context: experienceContext,
         semanticFrame,
+        packet: workingMemoryPacket,
       });
+
+      // C6: plan step（CompositePlanner/LLMExperiencePlanner 出口）
+      {
+        const traceAP = handled.metadata.agentTrace?.actionPlan;
+        const planStep = mkStep(
+          "plan",
+          { userGoal: semanticFrame.userGoal },
+          {
+            plannerSource: handled.metadata.agentTrace?.planner ?? "experience",
+            planKind: traceAP?.kind ?? null,
+            toolName: traceAP?.toolName ?? null,
+            requiresConfirmation: traceAP?.requiresConfirmation ?? false,
+            riskLevel: traceAP?.riskLevel ?? null,
+          },
+        );
+        if (planStep) pendingSteps.push(planStep);
+      }
+
+      // C6: confirm_create step（若有 confirmationId）
+      if (handled.response.confirmationId) {
+        const confirmStep = mkStep(
+          "confirm_create",
+          { planKind: handled.metadata.agentTrace?.actionPlan?.kind ?? null },
+          {
+            confirmationId: handled.response.confirmationId,
+            actionType: handled.metadata.agentTrace?.actionPlan?.kind ?? null,
+            riskLevel: handled.metadata.agentTrace?.actionPlan?.riskLevel ?? null,
+          },
+        );
+        if (confirmStep) pendingSteps.push(confirmStep);
+      }
 
       const trace = handled.metadata.agentTrace;
       if (trace?.semanticFrame && trace?.actionPlan) {
@@ -357,6 +888,25 @@ export class AgentService {
         }
       }
 
+      await this.recordTraceSteps(pendingSteps);
+
+      // C6 §snapshot-migration: workingMemorySnapshot 降级为 traceStepIds 引用
+      const assembleStepIds = pendingSteps
+        .filter((s) => s.step_type === "context_assemble")
+        .map((_, i) => `${turnId ?? "unknown"}_assemble_${i}`);
+      const updatedMetadata = {
+        ...handled.metadata,
+        agentTrace: handled.metadata.agentTrace
+          ? {
+              ...handled.metadata.agentTrace,
+              traceId: turnId,
+              workingMemorySnapshot: assembleStepIds.length
+                ? { traceStepIds: assembleStepIds }
+                : handled.metadata.agentTrace.workingMemorySnapshot,
+            }
+          : handled.metadata.agentTrace,
+      };
+
       return {
         message: handled.response.message ?? "",
         intent: handled.intent,
@@ -364,7 +914,7 @@ export class AgentService {
         refreshHints: handled.response.refreshHints,
         actionLogId: handled.metadata.actionLogId,
         confirmationId: handled.response.confirmationId,
-        metadata: handled.metadata,
+        metadata: updatedMetadata,
       };
     }
 
@@ -379,8 +929,9 @@ export class AgentService {
       }
     } else {
       const handler = this.handlers.get(route.domain);
+      // C4: 透传 workingMemoryPacket 给 handler（LLMDirectHandler 使用）
       handlerResult = handler
-        ? await handler.handle(userInput, experienceContext)
+        ? await handler.handle(userInput, experienceContext, workingMemoryPacket)
         : { domain: "general_chat", responseKind: "general" };
     }
 
@@ -395,8 +946,12 @@ export class AgentService {
 
     const log = await this.logService.logRequest(userInput, route.domain);
     await this.logService.logSuccess(log.id, { domain: route.domain });
+    // binding 在此路径无 conversationId（由 processInput 层持有），不透传
+
+    await this.recordTraceSteps(pendingSteps);
 
     const trace: AgentTrace = {
+      traceId: turnId,
       planner: "router",
       domain: route.domain,
       mode: "direct_response",
@@ -409,6 +964,10 @@ export class AgentService {
       actionPlan: plan,
       toolResults: [],
       finalResponse: message,
+      // C6 §snapshot-migration: workingMemorySnapshot 降级为 traceStepIds 引用
+      workingMemorySnapshot: turnId
+        ? { traceStepIds: [`${turnId}_assemble_0`] }
+        : undefined,
     };
 
     return {
@@ -502,7 +1061,106 @@ export class AgentService {
 
   // ─── 确认执行 ────────────────────────────────────────────────────────────
 
-  async confirmAction(confirmationId: string): Promise<AgentResponse> {
+  /** 内部版：无 Turn 管理，供 processInput 内部委托使用 */
+  private async _innerConfirmAction(confirmationId: string): Promise<AgentResponse> {
+    return this._confirmActionCore(confirmationId);
+  }
+
+  /** 内部版：无 Turn 管理，供 processInput 内部委托使用 */
+  private async _innerRejectAction(confirmationId: string): Promise<AgentResponse> {
+    return this._rejectActionCore(confirmationId);
+  }
+
+  async confirmAction(confirmationId: string, context?: { conversationId?: string; assistantMessageId?: string }): Promise<AgentResponse> {
+    let turn: import("@/types/agent.types").Turn | undefined;
+    const conversationId = context?.conversationId;
+
+    // C5: 防御层 — 跨会话 confirmation 引用
+    if (conversationId) {
+      try {
+        await this.assertConfirmationBelongsToConversation(confirmationId, conversationId);
+      } catch (e) {
+        if (e instanceof ConfirmationStaleError) {
+          return {
+            message: this.composeBoundaryMessage("", undefined, "confirmation_stale"),
+            intent: { intent: "unknown", confidence: 0, args: {}, rawInput: "" },
+          };
+        }
+      }
+    }
+
+    if (conversationId) {
+      try {
+        turn = await this.turnService.startTurn({ conversationId, trigger: "confirm_action" });
+      } catch { /* ignore */ }
+    }
+    try {
+      const response = await this._confirmActionCore(confirmationId);
+      // C2: 写入 SemanticEvent
+      if (conversationId) {
+        await this.recordTurnEvents({
+          conversationId,
+          turnId: turn?.id,
+          trigger: "confirm_action",
+          response,
+          relatedConfirmationId: confirmationId,
+        });
+      }
+      // C3: resolveOnConfirm
+      try {
+        await this.activeContextService.resolveOnConfirm(confirmationId);
+      } catch (e) {
+        console.warn("[AgentService] C3 resolveOnConfirm failed:", e);
+      }
+      // C6: confirm_resolve + execute trace steps
+      if (conversationId && turn?.id) {
+        const steps: RecordStepInput[] = [
+          {
+            turn_id: turn.id,
+            conversation_id: conversationId,
+            step_type: "confirm_resolve",
+            step_order: 0,
+            input_snapshot: { confirmationId },
+            output_snapshot: {
+              success: response.toolResult?.success ?? false,
+              toolName: response.metadata?.toolName ?? null,
+            },
+          },
+          {
+            turn_id: turn.id,
+            conversation_id: conversationId,
+            step_type: "execute",
+            step_order: 1,
+            input_snapshot: { toolName: response.metadata?.toolName ?? null, confirmationId },
+            output_snapshot: {
+              success: response.toolResult?.success ?? false,
+              relatedTaskId: response.toolResult?.relatedTaskId ?? null,
+              relatedTimeBlockId: response.toolResult?.relatedTimeBlockId ?? null,
+            },
+          },
+        ];
+        await this.recordTraceSteps(steps);
+      }
+      if (turn) {
+        try { await this.turnService.completeTurn(turn.id, context?.assistantMessageId ?? "pending"); } catch { /* ignore */ }
+      }
+      return { ...response, metadata: { ...response.metadata, conversationId, turnId: turn?.id } };
+    } catch (e) {
+      if (conversationId) {
+        await this.recordTurnEvents({
+          conversationId,
+          turnId: turn?.id,
+          trigger: "confirm_action",
+          errorMessage: String(e),
+          relatedConfirmationId: confirmationId,
+        });
+      }
+      if (turn) { try { await this.turnService.failTurn(turn.id, String(e)); } catch { /* ignore */ } }
+      throw e;
+    }
+  }
+
+  private async _confirmActionCore(confirmationId: string): Promise<AgentResponse> {
     // 先刷新过期状态，防止前端持有 pending confirmation 但实际已超时
     await this.confirmService.expireStale();
 
@@ -536,7 +1194,13 @@ export class AgentService {
     // 记录确认执行日志
     const log = await this.logService.logRequest(
       `[确认执行] ${confirmation.action_type}`,
-      confirmation.action_type
+      confirmation.action_type,
+      {
+        conversation_id: confirmation.conversation_id,
+        turn_id: confirmation.turn_id,
+        message_id: confirmation.message_id,
+        confirmation_id: confirmationId,
+      }
     );
     await this.logService.logToolExecution(log.id, confirmation.tool_name, args);
 
@@ -557,6 +1221,24 @@ export class AgentService {
     if (result.success) {
       await this.logService.logSuccess(log.id, result.data);
       this.trackLastEntities(confirmation.tool_name, result);
+      // V3.8+: 让确认成功后的 lastCreatedTaskId / lastScheduledTimeBlockIds
+      // 同步更新，便于后续"更改为 X 分钟"等指代型语句找到刚确认的对象。
+      if (result.relatedTaskId) {
+        this.rememberMentionedTask(result.relatedTaskId);
+        if (
+          confirmation.tool_name === "schedule_task" ||
+          confirmation.tool_name === "create_time_block"
+        ) {
+          this.lastCreatedTaskId = result.relatedTaskId;
+        }
+      }
+      if (result.relatedTimeBlockId) {
+        this.lastScheduledTimeBlockIds = this.prependUnique(
+          this.lastScheduledTimeBlockIds,
+          result.relatedTimeBlockId
+        );
+      }
+      this.lastToolResults = [result, ...this.lastToolResults].slice(0, 5);
     } else {
       await this.logService.logFailure(log.id, result.error ?? result.message);
     }
@@ -597,11 +1279,11 @@ export class AgentService {
     };
   }
 
-  // ─── 时间调整：重新推荐更晚/更早的时段 ────────────────────────────────────
+  // ─── V3.8: 细化推荐——合并 refinements 后重新出候选并替换 pending ──────────
 
-  private async adjustRecommendation(
+  private async refineRecommendation(
     confirmationId: string,
-    direction: "adjust_later" | "adjust_earlier",
+    refinements: NonNullable<import("@/agent/types").RefinementDecision["refinements"]>,
     context: import("@/agent/types").AgentExperienceContext
   ): Promise<AgentResponse> {
     const confirmation = await this.confirmService.getById(confirmationId);
@@ -617,41 +1299,95 @@ export class AgentService {
     const prevDuration = Number(prevArgs.estimated_duration_minutes ?? prevArgs.duration ?? 30);
     const prevEnd = prevArgs.end_time as string | undefined;
     const prevStart = prevArgs.start_time as string | undefined;
+    const prevCategory = prevArgs.category as string | undefined;
 
-    // 取消旧的 pending recommendation
-    try { await this.confirmService.reject(confirmationId); } catch { /* ignore */ }
-
-    // 计算新的推荐起点约束
     const now = new Date(context.currentDatetime);
-    let notBefore: Date;
-    if (direction === "adjust_later") {
-      // 从上次推荐的结束时间之后开始找（至少也不早于 now+buffer）
-      notBefore = prevEnd ? new Date(prevEnd) : now;
-    } else {
-      // 提前：从上次推荐起点减 duration 前开始（不得早于 now+buffer）
-      const prevStartMs = prevStart ? new Date(prevStart).getTime() : now.getTime();
-      notBefore = new Date(Math.max(prevStartMs - prevDuration * 60 * 1000, now.getTime()));
+
+    // ── 合并 refinements ─────────────────────────────────────────────────────
+    const newDuration = refinements.durationMinutes ?? prevDuration;
+
+    // anchorTime: 绝对时间锚点，直接作为起点，跳过 planner
+    if (refinements.anchorTime) {
+      const anchorStart = new Date(refinements.anchorTime.iso);
+      const anchorEnd = new Date(anchorStart.getTime() + newDuration * 60 * 1000);
+      try { await this.confirmService.reject(confirmationId); } catch { /* ignore */ }
+
+      const log = await this.logService.logRequest(`[细化推荐:锚点时间] ${prevTitle}`, "refine_recommendation");
+      const newPending = await this.confirmService.createConfirmation({
+        action_type: confirmation.action_type,
+        tool_name: "schedule_task",
+        tool_args_json: JSON.stringify({
+          title: prevTitle,
+          category: prevCategory,
+          duration: newDuration,
+          estimated_duration_minutes: newDuration,
+          start_time: anchorStart.toISOString(),
+          end_time: anchorEnd.toISOString(),
+        }),
+        risk_level: "low",
+        description: `按指定时间安排「${prevTitle}」`,
+      });
+      await this.logService.logSuccess(log.id, { newConfirmationId: newPending.id });
+
+      // C3: replaceForRefine（anchorTime path）
+      const refineResponse = this.buildRefineResponse(prevTitle, newDuration, newPending.id, anchorStart.toISOString(), anchorEnd.toISOString(), context, prevCategory, log.id, confirmation.action_type);
+      if (context.conversationId) {
+        try {
+          const newSnapshot = refineResponse.metadata?.pendingProposal;
+          if (newSnapshot) {
+            const newProposalId = newSnapshot.proposalId ?? (newSnapshot.proposalId = crypto.randomUUID());
+            await this.activeContextService.replaceForRefine({
+              old_confirmation_id: confirmationId,
+              new_confirmation_id: newPending.id,
+              new_proposal_id: newProposalId,
+              new_proposal_snapshot: newSnapshot,
+              conversation_id: context.conversationId,
+              turn_id: context.turnId,
+            });
+          }
+        } catch (e) {
+          console.warn("[AgentService] C3 replaceForRefine (anchor) failed:", e);
+        }
+      }
+      return refineResponse;
     }
 
-    // 重新用 RecommendationPlanner 推荐，notBefore 作为自定义 "now" 以跳过已推荐时段
+    // 计算搜索起点（notBefore）
+    let notBefore: Date = now;
+    let dateOffset = 0;
+
+    if (refinements.dateOffsetDays !== undefined && refinements.dateOffsetDays !== 0) {
+      // 日期偏移：直接设 date，不限制 notBefore 的时间
+      dateOffset = refinements.dateOffsetDays;
+      notBefore = now; // 使用目标日期的窗口开始
+    } else if (refinements.direction === "later") {
+      notBefore = prevEnd ? new Date(Math.max(new Date(prevEnd).getTime(), now.getTime())) : now;
+    } else if (refinements.direction === "earlier") {
+      const prevStartMs = prevStart ? new Date(prevStart).getTime() : now.getTime();
+      notBefore = new Date(Math.max(prevStartMs - newDuration * 60 * 1000, now.getTime()));
+    }
+
+    const targetDate = new Date(now);
+    targetDate.setDate(targetDate.getDate() + dateOffset);
+
+    // 重新用 RecommendationPlanner 推荐
     const availabilityProvider = new AvailabilityProvider(this.timeBlockService);
     const reasoner = new SchedulingReasoner();
     const planner = new RecommendationPlanner(availabilityProvider, reasoner);
 
     const candidates = await planner.plan({
-      date: now,
-      durationMinutes: prevDuration,
+      date: targetDate,
+      durationMinutes: newDuration,
       timezone: context.timezone,
       now: notBefore,
-      bufferMinutes: 0, // notBefore 已经是截断点，不再叠加 buffer
+      bufferMinutes: refinements.direction || refinements.dateOffsetDays !== undefined ? 0 : undefined,
+      timeOfDay: refinements.timeOfDay,
     });
 
-    const log = await this.logService.logRequest(
-      `[调整推荐:${direction}] ${prevTitle}`,
-      "adjust_recommendation"
-    );
+    const log = await this.logService.logRequest(`[细化推荐] ${prevTitle}`, "refine_recommendation");
 
-    let newConfirmationId: string | undefined;
+    try { await this.confirmService.reject(confirmationId); } catch { /* ignore */ }
+
     if (candidates.length > 0) {
       const rec = candidates[0];
       const newPending = await this.confirmService.createConfirmation({
@@ -659,54 +1395,169 @@ export class AgentService {
         tool_name: "schedule_task",
         tool_args_json: JSON.stringify({
           title: prevTitle,
-          category: prevArgs.category,
-          duration: prevDuration,
-          estimated_duration_minutes: prevDuration,
+          category: prevCategory,
+          duration: newDuration,
+          estimated_duration_minutes: newDuration,
           start_time: rec.start,
           end_time: rec.end,
         }),
         risk_level: "low",
         description: `按调整后时间安排「${prevTitle}」`,
       });
-      newConfirmationId = newPending.id;
-      await this.logService.logSuccess(log.id, { newConfirmationId, recommendation: rec });
+      await this.logService.logSuccess(log.id, { newConfirmationId: newPending.id, recommendation: rec });
 
-      const startStr = new Date(rec.start).toLocaleTimeString("zh-CN", {
-        hour: "2-digit", minute: "2-digit", timeZone: context.timezone,
-      });
-      const endStr = new Date(rec.end).toLocaleTimeString("zh-CN", {
-        hour: "2-digit", minute: "2-digit", timeZone: context.timezone,
-      });
-      const message = `那改到 ${startStr} - ${endStr} 怎么样，需要我按这个时间来安排吗？`;
-
-      const metadata: ChatMessageMetadata = {
-        intent: confirmation.action_type,
-        confirmationId: newConfirmationId,
-        actionLogId: log.id,
-        resultType: "pending_confirmation",
-        source: "llm",
-        llmResponseType: "clarification",
-      };
-
-      return {
-        message,
-        intent: { intent: "unknown", confidence: 0.95, args: {}, rawInput: "" },
-        confirmationId: newConfirmationId,
-        metadata,
-      };
+      // C3: replaceForRefine（planner path）
+      const refineResponseMain = this.buildRefineResponse(prevTitle, newDuration, newPending.id, rec.start, rec.end, context, prevCategory, log.id, confirmation.action_type);
+      if (context.conversationId) {
+        try {
+          const newSnapshotMain = refineResponseMain.metadata?.pendingProposal;
+          if (newSnapshotMain) {
+            const newProposalIdMain = newSnapshotMain.proposalId ?? (newSnapshotMain.proposalId = crypto.randomUUID());
+            await this.activeContextService.replaceForRefine({
+              old_confirmation_id: confirmationId,
+              new_confirmation_id: newPending.id,
+              new_proposal_id: newProposalIdMain,
+              new_proposal_snapshot: newSnapshotMain,
+              conversation_id: context.conversationId,
+              turn_id: context.turnId,
+            });
+          }
+        } catch (e) {
+          console.warn("[AgentService] C3 replaceForRefine (planner) failed:", e);
+        }
+      }
+      return refineResponseMain;
     }
 
-    // 没有更多可用时段
+    // 无可用时段
     await this.logService.logSuccess(log.id, { candidates: 0 });
     return {
-      message: "今天已经没有更合适的时间段了，你可以手动选择一个时间或者换一天安排。",
+      message: "没有找到合适的时间段，你可以换个时段或者手动选择具体时间。",
       intent: { intent: "unknown", confidence: 0.8, args: {}, rawInput: "" },
+    };
+  }
+
+  private buildRefineResponse(
+    title: string,
+    duration: number,
+    newConfirmationId: string,
+    startIso: string,
+    endIso: string,
+    context: import("@/agent/types").AgentExperienceContext,
+    category: string | undefined,
+    actionLogId: string,
+    actionType: string
+  ): AgentResponse {
+    const startStr = new Date(startIso).toLocaleTimeString("zh-CN", {
+      hour: "2-digit", minute: "2-digit", timeZone: context.timezone, hour12: false,
+    });
+    const endStr = new Date(endIso).toLocaleTimeString("zh-CN", {
+      hour: "2-digit", minute: "2-digit", timeZone: context.timezone, hour12: false,
+    });
+    const message = `那改到 ${startStr} - ${endStr} 怎么样，需要我按这个时间来安排吗？`;
+
+    const pendingProposal: import("@/agent/types").PendingProposalSnapshot = {
+      confirmationId: newConfirmationId,
+      kind: "recommendation",
+      title,
+      duration,
+      category,
+      start: startIso,
+      end: endIso,
+    };
+
+    const metadata: ChatMessageMetadata = {
+      intent: actionType,
+      confirmationId: newConfirmationId,
+      actionLogId,
+      resultType: "pending_confirmation",
+      source: "llm",
+      llmResponseType: "clarification",
+      pendingProposal,
+    };
+
+    return {
+      message,
+      intent: { intent: "unknown", confidence: 0.95, args: {}, rawInput: "" },
+      confirmationId: newConfirmationId,
+      metadata,
     };
   }
 
   // ─── 拒绝执行（Phase 4：新建 cancelled action_log） ──────────────────────
 
-  async rejectAction(confirmationId: string): Promise<AgentResponse> {
+  async rejectAction(confirmationId: string, context?: { conversationId?: string; assistantMessageId?: string }): Promise<AgentResponse> {
+    let turn: import("@/types/agent.types").Turn | undefined;
+    const conversationId = context?.conversationId;
+
+    // C5: 防御层 — 跨会话 confirmation 引用
+    if (conversationId) {
+      try {
+        await this.assertConfirmationBelongsToConversation(confirmationId, conversationId);
+      } catch (e) {
+        if (e instanceof ConfirmationStaleError) {
+          return {
+            message: this.composeBoundaryMessage("", undefined, "confirmation_stale"),
+            intent: { intent: "unknown", confidence: 0, args: {}, rawInput: "" },
+          };
+        }
+      }
+    }
+
+    if (conversationId) {
+      try {
+        turn = await this.turnService.startTurn({ conversationId, trigger: "reject_action" });
+      } catch { /* ignore */ }
+    }
+    try {
+      const response = await this._rejectActionCore(confirmationId);
+      // C2: 写入 SemanticEvent
+      if (conversationId) {
+        await this.recordTurnEvents({
+          conversationId,
+          turnId: turn?.id,
+          trigger: "reject_action",
+          response,
+          relatedConfirmationId: confirmationId,
+        });
+      }
+      // C3: resolveOnReject
+      try {
+        await this.activeContextService.resolveOnReject(confirmationId);
+      } catch (e) {
+        console.warn("[AgentService] C3 resolveOnReject failed:", e);
+      }
+      // C6: reject trace step
+      if (conversationId && turn?.id) {
+        await this.recordTraceSteps([{
+          turn_id: turn.id,
+          conversation_id: conversationId,
+          step_type: "reject",
+          step_order: 0,
+          input_snapshot: { confirmationId },
+          output_snapshot: { reason: "user_rejected" },
+        }]);
+      }
+      if (turn) {
+        try { await this.turnService.completeTurn(turn.id, context?.assistantMessageId ?? "pending"); } catch { /* ignore */ }
+      }
+      return { ...response, metadata: { ...response.metadata, conversationId, turnId: turn?.id } };
+    } catch (e) {
+      if (conversationId) {
+        await this.recordTurnEvents({
+          conversationId,
+          turnId: turn?.id,
+          trigger: "reject_action",
+          errorMessage: String(e),
+          relatedConfirmationId: confirmationId,
+        });
+      }
+      if (turn) { try { await this.turnService.failTurn(turn.id, String(e)); } catch { /* ignore */ } }
+      throw e;
+    }
+  }
+
+  private async _rejectActionCore(confirmationId: string): Promise<AgentResponse> {
     // 先获取 confirmation 以取得 tool_name / tool_args 用于日志记录
     const confirmation = await this.confirmService.getById(confirmationId);
 
@@ -725,7 +1576,13 @@ export class AgentService {
 
     const log = await this.logService.logRequest(
       `[拒绝确认] ${confirmation?.action_type ?? confirmationId}`,
-      confirmation?.action_type
+      confirmation?.action_type,
+      {
+        conversation_id: confirmation?.conversation_id,
+        turn_id: confirmation?.turn_id,
+        message_id: confirmation?.message_id,
+        confirmation_id: confirmationId,
+      }
     );
     await this.logService.logToolExecution(log.id, toolName, {
       ...toolArgs,
