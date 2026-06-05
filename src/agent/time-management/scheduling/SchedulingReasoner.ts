@@ -1,5 +1,6 @@
 import type { AvailabilitySlot } from "@/agent/time-management/scheduling/AvailabilityProvider";
 import type { TimeOfDayRange } from "@/agent/experience/SemanticFrameParser";
+import { roundUpToMinuteBoundary } from "@/agent/time-management/scheduling/timeRounding";
 
 export interface RecommendationCandidate {
   start: string;
@@ -40,6 +41,34 @@ function ceilToMinute(ms: number): number {
   return remainder === 0 ? ms : ms + (MS_PER_MINUTE - remainder);
 }
 
+const AUTO_CANDIDATE_ROUND_STEP_MINUTES = 5;
+
+/**
+ * 仅对系统自动 now+buffer 抬起的候选起点做 5 分钟向上对齐。
+ * 不影响 slot.start、timeOfDay 窗口起点、用户明确锚点。
+ */
+function maybeRoundUpAutoCandidateStart(
+  effectiveStart: number,
+  earliestAllowedMs: number,
+  slotStart: number,
+  todWindowStart: number,
+  valueBeforeTodClamp: number
+): number {
+  if (earliestAllowedMs === -Infinity) return effectiveStart;
+
+  const ceiledEarliest = ceilToMinute(earliestAllowedMs);
+  const raisedByNow = ceiledEarliest > slotStart && effectiveStart >= ceiledEarliest;
+  const purelyFromTod =
+    todWindowStart > -Infinity &&
+    valueBeforeTodClamp < todWindowStart &&
+    effectiveStart === ceilToMinute(todWindowStart);
+
+  if (raisedByNow && !purelyFromTod) {
+    return roundUpToMinuteBoundary(effectiveStart, AUTO_CANDIDATE_ROUND_STEP_MINUTES);
+  }
+  return effectiveStart;
+}
+
 export class SchedulingReasoner {
   rank(
     slots: AvailabilitySlot[],
@@ -71,13 +100,20 @@ export class SchedulingReasoner {
       const slotEnd = new Date(slot.end).getTime();
 
       // V3.7 P0-3：把 slot 起点抬升到 now+buffer 之后。
-      // V3.8：进一步向上对齐到下一分钟边界，避免推荐出现 18:00:36 这种碎秒，
-      // 同时让连续 refine 不会每次漂 1 分钟。
+      // V3.8：向上对齐到分钟边界；系统 now-based 候选再对齐到 5 分钟边界。
       let effectiveStart = ceilToMinute(Math.max(slotStart, earliestAllowedMs));
+      const beforeTodClamp = effectiveStart;
 
       // 时段约束：effectiveStart 不得早于 todWindowStart。
       if (options.timeOfDay) {
         effectiveStart = ceilToMinute(Math.max(effectiveStart, todWindowStart));
+        effectiveStart = maybeRoundUpAutoCandidateStart(
+          effectiveStart,
+          earliestAllowedMs,
+          slotStart,
+          todWindowStart,
+          beforeTodClamp
+        );
         // slot 在时段窗口之后，跳过
         if (effectiveStart >= todWindowEnd) continue;
         // slot 结束不得晚于时段窗口结束
@@ -91,6 +127,14 @@ export class SchedulingReasoner {
         });
         continue;
       }
+
+      effectiveStart = maybeRoundUpAutoCandidateStart(
+        effectiveStart,
+        earliestAllowedMs,
+        slotStart,
+        -Infinity,
+        effectiveStart
+      );
 
       if (slotEnd - effectiveStart < durationMs) continue;
 

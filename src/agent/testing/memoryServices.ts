@@ -51,6 +51,9 @@ export class MemoryTaskService extends TaskService {
     if (filter?.excludeDeleted) {
       tasks = tasks.filter((t) => !t.deleted_at);
     }
+    if (!filter?.includeArchived) {
+      tasks = tasks.filter((t) => !t.archived_at);
+    }
     if (filter?.status) {
       const statuses = Array.isArray(filter.status) ? filter.status : [filter.status];
       tasks = tasks.filter((t) => statuses.includes(t.status));
@@ -101,9 +104,142 @@ export class MemoryTaskService extends TaskService {
     return updated;
   }
 
+  override async updateTaskStatus(
+    id: string,
+    status: import("@/types/task.types").TaskStatus
+  ): Promise<Task> {
+    const existing = await this.getTaskById(id);
+    if (!existing) throw new Error("task not found");
+    const now = new Date().toISOString();
+    return this.updateTask(id, {
+      status,
+      ...(status === "done" ? { completed_at: existing.completed_at ?? now } : {}),
+      ...(status !== "done" && status !== "archived" ? { completed_at: null } : {}),
+      ...(status !== "archived" ? { archived_at: null } : {}),
+      ...(status !== "deferred" ? { deferred_until: null } : {}),
+    });
+  }
+
+  override async completeTask(
+    id: string,
+    opts: { completedAt?: string } = {}
+  ): Promise<Task> {
+    const existing = await this.getTaskById(id);
+    if (!existing || existing.deleted_at) throw new Error("task not found");
+    if (existing.status === "archived") throw new Error("archived task cannot be completed");
+    return this.updateTask(id, {
+      status: "done",
+      completed_at: opts.completedAt ?? new Date().toISOString(),
+      archived_at: null,
+      deferred_until: null,
+    });
+  }
+
+  override async skipTaskToday(id: string): Promise<Task> {
+    const existing = await this.getTaskById(id);
+    if (!existing || existing.deleted_at) throw new Error("task not found");
+    return this.updateTask(id, {
+      status: "todo",
+      deferred_until: null,
+    });
+  }
+
+  override async deferTask(id: string, until?: string): Promise<Task> {
+    const existing = await this.getTaskById(id);
+    if (!existing || existing.deleted_at) throw new Error("task not found");
+    if (existing.status === "archived") throw new Error("archived task cannot be deferred");
+    return this.updateTask(id, {
+      status: "deferred",
+      deferred_until: until ?? null,
+      completed_at: null,
+      archived_at: null,
+    });
+  }
+
+  override async reopenTask(id: string): Promise<Task> {
+    const existing = await this.getTaskById(id);
+    if (!existing || existing.deleted_at) throw new Error("task not found");
+    if (!["done", "cancelled", "deferred", "archived"].includes(existing.status)) {
+      return existing;
+    }
+    return this.updateTask(id, {
+      status: "todo",
+      archived_at: null,
+      completed_at: null,
+      deferred_until: null,
+    });
+  }
+
+  override async archiveTask(
+    id: string,
+    opts: { archivedAt?: string } = {}
+  ): Promise<Task> {
+    const existing = await this.getTaskById(id);
+    if (!existing || existing.deleted_at) throw new Error("task not found");
+    if (existing.status !== "done" && existing.status !== "cancelled") {
+      throw new Error("only done or cancelled tasks can be archived");
+    }
+    return this.updateTask(id, {
+      status: "archived",
+      archived_at: opts.archivedAt ?? new Date().toISOString(),
+    });
+  }
+
+  override async unarchiveTask(id: string): Promise<Task> {
+    const existing = await this.getTaskById(id);
+    if (!existing || existing.deleted_at) throw new Error("task not found");
+    if (existing.status !== "archived" && !existing.archived_at) {
+      throw new Error("task is not archived");
+    }
+    return this.updateTask(id, {
+      status: existing.completed_at ? "done" : "todo",
+      archived_at: null,
+    });
+  }
+
+  override async batchDeleteTasks(ids: string[]): Promise<{ deletedIds: string[] }> {
+    if (ids.length === 0) throw new Error("batch delete requires at least one task");
+    const deletedIds: string[] = [];
+    for (const id of ids) {
+      const existing = await this.getTaskById(id);
+      if (!existing || existing.deleted_at) continue;
+      await this.deleteTask(id);
+      deletedIds.push(id);
+    }
+    return { deletedIds };
+  }
+
+  override async autoArchiveStaleDone(
+    thresholdDays = 7,
+    now: Date = new Date()
+  ): Promise<{ archived: Task[] }> {
+    const cutoff = new Date(now.getTime() - thresholdDays * 24 * 60 * 60 * 1000);
+    const stale = this.tasks.filter(
+      (task) =>
+        !task.deleted_at &&
+        !task.archived_at &&
+        task.status === "done" &&
+        task.completed_at !== undefined &&
+        new Date(task.completed_at).getTime() < cutoff.getTime()
+    );
+    const archived: Task[] = [];
+    for (const task of stale) {
+      archived.push(await this.archiveTask(task.id));
+    }
+    return { archived };
+  }
+
   markScheduled(taskId: string): void {
     this.tasks = this.tasks.map((t) =>
-      t.id === taskId ? { ...t, status: "scheduled" as const } : t
+      t.id === taskId
+        ? {
+            ...t,
+            status: "scheduled" as const,
+            completed_at: undefined,
+            archived_at: undefined,
+            deferred_until: undefined,
+          }
+        : t
     );
   }
 }
@@ -135,6 +271,31 @@ export class MemoryTimeBlockService extends TimeBlockService {
 
   override async getBlockById(id: string): Promise<TimeBlock | null> {
     return this.blocks.find((b) => b.id === id) ?? null;
+  }
+
+  override async batchCancelByTaskId(
+    taskId: string,
+    opts: { onlyFuture?: boolean } = {}
+  ): Promise<number> {
+    const now = new Date().toISOString();
+    let cancelledCount = 0;
+    this.blocks = this.blocks.map((block) => {
+      if (
+        block.task_id !== taskId ||
+        block.deleted_at ||
+        block.status !== "scheduled" ||
+        (opts.onlyFuture && block.start_time <= now)
+      ) {
+        return block;
+      }
+      cancelledCount++;
+      return {
+        ...block,
+        status: "cancelled" as const,
+        updated_at: now,
+      };
+    });
+    return cancelledCount;
   }
 
   override async createTimeBlock(input: CreateTimeBlockInput): Promise<TimeBlock> {
@@ -186,7 +347,12 @@ export class MemoryScheduleService extends ScheduleService {
     });
     // V3.8+: 补记模式 → 将任务标记为已完成
     const newStatus = input.initialStatus === "done" ? "done" : "scheduled";
-    await this.tasksMem.updateTask(input.taskId, { status: newStatus });
+    await this.tasksMem.updateTask(input.taskId, {
+      status: newStatus,
+      completed_at: input.initialStatus === "done" ? new Date().toISOString() : null,
+      archived_at: null,
+      deferred_until: null,
+    });
     return block;
   }
 }
@@ -612,6 +778,8 @@ export class MemoryActiveContextRepository implements IActiveContextRepository {
     if (idx === -1) throw new Error(`ActiveContext ${id} not found`);
     const updated = { ...this.records[idx], updated_at: now };
     if (input.status !== undefined) updated.status = input.status as ActiveContextStatus;
+    if ("active_domain" in input) updated.active_domain = input.active_domain ?? undefined;
+    if ("active_intent" in input) updated.active_intent = input.active_intent ?? undefined;
     if (input.expires_at !== undefined) updated.expires_at = input.expires_at ?? undefined;
     if ("active_confirmation_id" in input) updated.active_confirmation_id = input.active_confirmation_id ?? undefined;
     if ("active_proposal_id" in input) updated.active_proposal_id = input.active_proposal_id ?? undefined;

@@ -55,11 +55,13 @@ export class ScheduleService {
     const isBackfill = initialStatus === "done";
 
     // Validate task exists
-    const task = await this.taskRepo.findById(taskId);
+    const task = await this.taskRepo.findById(taskId, { excludeDeleted: true });
     if (!task) throw new Error("任务不存在");
-    if (task.deleted_at) throw new Error("任务已删除");
     // V3.8+: 补记模式允许对任何状态的任务追加历史时间块
-    if (!isBackfill && (task.status === "done" || task.status === "cancelled")) {
+    if (
+      !isBackfill &&
+      (task.status === "done" || task.status === "cancelled" || task.status === "archived")
+    ) {
       throw new Error(`任务状态为 ${task.status}，无法安排时间块`);
     }
 
@@ -78,7 +80,7 @@ export class ScheduleService {
     }
 
     // Create time block
-    const block = await this.blockRepo.create({
+    let block = await this.blockRepo.create({
       task_id: taskId,
       title,
       start_time: startTime,
@@ -87,8 +89,20 @@ export class ScheduleService {
       source: "manual",
     });
 
+    if (isBackfill) {
+      block = await this.blockRepo.update(block.id, {
+        status: "done",
+        completed_at: new Date().toISOString(),
+      });
+    }
+
     // V3.8+: 补记模式 → 将任务标记为已完成；普通安排 → 标记为 scheduled
-    await this.taskRepo.update(taskId, { status: isBackfill ? "done" : "scheduled" });
+    await this.taskRepo.update(taskId, {
+      status: isBackfill ? "done" : "scheduled",
+      completed_at: isBackfill ? new Date().toISOString() : null,
+      archived_at: null,
+      deferred_until: null,
+    });
 
     return block;
   }
@@ -98,9 +112,8 @@ export class ScheduleService {
    * Soft-deletes the TimeBlock and updates task status back to 'todo' if no other blocks remain.
    */
   async moveTimeBlockBackToTask(timeBlockId: string): Promise<MoveBackResult> {
-    const block = await this.blockRepo.findById(timeBlockId);
+    const block = await this.blockRepo.findById(timeBlockId, { excludeDeleted: true });
     if (!block) throw new Error("时间块不存在");
-    if (block.deleted_at) throw new Error("时间块已删除");
 
     // Guard: only task-type blocks with a task_id can be moved back
     if (!block.task_id) {

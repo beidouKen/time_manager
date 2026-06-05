@@ -1057,6 +1057,19 @@ export class AgentService {
     });
   }
 
+  private buildStaleConfirmationResponse(confirmationId?: string): AgentResponse {
+    return {
+      message: this.composeBoundaryMessage("", undefined, "confirmation_stale"),
+      intent: { intent: "unknown", confidence: 0, args: {}, rawInput: "" },
+      metadata: {
+        confirmationId,
+        alreadyProcessed: true,
+        resultType: "already_processed",
+        source: "chat",
+      },
+    };
+  }
+
   // ─── 旧链路已迁移到 Router/Handler ────────────────────────────────────────
 
   // ─── 确认执行 ────────────────────────────────────────────────────────────
@@ -1081,10 +1094,7 @@ export class AgentService {
         await this.assertConfirmationBelongsToConversation(confirmationId, conversationId);
       } catch (e) {
         if (e instanceof ConfirmationStaleError) {
-          return {
-            message: this.composeBoundaryMessage("", undefined, "confirmation_stale"),
-            intent: { intent: "unknown", confidence: 0, args: {}, rawInput: "" },
-          };
+          return this.buildStaleConfirmationResponse(confirmationId);
         }
       }
     }
@@ -1173,20 +1183,14 @@ export class AgentService {
     }
 
     if (confirmation.status !== "pending") {
-      return {
-        message: this.composeBoundaryMessage("", undefined, "confirmation_stale"),
-        intent: { intent: "unknown", confidence: 0, args: {}, rawInput: "" },
-      };
+      return this.buildStaleConfirmationResponse(confirmationId);
     }
 
     try {
       await this.confirmService.confirm(confirmationId);
     } catch (e) {
       // 过期或其他状态异常 → stale 分支
-      return {
-        message: this.composeBoundaryMessage("", undefined, "confirmation_stale"),
-        intent: { intent: "unknown", confidence: 0, args: {}, rawInput: "" },
-      };
+      return this.buildStaleConfirmationResponse(confirmationId);
     }
 
     const args = JSON.parse(confirmation.tool_args_json) as Record<string, unknown>;
@@ -1288,10 +1292,7 @@ export class AgentService {
   ): Promise<AgentResponse> {
     const confirmation = await this.confirmService.getById(confirmationId);
     if (!confirmation || confirmation.status !== "pending") {
-      return {
-        message: this.composeBoundaryMessage("", undefined, "confirmation_stale"),
-        intent: { intent: "unknown", confidence: 0, args: {}, rawInput: "" },
-      };
+      return this.buildStaleConfirmationResponse(confirmationId);
     }
 
     const prevArgs = JSON.parse(confirmation.tool_args_json) as Record<string, unknown>;
@@ -1305,6 +1306,103 @@ export class AgentService {
 
     // ── 合并 refinements ─────────────────────────────────────────────────────
     const newDuration = refinements.durationMinutes ?? prevDuration;
+
+    // duration-only: 保留原 proposal 的 start_time，只改 duration / end_time
+    if (
+      refinements.kind === "duration_only" &&
+      refinements.durationMinutes &&
+      prevStart
+    ) {
+      const anchorStart = new Date(prevStart);
+      const anchorEnd = new Date(
+        anchorStart.getTime() + refinements.durationMinutes * 60 * 1000
+      );
+      try {
+        await this.confirmService.reject(confirmationId);
+      } catch {
+        /* ignore */
+      }
+
+      const log = await this.logService.logRequest(
+        `[细化推荐:仅改时长] ${prevTitle}`,
+        "refine_recommendation"
+      );
+      const newPending = await this.confirmService.createConfirmation({
+        action_type: confirmation.action_type,
+        tool_name: "schedule_task",
+        tool_args_json: JSON.stringify({
+          title: prevTitle,
+          category: prevCategory,
+          duration: newDuration,
+          estimated_duration_minutes: newDuration,
+          start_time: anchorStart.toISOString(),
+          end_time: anchorEnd.toISOString(),
+        }),
+        risk_level: "low",
+        description: `将「${prevTitle}」时长调整为 ${newDuration} 分钟`,
+        conversation_id: context.conversationId,
+        turn_id: context.turnId,
+      });
+      await this.logService.logSuccess(log.id, {
+        newConfirmationId: newPending.id,
+        durationOnly: true,
+      });
+
+      const refineResponse = this.buildRefineResponse(
+        prevTitle,
+        newDuration,
+        newPending.id,
+        anchorStart.toISOString(),
+        anchorEnd.toISOString(),
+        context,
+        prevCategory,
+        log.id,
+        confirmation.action_type
+      );
+
+      if (context.conversationId && context.turnId) {
+        try {
+          await this.recordTraceSteps([
+            {
+              turn_id: context.turnId,
+              conversation_id: context.conversationId,
+              step_type: "refine",
+              step_order: 99,
+              input_snapshot: { confirmationId, refinements },
+              output_snapshot: {
+                newConfirmationId: newPending.id,
+                start: anchorStart.toISOString(),
+                end: anchorEnd.toISOString(),
+                kind: "duration_only",
+              },
+            },
+          ]);
+        } catch {
+          /* ignore */
+        }
+      }
+
+      if (context.conversationId) {
+        try {
+          const newSnapshot = refineResponse.metadata?.pendingProposal;
+          if (newSnapshot) {
+            const newProposalId =
+              newSnapshot.proposalId ?? (newSnapshot.proposalId = crypto.randomUUID());
+            await this.activeContextService.replaceForRefine({
+              old_confirmation_id: confirmationId,
+              new_confirmation_id: newPending.id,
+              new_proposal_id: newProposalId,
+              new_proposal_snapshot: newSnapshot,
+              conversation_id: context.conversationId,
+              turn_id: context.turnId,
+            });
+          }
+        } catch (e) {
+          console.warn("[AgentService] C3 replaceForRefine (duration_only) failed:", e);
+        }
+      }
+      return refineResponse;
+    }
 
     // anchorTime: 绝对时间锚点，直接作为起点，跳过 planner
     if (refinements.anchorTime) {
@@ -1496,10 +1594,7 @@ export class AgentService {
         await this.assertConfirmationBelongsToConversation(confirmationId, conversationId);
       } catch (e) {
         if (e instanceof ConfirmationStaleError) {
-          return {
-            message: this.composeBoundaryMessage("", undefined, "confirmation_stale"),
-            intent: { intent: "unknown", confidence: 0, args: {}, rawInput: "" },
-          };
+          return this.buildStaleConfirmationResponse(confirmationId);
         }
       }
     }
@@ -1790,7 +1885,12 @@ export class AgentService {
       return { timeline: true, timelineDate };
     }
 
-    if (toolName === "delete_task") {
+    if (
+      toolName === "delete_task" ||
+      toolName === "mark_task_completed" ||
+      toolName === "archive_task" ||
+      toolName === "defer_task"
+    ) {
       return { tasks: true, timeline: true };
     }
 

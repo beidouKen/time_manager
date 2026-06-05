@@ -1,11 +1,18 @@
-import { useEffect, useRef } from "react";
+import { lazy, Suspense, useEffect, useRef } from "react";
 import { useChatStore } from "@/store/chatStore";
 import { ChatMessage } from "@/components/chat/ChatMessage";
 import { ChatInput } from "@/components/chat/ChatInput";
+import { ActiveContextBanner } from "@/components/chat/ActiveContextBanner";
+import { DeleteConversationDialog } from "@/components/chat/DeleteConversationDialog";
 import { MessageSquare } from "lucide-react";
 
-// C6: dev-only debug 面板（生产构建中被 dead-code-eliminate）
-import { ContextDebugPanel } from "@/components/dev/ContextDebugPanel";
+// C6: dev-only debug 面板，使用 React.lazy 动态加载，避免静态 import 把
+// Sqlite*Repository → @tauri-apps/plugin-sql 拉入 ChatPanel 模块链。
+const LazyContextDebugPanel = lazy(() =>
+  import("@/components/dev/ContextDebugPanel").then((m) => ({
+    default: m.ContextDebugPanel,
+  }))
+);
 
 export function ChatPanel() {
   const { messages, loadHistory, currentConversationId } = useChatStore();
@@ -33,6 +40,7 @@ export function ChatPanel() {
         <MessageSquare size={18} className="text-blue-600" />
         <h2 className="text-sm font-semibold text-gray-800">助手</h2>
         <span className="text-xs text-gray-400">规则化解析 · 无 LLM</span>
+        <DeleteConversationDialog />
       </div>
 
       {/* Messages */}
@@ -40,6 +48,7 @@ export function ChatPanel() {
         ref={scrollRef}
         className="flex-1 overflow-y-auto px-4 py-4"
       >
+        <ActiveContextBanner />
         {messages.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-full text-gray-400">
             <MessageSquare size={40} className="mb-3 opacity-50" />
@@ -54,12 +63,14 @@ export function ChatPanel() {
       {/* Input */}
       <ChatInput />
 
-      {/* C6: Dev-only debug 面板（生产构建中不渲染） */}
+      {/* C6: Dev-only debug 面板（生产构建中不渲染；动态加载不影响主体渲染） */}
       {import.meta.env.DEV && (
-        <ContextDebugPanel
-          turnId={lastTurnId}
-          conversationId={currentConversationId ?? undefined}
-        />
+        <Suspense fallback={null}>
+          <LazyContextDebugPanel
+            turnId={lastTurnId}
+            conversationId={currentConversationId ?? undefined}
+          />
+        </Suspense>
       )}
     </div>
   );

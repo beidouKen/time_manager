@@ -1,5 +1,14 @@
 import { create } from "zustand";
 
+export type TodoFilterValue =
+  | "all"
+  | "todo"
+  | "planned"
+  | "in_progress"
+  | "deferred"
+  | "done"
+  | "archived";
+
 interface UiState {
   // Task form
   taskFormOpen: boolean;
@@ -14,8 +23,11 @@ interface UiState {
   timeBlockFormOpen: boolean;
   editingBlockId: string | null;
 
-  // Sidebar
-  activePage: "today" | "chat" | "settings";
+  // Sidebar — 5 application-level pages
+  activePage: "today" | "todo" | "timeline" | "chat" | "settings";
+
+  // TodoPage filter (persisted across page switches)
+  todoFilter: TodoFilterValue;
 }
 
 interface UiActions {
@@ -26,6 +38,7 @@ interface UiActions {
   openTimeBlockForm: (blockId?: string) => void;
   closeTimeBlockForm: () => void;
   setActivePage: (page: UiState["activePage"]) => void;
+  setTodoFilter: (filter: TodoFilterValue) => void;
 }
 
 export const useUiStore = create<UiState & UiActions>((set) => ({
@@ -37,6 +50,7 @@ export const useUiStore = create<UiState & UiActions>((set) => ({
   timeBlockFormOpen: false,
   editingBlockId: null,
   activePage: "today",
+  todoFilter: "all",
 
   openTaskForm: (taskId) =>
     set({ taskFormOpen: true, editingTaskId: taskId ?? null }),
@@ -62,4 +76,5 @@ export const useUiStore = create<UiState & UiActions>((set) => ({
     set({ timeBlockFormOpen: false, editingBlockId: null }),
 
   setActivePage: (page) => set({ activePage: page }),
+  setTodoFilter: (filter) => set({ todoFilter: filter }),
 }));

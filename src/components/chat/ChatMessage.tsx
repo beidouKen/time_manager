@@ -1,6 +1,7 @@
 import { cn } from "@/lib/utils";
 import type { ChatMessage as ChatMessageType } from "@/store/chatStore";
 import {
+  isConfirmationProcessing,
   shouldShowConfirmationButtons,
   useChatStore,
 } from "@/store/chatStore";
@@ -29,7 +30,12 @@ const ERROR_KIND_LABEL: Record<string, string> = {
 };
 
 export function ChatMessage({ message }: Props) {
-  const { confirmAction, rejectAction, isProcessing } = useChatStore();
+  const {
+    confirmAction,
+    rejectAction,
+    isProcessing,
+    processingConfirmationIds,
+  } = useChatStore();
   const isUser = message.role === "user";
 
   // confirmationId 优先从 metadata 读取，向后兼容旧的顶层字段
@@ -40,6 +46,11 @@ export function ChatMessage({ message }: Props) {
   // - 已 confirmed/rejected/failed 的消息：metadata.resultType 为 success/failure/rejected
   // - 仍 pending 的消息：metadata.resultType 为 "pending_confirmation"，或为 undefined（旧数据兼容）
   const isPendingConfirmation = shouldShowConfirmationButtons(message);
+  const isConfirming = isConfirmationProcessing(
+    confirmationId,
+    processingConfirmationIds
+  );
+  const buttonsDisabled = isProcessing || isConfirming;
 
   // V3.5：优先读取 agentTrace，兼容旧字段
   const trace = message.metadata?.agentTrace;
@@ -101,17 +112,17 @@ export function ChatMessage({ message }: Props) {
           <div className="flex gap-2 mt-3 pt-2 border-t border-gray-200">
             <button
               onClick={() => confirmAction(confirmationId)}
-              disabled={isProcessing}
+              disabled={buttonsDisabled}
               className="px-3 py-1 text-xs font-medium bg-red-500 text-white rounded hover:bg-red-600 disabled:opacity-50"
             >
-              确认执行
+              {isConfirming ? "处理中…" : "确认执行"}
             </button>
             <button
               onClick={() => rejectAction(confirmationId)}
-              disabled={isProcessing}
+              disabled={buttonsDisabled}
               className="px-3 py-1 text-xs font-medium bg-gray-200 text-gray-700 rounded hover:bg-gray-300 disabled:opacity-50"
             >
-              取消
+              {isConfirming ? "处理中…" : "取消"}
             </button>
           </div>
         )}

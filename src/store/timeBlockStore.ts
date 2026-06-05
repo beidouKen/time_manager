@@ -3,6 +3,7 @@ import { TimeBlockService } from "@/services/TimeBlockService";
 import { ScheduleService } from "@/services/ScheduleService";
 import { HeartbeatService } from "@/services/HeartbeatService";
 import { ActionLogService } from "@/services/ActionLogService";
+import { UiActionEventService } from "@/services/UiActionEventService";
 import type { TimeBlock, CreateTimeBlockInput, UpdateTimeBlockInput } from "@/types/timeblock.types";
 import { startOfDay } from "date-fns";
 import { useChatStore } from "@/store/chatStore";
@@ -12,6 +13,7 @@ const timeBlockService = new TimeBlockService();
 const scheduleService = new ScheduleService();
 const heartbeatService = new HeartbeatService();
 const actionLogService = new ActionLogService();
+const uiActionEventService = new UiActionEventService();
 
 // ─── 日志辅助（TimeBlock 菜单操作） ──────────────────────────────────────────
 
@@ -45,6 +47,30 @@ async function logTimelineAction(
   } catch (e) {
     console.warn("[Timeline] 日志写入失败:", e);
   }
+}
+
+async function recordTimeBlockUiAction(
+  blockId: string,
+  eventType: string,
+  payload?: Record<string, unknown>
+): Promise<void> {
+  try {
+    const chat = useChatStore.getState();
+    await uiActionEventService.recordUiAction(chat.currentConversationId, {
+      entity_type: "time_block",
+      entity_id: blockId,
+      event_type: eventType,
+      payload,
+    });
+    await chat.refreshActiveContext?.();
+  } catch (e) {
+    console.warn("[timeBlockStore] UI action event failed:", e);
+  }
+}
+
+async function refreshTasksAndTimeline(refreshBlocks: () => Promise<void>): Promise<void> {
+  const { useTaskStore } = await import("@/store/taskStore");
+  await Promise.all([refreshBlocks(), useTaskStore.getState().loadTasks()]);
 }
 
 interface TimeBlockState {
@@ -106,6 +132,9 @@ export const useTimeBlockStore = create<TimeBlockState & TimeBlockActions>(
       const block = await timeBlockService.createTimeBlock(input);
       set((s) => ({ blocks: [...s.blocks, block].sort((a, b) =>
         a.start_time.localeCompare(b.start_time)) }));
+      await recordTimeBlockUiAction(block.id, "create_time_block", {
+        taskId: block.task_id ?? null,
+      });
       return block;
     },
 
@@ -115,6 +144,7 @@ export const useTimeBlockStore = create<TimeBlockState & TimeBlockActions>(
       set((s) => ({
         blocks: s.blocks.map((b) => (b.id === id ? updated : b)),
       }));
+      await recordTimeBlockUiAction(id, "update_time_block", { patch });
       return updated;
     },
 
@@ -122,6 +152,7 @@ export const useTimeBlockStore = create<TimeBlockState & TimeBlockActions>(
       set({ error: null });
       await timeBlockService.deleteTimeBlock(id);
       set((s) => ({ blocks: s.blocks.filter((b) => b.id !== id) }));
+      await recordTimeBlockUiAction(id, "delete_time_block");
     },
 
     updateBlockStatus: async (id, status) => {
@@ -130,6 +161,7 @@ export const useTimeBlockStore = create<TimeBlockState & TimeBlockActions>(
       set((s) => ({
         blocks: s.blocks.map((b) => (b.id === id ? updated : b)),
       }));
+      await recordTimeBlockUiAction(id, "update_time_block", { status });
     },
 
     moveBackToTask: async (blockId) => {
@@ -137,6 +169,11 @@ export const useTimeBlockStore = create<TimeBlockState & TimeBlockActions>(
       const result = await scheduleService.moveTimeBlockBackToTask(blockId);
       // Remove block from current view
       set((s) => ({ blocks: s.blocks.filter((b) => b.id !== blockId) }));
+      await refreshTasksAndTimeline(get().refreshBlocks);
+      await recordTimeBlockUiAction(blockId, "move_time_block_back_to_task", {
+        taskId: result.taskId,
+        taskStatusUpdatedTo: result.taskStatusUpdatedTo,
+      });
       return result;
     },
 
@@ -168,6 +205,10 @@ export const useTimeBlockStore = create<TimeBlockState & TimeBlockActions>(
       } finally {
         await logTimelineAction("complete_block", block, success, errorMsg);
       }
+      await refreshTasksAndTimeline(get().refreshBlocks);
+      await recordTimeBlockUiAction(blockId, "complete_time_block", {
+        taskId: block.task_id ?? null,
+      });
     },
 
     skipBlockWithLinkage: async (blockId) => {
@@ -194,6 +235,10 @@ export const useTimeBlockStore = create<TimeBlockState & TimeBlockActions>(
       } finally {
         await logTimelineAction("skip_block", block, success, errorMsg);
       }
+      await refreshTasksAndTimeline(get().refreshBlocks);
+      await recordTimeBlockUiAction(blockId, "skip_time_block", {
+        taskId: block.task_id ?? null,
+      });
     },
 
     delayBlockWithLinkage: async (blockId) => {
@@ -220,6 +265,10 @@ export const useTimeBlockStore = create<TimeBlockState & TimeBlockActions>(
       } finally {
         await logTimelineAction("delay_block", block, success, errorMsg);
       }
+      await refreshTasksAndTimeline(get().refreshBlocks);
+      await recordTimeBlockUiAction(blockId, "delay_time_block", {
+        taskId: block.task_id ?? null,
+      });
     },
   })
 );

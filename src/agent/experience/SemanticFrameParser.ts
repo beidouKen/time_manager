@@ -15,6 +15,9 @@ const BACKFILL_RE =
 const TODAY_RE = /今天|今晚|今早/u;
 const TOMORROW_RE = /明天/u;
 const DAY_AFTER_RE = /后天|\d{4}[-/]\d{1,2}[-/]\d{1,2}/u;
+/** 用户明确要求未来时段，非系统默认顺延 */
+export const NEXT_OCCURRENCE_RE =
+  /下一个|最近一个|之后(的)?(早上|上午|中午|下午|晚上|夜里)|往后|往后排|改天/u;
 
 export interface TimeOfDayRange {
   /** 本地小时（含），0-23 */
@@ -50,6 +53,7 @@ export class SemanticFrameParser {
         : hasToday
           ? "today"
           : null;
+    const requestsNextOccurrence = NEXT_OCCURRENCE_RE.test(normalized);
 
     const timeExpressions: SemanticFrame["timeExpressions"] = [];
     if (startNow) {
@@ -91,6 +95,7 @@ export class SemanticFrameParser {
       isExplicitToday,
       explicitDateAnchor,
       possibleBackfill,
+      requestsNextOccurrence,
     };
   }
 
@@ -173,6 +178,22 @@ export class SemanticFrameParser {
 
     if (/(安排在哪|排在哪|什么时候|时间段)/.test(input)) {
       return "query_schedule";
+    }
+
+    // V4.1+: 查询任务列表（优先于创建意图，防止"今天有哪些任务"被误解为创建）
+    if (
+      /(有哪些|有什么|列出|查看|查询|哪些).*(任务|待办|安排|计划)/.test(input) ||
+      /(今天|明天|这周|本周).*(任务|安排|计划).*(有哪些|是什么|有什么)/.test(input) ||
+      /(任务|待办).*(有哪些|有什么|是什么)/.test(input)
+    ) {
+      return "query_tasks";
+    }
+
+    // V4.1+: 时间管理建议（优先于创建意图，防止"番茄工作法建议"被误解为创建）
+    if (
+      /(建议|方法|策略|技巧|番茄|效率|时间管理|怎么安排|如何安排|怎么规划|如何规划)/.test(input)
+    ) {
+      return "request_advice";
     }
 
     // "帮我记录一下/记一下" 与 "帮我安排" 语义等价，归入任务创建路径
@@ -351,12 +372,14 @@ export class SemanticFrameParser {
     const taskMatch = input.match(/(.+?)(?:任务|待办)/);
     let raw = (taskMatch?.[1] ?? "").trim();
 
-    // 动作/语气填充词
+    // 动作/语气填充词（含查询代词，防止"哪些/什么/列出"污染标题）
     const FILLERS = [
       "我", "现在", "有一个", "有个", "有", "一个", "个",
       "临时的", "临时", "帮我", "给我", "创建", "安排",
       "排一个", "排个", "新建", "添加", "删除", "删掉",
       "在",
+      // 查询代词
+      "哪些", "什么", "有什么", "有哪些", "列出", "查看", "查询",
     ];
     // 时段/日期词：用户可能写"早上""今天下午"等放在标题前，需要剥离避免污染标题
     const TIME_OF_DAY_WORDS = [

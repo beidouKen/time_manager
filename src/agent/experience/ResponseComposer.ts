@@ -102,6 +102,10 @@ export class ResponseComposer {
       return frame.userGoal;
     }
 
+    if (frame.userGoal === "request_advice") {
+      return "general_chat";
+    }
+
     const result = toolResults[0];
     if (result && !result.success) return "tool_failure";
     return "tool_success";

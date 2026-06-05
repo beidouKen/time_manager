@@ -7,7 +7,7 @@ import { ResponseBoundary } from "@/agent/experience/ResponseBoundary";
 import { ConversationService } from "@/services/ConversationService";
 import { ActiveContextService } from "@/services/ActiveContextService";
 import { ContextInvalidationService } from "@/services/ContextInvalidationService";
-import type { ConversationMessage } from "@/types/agent.types";
+import type { ActiveContext, ConversationMessage } from "@/types/agent.types";
 import { useTaskStore } from "@/store/taskStore";
 import { useTimeBlockStore } from "@/store/timeBlockStore";
 import { useUiStore } from "@/store/uiStore";
@@ -54,6 +54,9 @@ interface ChatState {
    * confirmAction / rejectAction 后清空。
    */
   pendingProposal: PendingProposalSnapshot | null;
+  activeContext: ActiveContext | null;
+  /** 正在处理的 confirmationId，防止重复点击 */
+  processingConfirmationIds: Record<string, true>;
 }
 
 interface ChatActions {
@@ -64,6 +67,7 @@ interface ChatActions {
   clearHistory: () => Promise<void>;
   /** C5: 仅失效当前会话（不新建新会话），供未来"归档"按钮复用 */
   invalidateCurrentConversation: () => Promise<void>;
+  refreshActiveContext: () => Promise<void>;
 }
 
 // ─── 辅助：从 AgentResponse 提取 metadata_json 字符串 ────────────────────
@@ -135,7 +139,17 @@ export function shouldShowConfirmationButtons(message: ChatMessage): boolean {
     message.metadata?.confirmationId ?? message.confirmationId;
   if (!confirmationId) return false;
   const resultType = message.metadata?.resultType;
-  return resultType === undefined || resultType === "pending_confirmation";
+  return (
+    resultType === undefined || resultType === "pending_confirmation"
+  );
+}
+
+export function isConfirmationProcessing(
+  confirmationId: string | undefined,
+  processingConfirmationIds: Record<string, true>
+): boolean {
+  if (!confirmationId) return false;
+  return Boolean(processingConfirmationIds[confirmationId]);
 }
 
 /**
@@ -144,7 +158,7 @@ export function shouldShowConfirmationButtons(message: ChatMessage): boolean {
 export function applyConfirmationPatch(
   messages: ChatMessage[],
   confirmationId: string,
-  newResultType: "success" | "failure" | "rejected"
+  newResultType: "success" | "failure" | "rejected" | "already_processed"
 ): {
   messages: ChatMessage[];
   patches: Array<{ id: string; metadataJson: string }>;
@@ -181,7 +195,7 @@ async function runConfirmationFinalize(
   get: () => ChatState & ChatActions,
   confirmationId: string,
   response: AgentResponse,
-  newResultType: "success" | "failure" | "rejected"
+  newResultType: "success" | "failure" | "rejected" | "already_processed"
 ): Promise<void> {
   const newMsgId = crypto.randomUUID();
   let collectedPatches: Array<{ id: string; metadataJson: string }> = [];
@@ -238,6 +252,22 @@ export const useChatStore = create<ChatState & ChatActions>((set, _get) => ({
   error: null,
   currentConversationId: null,
   pendingProposal: null,
+  activeContext: null,
+  processingConfirmationIds: {},
+
+  refreshActiveContext: async () => {
+    const conversationId = _get().currentConversationId;
+    if (!conversationId) {
+      set({ activeContext: null });
+      return;
+    }
+    try {
+      const activeContext = await activeContextService.findActiveByConversation(conversationId);
+      set({ activeContext });
+    } catch (e) {
+      console.warn("[chatStore] refreshActiveContext failed:", e);
+    }
+  },
 
   loadHistory: async () => {
     try {
@@ -269,6 +299,7 @@ export const useChatStore = create<ChatState & ChatActions>((set, _get) => ({
       if (conversationId) {
         try {
           const active = await activeContextService.findActiveByConversation(conversationId);
+          set({ activeContext: active });
           if (active?.proposal_snapshot_json) {
             const snapshot = JSON.parse(active.proposal_snapshot_json) as PendingProposalSnapshot;
             set({ pendingProposal: snapshot });
@@ -342,6 +373,7 @@ export const useChatStore = create<ChatState & ChatActions>((set, _get) => ({
       if (!pendingProposal && conversationId) {
         try {
           const activeCtx = await activeContextService.findActiveByConversation(conversationId);
+          set({ activeContext: activeCtx });
           if (activeCtx?.proposal_snapshot_json) {
             pendingProposal = JSON.parse(activeCtx.proposal_snapshot_json) as PendingProposalSnapshot;
           }
@@ -394,6 +426,7 @@ export const useChatStore = create<ChatState & ChatActions>((set, _get) => ({
       });
 
       await applyRefreshHints(response);
+      await _get().refreshActiveContext();
     } catch (e) {
       const fallbackContext: AgentExperienceContext = {
         currentDatetime: new Date().toISOString(),
@@ -463,29 +496,108 @@ export const useChatStore = create<ChatState & ChatActions>((set, _get) => ({
   },
 
   confirmAction: async (confirmationId: string) => {
-    set({ isProcessing: true });
+    if (_get().processingConfirmationIds[confirmationId]) return;
+
+    set((s) => ({
+      isProcessing: true,
+      processingConfirmationIds: {
+        ...s.processingConfirmationIds,
+        [confirmationId]: true,
+      },
+    }));
+
     try {
       const conversationId = _get().currentConversationId ?? undefined;
-      const response = await agentService.confirmAction(confirmationId, { conversationId });
-      const newResultType: "success" | "failure" =
-        response.metadata?.resultType === "failure" ? "failure" : "success";
-      await runConfirmationFinalize(set, _get, confirmationId, response, newResultType);
+      const response = await agentService.confirmAction(confirmationId, {
+        conversationId,
+      });
+      const newResultType: "success" | "failure" | "already_processed" =
+        response.metadata?.alreadyProcessed
+          ? "already_processed"
+          : response.metadata?.resultType === "failure"
+            ? "failure"
+            : "success";
+      await runConfirmationFinalize(
+        set,
+        _get,
+        confirmationId,
+        response,
+        newResultType
+      );
       set({ pendingProposal: null });
       await applyRefreshHints(response);
+      await _get().refreshActiveContext();
     } catch (e) {
-      set({ isProcessing: false, error: String(e) });
+      const errorResponse: AgentResponse = {
+        message: `确认失败：${String(e)}`,
+        intent: { intent: "unknown", confidence: 0, args: {}, rawInput: "" },
+        metadata: { resultType: "failure", confirmationId },
+      };
+      await runConfirmationFinalize(
+        set,
+        _get,
+        confirmationId,
+        errorResponse,
+        "failure"
+      );
+      set({ pendingProposal: null, error: String(e) });
+    } finally {
+      set((s) => {
+        const next = { ...s.processingConfirmationIds };
+        delete next[confirmationId];
+        return { processingConfirmationIds: next, isProcessing: false };
+      });
     }
   },
 
   rejectAction: async (confirmationId: string) => {
-    set({ isProcessing: true });
+    if (_get().processingConfirmationIds[confirmationId]) return;
+
+    set((s) => ({
+      isProcessing: true,
+      processingConfirmationIds: {
+        ...s.processingConfirmationIds,
+        [confirmationId]: true,
+      },
+    }));
+
     try {
       const conversationId = _get().currentConversationId ?? undefined;
-      const response = await agentService.rejectAction(confirmationId, { conversationId });
-      await runConfirmationFinalize(set, _get, confirmationId, response, "rejected");
+      const response = await agentService.rejectAction(confirmationId, {
+        conversationId,
+      });
+      const newResultType: "rejected" | "already_processed" =
+        response.metadata?.alreadyProcessed ? "already_processed" : "rejected";
+      await runConfirmationFinalize(
+        set,
+        _get,
+        confirmationId,
+        response,
+        newResultType
+      );
       set({ pendingProposal: null });
+      await applyRefreshHints(response);
+      await _get().refreshActiveContext();
     } catch (e) {
-      set({ isProcessing: false, error: String(e) });
+      const errorResponse: AgentResponse = {
+        message: `取消失败：${String(e)}`,
+        intent: { intent: "unknown", confidence: 0, args: {}, rawInput: "" },
+        metadata: { resultType: "failure", confirmationId },
+      };
+      await runConfirmationFinalize(
+        set,
+        _get,
+        confirmationId,
+        errorResponse,
+        "failure"
+      );
+      set({ pendingProposal: null, error: String(e) });
+    } finally {
+      set((s) => {
+        const next = { ...s.processingConfirmationIds };
+        delete next[confirmationId];
+        return { processingConfirmationIds: next, isProcessing: false };
+      });
     }
   },
 
@@ -500,7 +612,13 @@ export const useChatStore = create<ChatState & ChatActions>((set, _get) => ({
     } catch { /* ignore */ }
 
     // 先进入新会话（UI 不卡顿），再后台 invalidate 旧会话
-    set({ messages: [], currentConversationId: newConvId, pendingProposal: null });
+    set({
+      messages: [],
+      currentConversationId: newConvId,
+      pendingProposal: null,
+      activeContext: null,
+      processingConfirmationIds: {},
+    });
 
     if (oldId) {
       try {

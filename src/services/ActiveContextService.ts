@@ -99,6 +99,39 @@ export class ActiveContextService {
     return this.repo.findByConfirmation(confirmationId);
   }
 
+  async touchOnUserAction(
+    conversationId: string,
+    hint: {
+      task_id?: string;
+      time_block_id?: string;
+      intent?: SemanticEventIntent;
+    }
+  ): Promise<ActiveContext> {
+    await this.expireStaleNow();
+    const active = await this.repo.findActiveByConversation(conversationId);
+    const patch = {
+      active_domain: "time_management",
+      active_intent: hint.intent ?? "ui_action",
+      active_task_id: hint.task_id ?? null,
+      active_time_block_id: hint.time_block_id ?? null,
+      expires_at: this.defaultExpiresAt(),
+    };
+
+    if (active) {
+      return this.repo.update(active.id, patch);
+    }
+
+    return this.repo.create({
+      conversation_id: conversationId,
+      active_domain: "time_management",
+      active_intent: hint.intent ?? "ui_action",
+      active_task_id: hint.task_id,
+      active_time_block_id: hint.time_block_id,
+      status: "active",
+      expires_at: this.defaultExpiresAt(),
+    });
+  }
+
   // ── 状态机 ────────────────────────────────────────────────────────────────
 
   async resolveOnConfirm(confirmationId: string): Promise<void> {

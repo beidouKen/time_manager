@@ -6,7 +6,34 @@ export type TaskStatus =
   | "scheduled"
   | "in_progress"
   | "done"
-  | "cancelled";
+  | "cancelled"
+  | "archived"
+  | "deferred";
+
+export const TASK_STATUSES: TaskStatus[] = [
+  "todo",
+  "scheduled",
+  "in_progress",
+  "done",
+  "cancelled",
+  "archived",
+  "deferred",
+];
+
+const TASK_STATUS_TRANSITIONS: Record<TaskStatus, TaskStatus[]> = {
+  todo: ["scheduled", "cancelled", "done", "deferred"],
+  scheduled: ["in_progress", "todo", "cancelled", "done", "deferred"],
+  in_progress: ["todo", "cancelled", "done", "deferred", "scheduled"],
+  done: ["archived", "todo"],
+  cancelled: ["archived", "todo"],
+  archived: ["todo", "scheduled"],
+  deferred: ["todo", "scheduled", "cancelled", "done"],
+};
+
+export function canTransitionTaskStatus(from: TaskStatus, to: TaskStatus): boolean {
+  if (from === to) return true;
+  return TASK_STATUS_TRANSITIONS[from].includes(to);
+}
 
 export interface Task {
   id: string;
@@ -22,6 +49,9 @@ export interface Task {
   created_at: string;
   updated_at: string;
   deleted_at?: string;
+  archived_at?: string;
+  completed_at?: string;
+  deferred_until?: string;
 }
 
 // Zod schemas
@@ -46,11 +76,14 @@ export const UpdateTaskSchema = z.object({
   estimated_duration_minutes: z.number().int().positive().optional().nullable(),
   priority: z.enum(["low", "medium", "high", "urgent"]).optional(),
   status: z
-    .enum(["todo", "scheduled", "in_progress", "done", "cancelled"])
+    .enum(["todo", "scheduled", "in_progress", "done", "cancelled", "archived", "deferred"])
     .optional(),
   category: z.string().max(100).optional().nullable(),
   is_flexible: z.boolean().optional(),
   can_split: z.boolean().optional(),
+  archived_at: z.string().optional().nullable(),
+  completed_at: z.string().optional().nullable(),
+  deferred_until: z.string().optional().nullable(),
 });
 
 export type UpdateTaskInput = z.infer<typeof UpdateTaskSchema>;
@@ -58,4 +91,5 @@ export type UpdateTaskInput = z.infer<typeof UpdateTaskSchema>;
 export interface TaskFilter {
   status?: TaskStatus | TaskStatus[];
   excludeDeleted?: boolean;
+  includeArchived?: boolean;
 }

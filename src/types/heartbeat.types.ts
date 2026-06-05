@@ -7,6 +7,7 @@ export interface HeartbeatSettings {
   reminderBeforeMinutes: number;
   heartbeatIntervalSeconds: number;
   autoFeedbackPromptEnabled: boolean;
+  autoArchiveDays: number;
 }
 
 export const DEFAULT_HEARTBEAT_SETTINGS: HeartbeatSettings = {
@@ -14,6 +15,7 @@ export const DEFAULT_HEARTBEAT_SETTINGS: HeartbeatSettings = {
   reminderBeforeMinutes: 5,
   heartbeatIntervalSeconds: 30,
   autoFeedbackPromptEnabled: true,
+  autoArchiveDays: 7,
 };
 
 // ─── Heartbeat 评估结果 ────────────────────────────────────────────────────────

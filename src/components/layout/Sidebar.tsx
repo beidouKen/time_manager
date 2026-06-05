@@ -1,4 +1,11 @@
-import { CalendarDays, Settings, Clock, MessageSquare } from "lucide-react";
+import {
+  CalendarClock,
+  CalendarDays,
+  Clock,
+  ClipboardList,
+  MessageSquare,
+  Settings,
+} from "lucide-react";
 import { useUiStore } from "@/store/uiStore";
 import { cn } from "@/lib/utils";
 
@@ -7,6 +14,8 @@ export function Sidebar() {
 
   const navItems = [
     { id: "today" as const, icon: CalendarDays, label: "今天" },
+    { id: "todo" as const, icon: ClipboardList, label: "任务" },
+    { id: "timeline" as const, icon: CalendarClock, label: "时间轴" },
     { id: "chat" as const, icon: MessageSquare, label: "助手" },
     { id: "settings" as const, icon: Settings, label: "设置" },
   ];

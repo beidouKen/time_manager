@@ -67,6 +67,14 @@ export class SqliteActiveContextRepository implements IActiveContextRepository {
       setClauses.push(`status = $${idx++}`);
       params.push(input.status);
     }
+    if ("active_domain" in input) {
+      setClauses.push(`active_domain = $${idx++}`);
+      params.push(input.active_domain ?? null);
+    }
+    if ("active_intent" in input) {
+      setClauses.push(`active_intent = $${idx++}`);
+      params.push(input.active_intent ?? null);
+    }
     if (input.expires_at !== undefined) {
       setClauses.push(`expires_at = $${idx++}`);
       params.push(input.expires_at);

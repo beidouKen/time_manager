@@ -188,6 +188,8 @@ export interface RefinementDecision {
     anchorTime?: { iso: string; sourceText: string };
     /** 日期偏移（0=今天，1=明天，-1=昨天） */
     dateOffsetDays?: number;
+    /** 细化类型：仅改时长时继承原 proposal 锚点 */
+    kind?: "duration_only" | "time_shift" | "date_shift" | "anchor";
   };
 }
 
@@ -216,7 +218,10 @@ export type SemanticUserGoal =
   | "batch_reschedule_day"
   | "defer_task"
   // V3.8+: 在没有重新提及任务名的情况下，修改最近一次创建/安排的时间块时长
-  | "update_recent_duration";
+  | "update_recent_duration"
+  // V4.1+: 查询任务列表 / 请求时间管理建议（区别于创建/安排意图）
+  | "query_tasks"
+  | "request_advice";
 
 export interface SemanticFrame {
   userGoal: SemanticUserGoal;
@@ -270,6 +275,11 @@ export interface SemanticFrame {
    * 为 true 时，即使时段已过，也应允许按历史时间创建记录，不做顺延或追问。
    */
   possibleBackfill?: boolean;
+  /**
+   * 用户是否明确要求"下一个/最近一个/之后"等未来时段（非系统默认顺延）。
+   * 为 true 且无明确今天/明天时，允许 allowShiftToNextDay。
+   */
+  requestsNextOccurrence?: boolean;
 }
 
 export interface AgentExperienceContext {
@@ -303,6 +313,7 @@ export interface ExperienceActionPlan {
     | "direct_response"
     | "tool"
     | "query_schedule"
+    | "query_tasks"
     | "chat"
     | "request_recommendation"
     | "suggestion"
@@ -454,7 +465,14 @@ export interface ChatMessageMetadata {
   confirmationId?: string;
   relatedTaskId?: string;
   relatedTimeBlockId?: string;
-  resultType?: "success" | "failure" | "pending_confirmation" | "rejected";
+  resultType?:
+    | "success"
+    | "failure"
+    | "pending_confirmation"
+    | "rejected"
+    | "already_processed";
+  /** 确认请求已被处理过（stale 路径） */
+  alreadyProcessed?: boolean;
   source?: "chat" | "heartbeat" | "system" | "llm";
   // V3 新增：LLM 相关元数据
   /** LLM 使用的模型名称（如 deepseek-v4-pro） */
@@ -475,6 +493,10 @@ export interface ChatMessageMetadata {
   conversationId?: string;
   /** C1: 所属回合 ID */
   turnId?: string;
+  /** Past time 追问时可用的快捷操作（UI 后续渲染） */
+  quickActions?: Array<
+    "backfill_today" | "schedule_tomorrow" | "schedule_other_day" | "cancel"
+  >;
 }
 
 // ─── V3.7 SinglePlanAction（batch/defer 分解后的原子操作） ──────────────────

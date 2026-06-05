@@ -144,6 +144,16 @@ interface RuleRefinements {
   timeOfDay?: TimeOfDayRange;
   direction?: "later" | "earlier";
   anchorTime?: { iso: string; sourceText: string };
+  kind?: "duration_only" | "time_shift" | "date_shift" | "anchor";
+}
+
+function inferRefinementKind(result: RuleRefinements): RuleRefinements["kind"] | undefined {
+  if (result.anchorTime) return "anchor";
+  if (result.timeOfDay || result.direction) return "time_shift";
+  if (result.durationMinutes !== undefined && !result.timeOfDay && !result.direction && !result.anchorTime) {
+    return "duration_only";
+  }
+  return undefined;
 }
 
 /**
@@ -192,7 +202,11 @@ function extractRuleRefinements(input: string): RuleRefinements | null {
     found = true;
   }
 
-  return found ? result : null;
+  if (!found) return null;
+
+  const kind = inferRefinementKind(result);
+  if (kind) result.kind = kind;
+  return result;
 }
 
 // ─── anchorTimeLocal (HH:MM 字符串) 转 ISO ──────────────────────────────────
@@ -365,6 +379,7 @@ export class PendingProposalInterpreter {
       if (ruleRefinements.timeOfDay) refinements.timeOfDay = ruleRefinements.timeOfDay;
       if (ruleRefinements.direction) refinements.direction = ruleRefinements.direction;
       if (ruleRefinements.anchorTime) refinements.anchorTime = ruleRefinements.anchorTime;
+      if (ruleRefinements.kind) refinements.kind = ruleRefinements.kind;
 
       return {
         intent: "refine",

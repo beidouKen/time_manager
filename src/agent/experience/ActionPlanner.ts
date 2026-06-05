@@ -66,8 +66,10 @@ export class ActionPlanner implements PlannerPort {
           const isExplicitTomorrow = frame.explicitDateAnchor === "tomorrow";
           const possibleBackfill = Boolean(frame.possibleBackfill);
 
-          // 有明确日期时禁止顺延；否则允许（默认行为）
-          const allowShiftToNextDay = !isExplicitToday && !isExplicitTomorrow;
+          // 仅当用户明确要求"下一个/之后"等未来时段时才允许顺延；无明确日期默认不顺延
+          const requestsNextOccurrence = Boolean(frame.requestsNextOccurrence);
+          const allowShiftToNextDay =
+            requestsNextOccurrence && !isExplicitToday && !isExplicitTomorrow;
           // 补记模式：允许推荐已过去的时间段（忽略 now 过滤）
           const allowPastTime = possibleBackfill && isExplicitToday;
           // 明天的日期偏移（交给 TimeManagementAgent 用 context.currentDatetime 算实际 date）
@@ -85,6 +87,7 @@ export class ActionPlanner implements PlannerPort {
               isExplicitToday,
               isExplicitTomorrow,
               possibleBackfill,
+              requestsNextOccurrence,
               allowShiftToNextDay,
               allowPastTime,
               dateOffsetDays,
@@ -370,6 +373,34 @@ export class ActionPlanner implements PlannerPort {
           replayKey: `defer:${taskId ?? title}`,
         };
       }
+
+      // V4.1+: 查询任务列表（只读，直接返回）
+      case "query_tasks":
+        return {
+          ...base,
+          kind: "query_tasks",
+          params: {
+            currentDatetime: context.currentDatetime,
+            dateRange: frame.dateRange ?? null,
+          },
+          summary: "列出今日任务",
+          traceLabel: "query_tasks:list",
+          replayKey: `query_tasks:${context.currentDatetime.slice(0, 10)}`,
+        };
+
+      // V4.1+: 时间管理建议（只读，直接返回文案）
+      case "request_advice":
+        return {
+          ...base,
+          kind: "direct_response",
+          params: {
+            currentDatetime: context.currentDatetime,
+            adviceRequested: true,
+          },
+          summary: "时间管理建议",
+          traceLabel: "request_advice:direct",
+          replayKey: `request_advice:${context.currentDatetime.slice(0, 10)}`,
+        };
 
       default:
         return {

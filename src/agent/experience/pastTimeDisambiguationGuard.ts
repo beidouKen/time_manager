@@ -21,6 +21,8 @@ const EXPLICIT_TODAY_RE = /今天|今晚|今早/u;
 const EXPLICIT_TOMORROW_RE = /明天/u;
 const BACKFILL_RE =
   /补上|补记|记录一下|记一下|记上|刚才|刚刚|已经.*做|已经.*完成|之前做|先前做|做完了|完成了/u;
+const NEXT_OCCURRENCE_RE =
+  /下一个|最近一个|之后(的)?(早上|上午|中午|下午|晚上|夜里)|往后|往后排|改天/u;
 
 /**
  * 对 request_recommendation 类 plan 的 params 应用 Past Time Disambiguation 规则。
@@ -55,8 +57,14 @@ export function applyPastTimeDisambiguationGuard(
       ? Boolean(frame.possibleBackfill)
       : BACKFILL_RE.test(userInput);
 
-  // 优先级：明确日期 > 时段，只有无明确日期时才允许顺延
-  const allowShiftToNextDay = !isExplicitToday && !isExplicitTomorrow;
+  const requestsNextOccurrence =
+    frame.requestsNextOccurrence !== undefined
+      ? Boolean(frame.requestsNextOccurrence)
+      : NEXT_OCCURRENCE_RE.test(userInput);
+
+  // 仅用户明确要求未来时段时才允许顺延；无明确日期默认不顺延
+  const allowShiftToNextDay =
+    requestsNextOccurrence && !isExplicitToday && !isExplicitTomorrow;
   // 补记模式：忽略 now 过滤，可推荐已过去的时段
   const allowPastTime = possibleBackfill && isExplicitToday;
   const dateOffsetDays = isExplicitTomorrow ? 1 : 0;
@@ -66,6 +74,7 @@ export function applyPastTimeDisambiguationGuard(
     allowPastTime,
     possibleBackfill,
     isExplicitToday,
+    requestsNextOccurrence,
     dateOffsetDays,
   });
 }

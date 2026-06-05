@@ -708,6 +708,137 @@ const MIGRATIONS: Migration[] = [
       );
     },
   },
+  // ─── v11: Context OS v1.1 task closure ───────────────────────────────────
+  {
+    version: 11,
+    run: async (db) => {
+      if (await tableExists(db, "tasks")) {
+        const hasArchivedAt = await tableHasColumn(db, "tasks", "archived_at");
+        const hasCompletedAt = await tableHasColumn(db, "tasks", "completed_at");
+        const hasDeferredUntil = await tableHasColumn(db, "tasks", "deferred_until");
+        const taskTableSqlRows = await db.select<{ sql?: string }[]>(
+          `SELECT sql FROM sqlite_master WHERE type='table' AND name='tasks'`,
+        );
+        const taskTableSql = taskTableSqlRows[0]?.sql ?? "";
+        const taskStatusAlreadyExpanded =
+          taskTableSql.includes("'archived'") && taskTableSql.includes("'deferred'");
+
+        if (
+          !hasArchivedAt ||
+          !hasCompletedAt ||
+          !hasDeferredUntil ||
+          !taskStatusAlreadyExpanded
+        ) {
+          await db.execute(`PRAGMA foreign_keys = OFF`);
+          await db.execute(`DROP TABLE IF EXISTS tasks_new`);
+          await db.execute(`
+            CREATE TABLE tasks_new (
+              id TEXT PRIMARY KEY,
+              title TEXT NOT NULL,
+              description TEXT,
+              deadline TEXT,
+              estimated_duration_minutes INTEGER,
+              priority TEXT NOT NULL DEFAULT 'medium'
+                CHECK(priority IN ('low','medium','high','urgent')),
+              status TEXT NOT NULL DEFAULT 'todo'
+                CHECK(status IN ('todo','scheduled','in_progress','done','cancelled','archived','deferred')),
+              category TEXT,
+              is_flexible INTEGER NOT NULL DEFAULT 1,
+              can_split INTEGER NOT NULL DEFAULT 0,
+              created_at TEXT NOT NULL DEFAULT (datetime('now')),
+              updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+              deleted_at TEXT,
+              archived_at TEXT,
+              completed_at TEXT,
+              deferred_until TEXT
+            )
+          `);
+          await db.execute(`
+            INSERT INTO tasks_new (
+              id, title, description, deadline, estimated_duration_minutes,
+              priority, status, category, is_flexible, can_split,
+              created_at, updated_at, deleted_at,
+              archived_at, completed_at, deferred_until
+            )
+            SELECT
+              id, title, description, deadline, estimated_duration_minutes,
+              priority, status, category, is_flexible, can_split,
+              created_at, updated_at, deleted_at,
+              ${hasArchivedAt ? "archived_at" : "NULL"},
+              ${hasCompletedAt ? "completed_at" : "NULL"},
+              ${hasDeferredUntil ? "deferred_until" : "NULL"}
+            FROM tasks
+          `);
+          await db.execute(`DROP TABLE tasks`);
+          await db.execute(`ALTER TABLE tasks_new RENAME TO tasks`);
+          await db.execute(`PRAGMA foreign_keys = ON`);
+        }
+      }
+
+      const semanticEventsExists = await tableExists(db, "semantic_events");
+      if (semanticEventsExists) {
+        const rows = await db.select<{ sql?: string }[]>(
+          `SELECT sql FROM sqlite_master WHERE type='table' AND name='semantic_events'`,
+        );
+        const sql = rows[0]?.sql ?? "";
+        if (!sql.includes("'user_ui'")) {
+          await db.execute(`DROP TABLE IF EXISTS semantic_events_new`);
+          await db.execute(`
+            CREATE TABLE semantic_events_new (
+              id TEXT PRIMARY KEY,
+              conversation_id TEXT NOT NULL,
+              turn_id TEXT,
+              message_id TEXT,
+              domain TEXT NOT NULL,
+              intent TEXT NOT NULL,
+              context_role TEXT NOT NULL,
+              entities_json TEXT,
+              confidence REAL NOT NULL DEFAULT 0.5,
+              related_task_id TEXT,
+              related_time_block_id TEXT,
+              related_confirmation_id TEXT,
+              related_proposal_id TEXT,
+              source TEXT NOT NULL CHECK(source IN ('rule','llm','tool','system','user_ui')),
+              created_at TEXT NOT NULL DEFAULT (datetime('now')),
+              invalidated_at TEXT
+            )
+          `);
+          await db.execute(`
+            INSERT INTO semantic_events_new
+            SELECT id, conversation_id, turn_id, message_id, domain, intent, context_role,
+                   entities_json, confidence, related_task_id, related_time_block_id,
+                   related_confirmation_id, related_proposal_id, source, created_at, invalidated_at
+            FROM semantic_events
+          `);
+          await db.execute(`DROP TABLE semantic_events`);
+          await db.execute(`ALTER TABLE semantic_events_new RENAME TO semantic_events`);
+        }
+      }
+
+      if (semanticEventsExists) {
+        await db.execute(
+          `CREATE INDEX IF NOT EXISTS idx_semantic_events_conv_created
+           ON semantic_events(conversation_id, created_at)`,
+        );
+        await db.execute(
+          `CREATE INDEX IF NOT EXISTS idx_semantic_events_turn
+           ON semantic_events(turn_id)`,
+        );
+        await db.execute(
+          `CREATE INDEX IF NOT EXISTS idx_semantic_events_confirmation
+           ON semantic_events(related_confirmation_id)`,
+        );
+        await db.execute(
+          `CREATE INDEX IF NOT EXISTS idx_semantic_events_task
+           ON semantic_events(related_task_id)`,
+        );
+        await db.execute(
+          `CREATE INDEX IF NOT EXISTS idx_semantic_events_invalidated
+           ON semantic_events(invalidated_at)`,
+        );
+      }
+    },
+  },
 ];
 
 // 单例锁：防止 React StrictMode 等场景下并发调用导致迁移竞态

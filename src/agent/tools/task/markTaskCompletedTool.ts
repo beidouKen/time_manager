@@ -20,7 +20,7 @@ export class MarkTaskCompletedTool extends BaseTool {
       const taskId = args.taskId as string;
       if (!taskId) return this.failure("缺少任务 ID");
 
-      const task = await this.taskService.updateTaskStatus(taskId, "done");
+      const task = await this.taskService.completeTask(taskId);
       return this.success(`已将任务「${task.title}」标记为完成`, task);
     } catch (e) {
       return this.failure(String(e));

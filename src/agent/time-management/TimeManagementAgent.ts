@@ -318,7 +318,7 @@ export class TimeManagementAgent {
         | undefined;
 
       // V3.8+ Past Time Disambiguation: 读取 ActionPlanner 标注的决策参数
-      const allowShiftToNextDay = Boolean(actionPlan.params.allowShiftToNextDay ?? true);
+      const allowShiftToNextDay = Boolean(actionPlan.params.allowShiftToNextDay ?? false);
       const allowPastTime = Boolean(actionPlan.params.allowPastTime ?? false);
       const dateOffsetDays = Number(actionPlan.params.dateOffsetDays ?? 0);
       // 若用户说"明天"，推荐基准日期向后偏移 1 天
@@ -381,6 +381,25 @@ export class TimeManagementAgent {
         needsPastTimeClarification: planResult.needsPastTimeClarification,
         confirmationId,
       });
+    } else if (actionPlan.kind === "query_tasks") {
+      // V4.1+: 查询任务列表，加载所有活跃任务（只读）
+      try {
+        const allTasks = await this.deps.taskService.getTasks({ excludeDeleted: true });
+        const activeTasks = allTasks.filter(
+          (t) => !t.archived_at && t.status !== "archived" && t.status !== "cancelled"
+        );
+        const queryResult: AgentToolResult = {
+          success: true,
+          message: "query_tasks",
+          data: activeTasks,
+        };
+        toolResults.push(queryResult);
+        await this.deps.logService.logSuccess(log.id, {
+          taskCount: activeTasks.length,
+        });
+      } catch (e) {
+        await this.deps.logService.logFailure(log.id, String(e));
+      }
     } else if (actionPlan.kind === "batch_action" || actionPlan.kind === "defer_task") {
       // V3.7: batch / defer — high risk, always requires confirmation.
       // params.actions[] 已由 PlanSafetyValidator 确认存在，序列化整个 params。
@@ -428,8 +447,38 @@ export class TimeManagementAgent {
             actionPlan.params.needsPastTimeClarification
           ),
           possibleBackfill: Boolean(actionPlan.params.possibleBackfill),
+          isExplicitToday: Boolean(actionPlan.params.isExplicitToday),
         }
       );
+    } else if (actionPlan.kind === "query_tasks") {
+      const tasks = toolResults[0]?.data as Array<{ title: string; status: string }> | undefined;
+      if (!tasks || tasks.length === 0) {
+        finalResponseMessage = "目前没有待处理的任务。你可以告诉我「安排一个任务」来开始规划。";
+      } else {
+        const lines = tasks
+          .slice(0, 10)
+          .map((t, i) => `${i + 1}. ${t.title}（${t.status}）`);
+        finalResponseMessage =
+          `当前共有 ${tasks.length} 个活跃任务：\n` +
+          lines.join("\n") +
+          (tasks.length > 10 ? `\n……（还有 ${tasks.length - 10} 个）` : "");
+        // 附加建议（若用户在同一句中提到了"建议"相关词）
+        const input = userInput;
+        if (/(建议|番茄|效率|时间管理|怎么安排|如何安排)/.test(input)) {
+          finalResponseMessage +=
+            "\n\n时间管理建议：可以用番茄工作法（25分钟专注 + 5分钟休息）分块处理上述任务，优先处理截止日期最近或优先级最高的任务。";
+        }
+      }
+    } else if (actionPlan.params.adviceRequested) {
+      // V4.1+: 时间管理建议（request_advice 意图，direct_response 路径）
+      finalResponseMessage =
+        "时间管理建议：\n" +
+        "1. 使用番茄工作法（25 分钟专注 + 5 分钟休息），把大任务分成可执行的小块。\n" +
+        "2. 优先处理截止日期最近或影响最大的任务（艾森豪威尔矩阵：重要且紧急优先）。\n" +
+        "3. 在精力最充沛的时段（通常是上午）处理需要深度思考的任务。\n" +
+        "4. 将类似性质的小任务集中处理，减少上下文切换成本。\n" +
+        "5. 每天结束前回顾完成情况，为次日做好规划。\n" +
+        "\n如需我帮你把某个任务安排进时间轴，直接告诉我任务名称和时间即可。";
     } else if (actionPlan.kind === "batch_action") {
       finalResponseMessage = `已收到批量操作请求（${actionPlan.summary}），请确认是否继续。`;
     } else if (actionPlan.kind === "defer_task") {
@@ -456,7 +505,7 @@ export class TimeManagementAgent {
     const traceMode =
       actionPlan.kind === "direct_response"
         ? "direct_response"
-        : actionPlan.kind === "query_schedule"
+        : actionPlan.kind === "query_schedule" || actionPlan.kind === "query_tasks"
           ? "query_schedule"
           : actionPlan.kind === "chat"
             ? "chitchat"
@@ -520,6 +569,10 @@ export class TimeManagementAgent {
       }
     }
 
+    const needsPastTimeClarification = Boolean(
+      actionPlan.params.needsPastTimeClarification
+    );
+
     const metadata: ChatMessageMetadata = {
       intent: semanticFrame.userGoal,
       toolName: actionPlan.toolName,
@@ -539,6 +592,16 @@ export class TimeManagementAgent {
       llmResponseType: traceMode === "chitchat" ? "chitchat" : traceMode === "clarification" ? "clarification" : "tool_plan",
       agentTrace: trace,
       pendingProposal,
+      ...(needsPastTimeClarification
+        ? {
+            quickActions: [
+              "backfill_today",
+              "schedule_tomorrow",
+              "schedule_other_day",
+              "cancel",
+            ] as const,
+          }
+        : {}),
     };
 
     return {
@@ -575,22 +638,27 @@ export class TimeManagementAgent {
     meta: {
       shiftedToNextDay?: boolean;
       timeOfDayLabel?: string;
-      /** V3.8+ Past Time Disambiguation: 用户说了"今天"但时段已过、非补记 */
+      /** V3.8+ Past Time Disambiguation: 时段已过、非补记，需追问 */
       needsPastTimeClarification?: boolean;
       /** V3.8+ 补记模式：推荐的是今天已过的时段 */
       possibleBackfill?: boolean;
+      /** 用户是否明确说了"今天" */
+      isExplicitToday?: boolean;
     } = {}
   ): string {
-    // ── Case 1: 用户明确说了"今天"，但时段已过，且不是补记 ──────────────────
-    // 不能静默给明天，需追问意图
+    // ── Case 1: 时段已过且非补记 → 追问意图，不默认顺延明天 ────────────────
     if (meta.needsPastTimeClarification) {
-      const todPart = meta.timeOfDayLabel
-        ? `今天${meta.timeOfDayLabel}`
-        : "今天这个时段";
-      const tomorrowPart = meta.timeOfDayLabel
-        ? `明天${meta.timeOfDayLabel}`
-        : "明天同一时段";
-      return `${todPart}已经过去了。你是想补记${todPart}的记录，还是想把它安排到${tomorrowPart}？`;
+      const todPart = meta.timeOfDayLabel ?? "这个时段";
+      if (meta.isExplicitToday) {
+        const todayPart = meta.timeOfDayLabel
+          ? `今天${meta.timeOfDayLabel}`
+          : "今天这个时段";
+        const tomorrowPart = meta.timeOfDayLabel
+          ? `明天${meta.timeOfDayLabel}`
+          : "明天同一时段";
+        return `${todayPart}已经过去了。你是想补记${todayPart}的记录，还是想把它安排到${tomorrowPart}？`;
+      }
+      return `今天${todPart}的时间段已经过去了。你是想补记今天${todPart}的记录，还是安排到之后某一天？`;
     }
 
     if (!recommendation) {

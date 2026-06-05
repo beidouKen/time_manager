@@ -60,10 +60,14 @@ export class SqliteTimeBlockRepository implements ITimeBlockRepository {
     return rows.map(rowToTimeBlock);
   }
 
-  async findById(id: string): Promise<TimeBlock | null> {
+  async findById(
+    id: string,
+    options: { excludeDeleted?: boolean } = {}
+  ): Promise<TimeBlock | null> {
     const db = await getDb();
+    const excludeDeleted = options.excludeDeleted === true;
     const rows = await db.select<Record<string, unknown>[]>(
-      "SELECT * FROM time_blocks WHERE id = $1",
+      `SELECT * FROM time_blocks WHERE id = $1${excludeDeleted ? " AND deleted_at IS NULL" : ""}`,
       [id]
     );
     if (rows.length === 0) return null;

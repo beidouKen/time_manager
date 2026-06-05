@@ -24,23 +24,28 @@ import { SqliteSemanticEventRepository } from "@/repositories/sqlite/SqliteSeman
 import { ContextTraceService } from "@/services/ContextTraceService";
 import { ActiveContextService } from "@/services/ActiveContextService";
 import { SemanticEventService } from "@/services/SemanticEventService";
+import { ConversationService } from "@/services/ConversationService";
+import { SqliteConversationRepository } from "@/repositories/sqlite/SqliteConversationRepository";
 
 // ─── 懒加载 service（仅 dev 环境初始化，避免生产 bundle 体积增加） ──────────
 
 let _traceService: ContextTraceService | undefined;
 let _activeContextService: ActiveContextService | undefined;
 let _semanticEventService: SemanticEventService | undefined;
+let _conversationService: ConversationService | undefined;
 
 function getDevServices() {
   if (!_traceService) {
     _traceService = new ContextTraceService(new SqliteTraceStepRepository());
     _activeContextService = new ActiveContextService(new SqliteActiveContextRepository());
     _semanticEventService = new SemanticEventService(new SqliteSemanticEventRepository());
+    _conversationService = new ConversationService(new SqliteConversationRepository());
   }
   return {
     traceService: _traceService,
     activeContextService: _activeContextService!,
     semanticEventService: _semanticEventService!,
+    conversationService: _conversationService!,
   };
 }
 
@@ -158,19 +163,20 @@ function stepTypeColor(type: string): string {
 }
 
 // ─── Main Component ───────────────────────────────────────────────────────────
+// ⚠ DEV GUARD: This component must ONLY be rendered by the parent with
+// {import.meta.env.DEV && <ContextDebugPanel ... />}
+// Do NOT add an early return before hooks here — it violates Rules of Hooks.
 
 export function ContextDebugPanel({
   turnId,
   conversationId,
   mode = "turn",
 }: ContextDebugPanelProps) {
-  // ⚠ DEV GUARD — this line must remain first
-  if (!import.meta.env.DEV) return null;
-
   const [isOpen, setIsOpen] = useState(false);
   const [steps, setSteps] = useState<AgentTraceStep[]>([]);
   const [activeCtx, setActiveCtx] = useState<ActiveContext | null>(null);
   const [recentEvents, setRecentEvents] = useState<SemanticEvent[]>([]);
+  const [conversationTitle, setConversationTitle] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
@@ -178,8 +184,12 @@ export function ContextDebugPanel({
     if (!turnId && !conversationId) return;
 
     setLoading(true);
-    const { traceService, activeContextService, semanticEventService } =
-      getDevServices();
+    const {
+      traceService,
+      activeContextService,
+      semanticEventService,
+      conversationService,
+    } = getDevServices();
 
     Promise.all([
       turnId && mode === "turn"
@@ -193,11 +203,19 @@ export function ContextDebugPanel({
       conversationId
         ? semanticEventService.findByConversation(conversationId, { limit: 10 })
         : Promise.resolve([]),
+      conversationId
+        ? conversationService.getConversation(conversationId)
+        : Promise.resolve(null),
     ])
-      .then(([s, ac, ev]) => {
-        setSteps(s as AgentTraceStep[]);
+      .then(([s, ac, ev, conv]) => {
+        const sortedSteps = [...(s as AgentTraceStep[])].sort(
+          (a, b) =>
+            new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+        );
+        setSteps(sortedSteps.slice(0, 20));
         setActiveCtx(ac as ActiveContext | null);
         setRecentEvents(ev as SemanticEvent[]);
+        setConversationTitle(conv?.title ?? null);
       })
       .catch(console.error)
       .finally(() => setLoading(false));
@@ -240,7 +258,9 @@ export function ContextDebugPanel({
         <span style={{ color: "#22d3ee" }}>⬡</span>
         <span style={{ fontWeight: 600 }}>ContextDebugPanel</span>
         <span style={{ color: "#64748b" }}>
-          [DEV] {turnId ? `turn=${turnId.slice(0, 8)}…` : ""}
+          [DEV]
+          {conversationTitle ? ` ${conversationTitle}` : ""}
+          {turnId ? ` turn=${turnId.slice(0, 8)}…` : ""}
           {conversationId ? ` conv=${conversationId.slice(0, 8)}…` : ""}
         </span>
         <span style={{ marginLeft: "auto" }}>{isOpen ? "▼" : "▲"}</span>

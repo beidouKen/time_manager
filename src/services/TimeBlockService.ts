@@ -41,7 +41,7 @@ export class TimeBlockService {
   }
 
   async getBlockById(id: string): Promise<TimeBlock | null> {
-    return this.repo.findById(id);
+    return this.repo.findById(id, { excludeDeleted: true });
   }
 
   async createTimeBlock(input: CreateTimeBlockInput): Promise<TimeBlock> {
@@ -50,7 +50,7 @@ export class TimeBlockService {
   }
 
   async updateTimeBlock(id: string, input: UpdateTimeBlockInput): Promise<TimeBlock> {
-    const existing = await this.repo.findById(id);
+    const existing = await this.repo.findById(id, { excludeDeleted: true });
     if (!existing) throw new Error("时间块不存在");
     if (existing.deleted_at) throw new Error("时间块已删除");
     if (existing.is_locked) throw new Error("时间块已锁定，不可修改");
@@ -63,7 +63,7 @@ export class TimeBlockService {
     id: string,
     status: TimeBlock["status"]
   ): Promise<TimeBlock> {
-    const existing = await this.repo.findById(id);
+    const existing = await this.repo.findById(id, { excludeDeleted: true });
     if (!existing) throw new Error("时间块不存在");
     if (existing.deleted_at) throw new Error("时间块已删除");
     return this.repo.update(id, { status });
@@ -79,20 +79,40 @@ export class TimeBlockService {
     id: string,
     update: ExecutionStateUpdate
   ): Promise<TimeBlock> {
-    const existing = await this.repo.findById(id);
+    const existing = await this.repo.findById(id, { excludeDeleted: true });
     if (!existing) throw new Error("时间块不存在");
     if (existing.deleted_at) throw new Error("时间块已删除");
     return this.repo.update(id, update);
   }
 
   async deleteTimeBlock(id: string): Promise<void> {
-    const existing = await this.repo.findById(id);
+    const existing = await this.repo.findById(id, { excludeDeleted: true });
     if (!existing) throw new Error("时间块不存在");
     await this.repo.softDelete(id);
   }
 
   async countActiveByTaskId(taskId: string): Promise<number> {
     return this.repo.countActiveByTaskId(taskId);
+  }
+
+  async batchCancelByTaskId(
+    taskId: string,
+    opts: { onlyFuture?: boolean } = {}
+  ): Promise<number> {
+    const now = new Date().toISOString();
+    const blocks = await this.repo.findByTaskId(taskId);
+    const cancellable = blocks.filter(
+      (block) =>
+        !block.deleted_at &&
+        block.status === "scheduled" &&
+        (!opts.onlyFuture || block.start_time > now)
+    );
+
+    for (const block of cancellable) {
+      await this.repo.update(block.id, { status: "cancelled" });
+    }
+
+    return cancellable.length;
   }
 
   /**

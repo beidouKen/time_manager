@@ -25,6 +25,9 @@ function rowToTask(row: Record<string, unknown>): Task {
     created_at: row.created_at as string,
     updated_at: row.updated_at as string,
     deleted_at: (row.deleted_at as string) ?? undefined,
+    archived_at: (row.archived_at as string) ?? undefined,
+    completed_at: (row.completed_at as string) ?? undefined,
+    deferred_until: (row.deferred_until as string) ?? undefined,
   };
 }
 
@@ -38,6 +41,10 @@ export class SqliteTaskRepository implements ITaskRepository {
 
     if (excludeDeleted) {
       sql += " AND deleted_at IS NULL";
+    }
+
+    if (!filter?.includeArchived) {
+      sql += " AND archived_at IS NULL";
     }
 
     if (filter?.status) {
@@ -57,10 +64,14 @@ export class SqliteTaskRepository implements ITaskRepository {
     return rows.map(rowToTask);
   }
 
-  async findById(id: string): Promise<Task | null> {
+  async findById(
+    id: string,
+    options: { excludeDeleted?: boolean } = {}
+  ): Promise<Task | null> {
     const db = await getDb();
+    const excludeDeleted = options.excludeDeleted === true;
     const rows = await db.select<Record<string, unknown>[]>(
-      "SELECT * FROM tasks WHERE id = $1",
+      `SELECT * FROM tasks WHERE id = $1${excludeDeleted ? " AND deleted_at IS NULL" : ""}`,
       [id]
     );
     if (rows.length === 0) return null;
@@ -140,6 +151,18 @@ export class SqliteTaskRepository implements ITaskRepository {
     if (data.can_split !== undefined) {
       fields.push(`can_split = $${idx++}`);
       params.push(data.can_split ? 1 : 0);
+    }
+    if (data.archived_at !== undefined) {
+      fields.push(`archived_at = $${idx++}`);
+      params.push(data.archived_at ?? null);
+    }
+    if (data.completed_at !== undefined) {
+      fields.push(`completed_at = $${idx++}`);
+      params.push(data.completed_at ?? null);
+    }
+    if (data.deferred_until !== undefined) {
+      fields.push(`deferred_until = $${idx++}`);
+      params.push(data.deferred_until ?? null);
     }
 
     params.push(id);

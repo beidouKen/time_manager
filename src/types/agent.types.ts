@@ -106,7 +106,7 @@ export type SemanticEventContextRole =
   | "topic_change"
   | "low_signal";
 
-export type SemanticEventSource = "rule" | "llm" | "tool" | "system";
+export type SemanticEventSource = "rule" | "llm" | "tool" | "system" | "user_ui";
 
 export interface SemanticEvent {
   id: string;
@@ -141,7 +141,7 @@ export const CreateSemanticEventSchema = z.object({
   related_time_block_id: z.string().optional(),
   related_confirmation_id: z.string().optional(),
   related_proposal_id: z.string().optional(),
-  source: z.enum(["rule", "llm", "tool", "system"]) as z.ZodType<SemanticEventSource>,
+  source: z.enum(["rule", "llm", "tool", "system", "user_ui"]) as z.ZodType<SemanticEventSource>,
 });
 
 export type CreateSemanticEventInput = {
@@ -371,6 +371,8 @@ export type CreateActiveContextInput = z.input<typeof CreateActiveContextSchema>
 
 export const UpdateActiveContextSchema = z.object({
   status: z.enum(["active", "expired", "resolved", "invalidated"]).optional(),
+  active_domain: z.string().nullable().optional(),
+  active_intent: z.string().nullable().optional(),
   expires_at: z.string().optional(),
   active_confirmation_id: z.string().nullable().optional(),
   active_proposal_id: z.string().nullable().optional(),

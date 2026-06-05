@@ -1,16 +1,14 @@
 import { useEffect } from "react";
-import { TodoList } from "@/components/todo/TodoList";
 import { TodayTimeline } from "@/components/timeline/TodayTimeline";
+import { TodaySections } from "@/components/today/TodaySections";
 import { HeartbeatPanel } from "@/components/heartbeat/HeartbeatPanel";
 import { ExecutionFeedbackDialog } from "@/components/heartbeat/ExecutionFeedbackDialog";
 import { DelayChoiceDialog } from "@/components/heartbeat/DelayChoiceDialog";
 import { useTimeBlockStore } from "@/store/timeBlockStore";
 import { useHeartbeatStore } from "@/store/heartbeatStore";
-import { useTaskStore } from "@/store/taskStore";
 
 export function TodayPage() {
-  const { setCurrentDate, refreshBlocks, delayBlockWithLinkage } = useTimeBlockStore();
-  const { loadTasks } = useTaskStore();
+  const { setCurrentDate, delayBlockWithLinkage } = useTimeBlockStore();
   const {
     heartbeatEnabled,
     startHeartbeat,
@@ -35,15 +33,11 @@ export function TodayPage() {
   }, [heartbeatEnabled, startHeartbeat, stopHeartbeat]);
 
   return (
-    <div className="flex h-full overflow-hidden">
-      {/* Left: Todo panel */}
-      <div className="w-80 flex-shrink-0 border-r border-gray-200 bg-white overflow-hidden flex flex-col">
-        <TodoList />
-      </div>
-
-      {/* Right: Timeline + Heartbeat panel */}
-      <div className="flex-1 overflow-hidden flex flex-col bg-white">
+    <div className="flex h-full overflow-hidden bg-white">
+      {/* Today execution view: Heartbeat + TodaySections + Timeline */}
+      <div className="flex-1 overflow-hidden flex flex-col">
         <HeartbeatPanel />
+        <TodaySections />
         <TodayTimeline />
       </div>
 
@@ -56,9 +50,7 @@ export function TodayPage() {
         onDelayLater={async (blockId) => {
           await delayBlockWithLinkage(blockId);
         }}
-        onSuccess={async () => {
-          await Promise.all([refreshBlocks(), loadTasks()]);
-        }}
+        onSuccess={async () => undefined}
       />
     </div>
   );

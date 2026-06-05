@@ -3,6 +3,7 @@ import { persist, createJSONStorage } from "zustand/middleware";
 import { HeartbeatService } from "@/services/HeartbeatService";
 import { TimeBlockService } from "@/services/TimeBlockService";
 import { ActionLogService } from "@/services/ActionLogService";
+import { UiActionEventService } from "@/services/UiActionEventService";
 import { DEFAULT_HEARTBEAT_SETTINGS } from "@/types/heartbeat.types";
 import type { HeartbeatSettings } from "@/types/heartbeat.types";
 import type { TimeBlock } from "@/types/timeblock.types";
@@ -12,6 +13,7 @@ import { useChatStore } from "@/store/chatStore";
 const timeBlockService = new TimeBlockService();
 const heartbeatService = new HeartbeatService();
 const actionLogService = new ActionLogService();
+const uiActionEventService = new UiActionEventService();
 
 // ─── 日志辅助 ──────────────────────────────────────────────────────────────
 
@@ -52,6 +54,39 @@ async function logHeartbeatAction(
     // 日志写入失败不应阻断主流程
     console.warn("[Heartbeat] 日志写入失败:", e);
   }
+}
+
+async function recordHeartbeatUiAction(
+  block: TimeBlock,
+  eventType: string,
+  payload?: Record<string, unknown>
+): Promise<void> {
+  try {
+    const chat = useChatStore.getState();
+    await uiActionEventService.recordUiAction(chat.currentConversationId, {
+      entity_type: "time_block",
+      entity_id: block.id,
+      event_type: eventType,
+      payload: {
+        taskId: block.task_id ?? null,
+        ...(payload ?? {}),
+      },
+    });
+    await chat.refreshActiveContext?.();
+  } catch (e) {
+    console.warn("[Heartbeat] UI action event failed:", e);
+  }
+}
+
+async function refreshTasksAndTimeline(): Promise<void> {
+  const [{ useTaskStore }, { useTimeBlockStore }] = await Promise.all([
+    import("@/store/taskStore"),
+    import("@/store/timeBlockStore"),
+  ]);
+  await Promise.all([
+    useTaskStore.getState().loadTasks(),
+    useTimeBlockStore.getState().refreshBlocks(),
+  ]);
 }
 
 // ─── 状态定义 ─────────────────────────────────────────────────────────────
@@ -154,6 +189,7 @@ export const useHeartbeatStore = create<HeartbeatState>()(
           reminderBeforeMinutes,
           heartbeatIntervalSeconds,
           autoFeedbackPromptEnabled,
+          autoArchiveDays,
           isFeedbackDialogOpen,
         } = get();
 
@@ -169,6 +205,7 @@ export const useHeartbeatStore = create<HeartbeatState>()(
             reminderBeforeMinutes,
             heartbeatIntervalSeconds,
             autoFeedbackPromptEnabled,
+            autoArchiveDays,
           });
 
           set({
@@ -247,6 +284,8 @@ export const useHeartbeatStore = create<HeartbeatState>()(
           await logHeartbeatAction("start_block", block, success, errorMsg);
         }
         await get().tick();
+        await refreshTasksAndTimeline();
+        await recordHeartbeatUiAction(block, "start_time_block");
       },
 
       completeBlock: async (blockId, feedbackNote) => {
@@ -268,6 +307,8 @@ export const useHeartbeatStore = create<HeartbeatState>()(
           await logHeartbeatAction("complete_block", block, success, errorMsg);
         }
         await get().tick();
+        await refreshTasksAndTimeline();
+        await recordHeartbeatUiAction(block, "complete_time_block", { feedbackNote });
       },
 
       skipBlock: async (blockId, feedbackNote) => {
@@ -289,6 +330,8 @@ export const useHeartbeatStore = create<HeartbeatState>()(
           await logHeartbeatAction("skip_block", block, success, errorMsg);
         }
         await get().tick();
+        await refreshTasksAndTimeline();
+        await recordHeartbeatUiAction(block, "skip_time_block", { feedbackNote });
       },
 
       delayBlock: async (blockId, feedbackNote) => {
@@ -310,6 +353,8 @@ export const useHeartbeatStore = create<HeartbeatState>()(
           await logHeartbeatAction("delay_block", block, success, errorMsg);
         }
         await get().tick();
+        await refreshTasksAndTimeline();
+        await recordHeartbeatUiAction(block, "delay_time_block", { feedbackNote });
       },
 
       // V3.5-B: Delay 选择弹窗
@@ -329,6 +374,7 @@ export const useHeartbeatStore = create<HeartbeatState>()(
         reminderBeforeMinutes: state.reminderBeforeMinutes,
         heartbeatIntervalSeconds: state.heartbeatIntervalSeconds,
         autoFeedbackPromptEnabled: state.autoFeedbackPromptEnabled,
+        autoArchiveDays: state.autoArchiveDays,
       }),
     }
   )

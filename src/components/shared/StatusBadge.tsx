@@ -8,6 +8,8 @@ const TASK_STATUS_CONFIG: Record<TaskStatus, { label: string; className: string 
   in_progress: { label: "进行中", className: "bg-yellow-100 text-yellow-700" },
   done: { label: "已完成", className: "bg-green-100 text-green-700" },
   cancelled: { label: "已取消", className: "bg-red-100 text-red-500" },
+  archived: { label: "已归档", className: "bg-slate-100 text-slate-600" },
+  deferred: { label: "已延期", className: "bg-orange-100 text-orange-700" },
 };
 
 const PRIORITY_CONFIG: Record<TaskPriority, { label: string; className: string }> = {
@@ -23,7 +25,7 @@ const BLOCK_STATUS_CONFIG: Record<TimeBlockStatus, { label: string; className: s
   done: { label: "已完成", className: "bg-green-100 text-green-700" },
   skipped: { label: "已跳过", className: "bg-gray-100 text-gray-500" },
   cancelled: { label: "已取消", className: "bg-red-100 text-red-500" },
-  delayed: { label: "已延迟", className: "bg-orange-100 text-orange-600" },
+  delayed: { label: "已延后", className: "bg-orange-100 text-orange-600" },
 };
 
 const BLOCK_TYPE_CONFIG: Record<TimeBlockType, { label: string; dotClass: string }> = {

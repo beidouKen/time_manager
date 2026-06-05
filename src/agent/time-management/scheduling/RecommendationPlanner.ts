@@ -64,8 +64,10 @@ export class RecommendationPlanner {
    *    - 今日时段未过 → 正常推荐今天的候选
    *    - 今日时段已过 + `allowPastTime = false` → `needsPastTimeClarification = true`
    *    - 今日时段已过 + `allowPastTime = true`（补记）→ 以过去时段推荐（忽略 now 过滤）
-   * 3. `allowShiftToNextDay = true`（默认，用户未指定日期）：
+   * 3. `allowShiftToNextDay = true`（用户明确要求下一个/之后时段）：
    *    - 今日时段已过 → 自动顺延到次日同一时段，`shiftedToNextDay = true`
+   * 4. 无明确日期且 `allowShiftToNextDay = false`（默认）：
+   *    - 今日时段已过 → `needsPastTimeClarification = true`，不顺延
    */
   async planWithMeta(args: {
     date: Date;
@@ -76,8 +78,8 @@ export class RecommendationPlanner {
     timeOfDay?: TimeOfDayRange;
     /**
      * 是否允许在今日时段已过时自动顺延到次日。
-     * 默认 true（向后兼容）。
-     * 设为 false 时，若今日时段已过则返回 needsPastTimeClarification=true。
+     * 默认 false（无明确日期不顺延）。
+     * 仅用户明确要求下一个/之后时段时设为 true。
      */
     allowShiftToNextDay?: boolean;
     /**
@@ -89,7 +91,7 @@ export class RecommendationPlanner {
   }): Promise<PlanResult> {
     const timezone = args.timezone ?? "Asia/Shanghai";
     const now = args.now ?? new Date();
-    const allowShiftToNextDay = args.allowShiftToNextDay !== false; // default true
+    const allowShiftToNextDay = args.allowShiftToNextDay === true;
     const allowPastTime = args.allowPastTime === true;
 
     // 补记模式：不过滤 now 之前的槽位，让 Reasoner 从当天 08:00 起搜索历史可用段

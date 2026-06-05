@@ -11,7 +11,6 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { useTimeBlockStore } from "@/store/timeBlockStore";
-import { useTaskStore } from "@/store/taskStore";
 import { useUiStore } from "@/store/uiStore";
 import { useHeartbeatStore } from "@/store/heartbeatStore";
 import { BlockStatusBadge, BlockTypeDot } from "@/components/shared/StatusBadge";
@@ -43,9 +42,11 @@ function getStatusOverrideClasses(status: TimeBlock["status"]): string {
     case "delayed":
       return "!bg-orange-50 !border-orange-300 border-dashed";
     case "done":
+      return "!bg-green-50 !border-green-200";
     case "skipped":
+      return "!bg-gray-50 !border-gray-200 border-dashed";
     case "cancelled":
-      return "opacity-50";
+      return "!bg-red-50 !border-red-200 opacity-70";
     default:
       return "";
   }
@@ -63,7 +64,6 @@ export function TimeBlockCard({ block, dayStart }: TimeBlockCardProps) {
     completeBlockWithLinkage,
     skipBlockWithLinkage,
   } = useTimeBlockStore();
-  const { loadTasks } = useTaskStore();
   const { openTimeBlockForm } = useUiStore();
   const { openDelayDialog } = useHeartbeatStore();
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
@@ -89,7 +89,6 @@ export function TimeBlockCard({ block, dayStart }: TimeBlockCardProps) {
   const handleMarkDone = async () => {
     try {
       await completeBlockWithLinkage(block.id);
-      await loadTasks();
       toast.success("已标记完成");
     } catch (e) {
       toast.error(String(e));
@@ -99,7 +98,6 @@ export function TimeBlockCard({ block, dayStart }: TimeBlockCardProps) {
   const handleMarkSkipped = async () => {
     try {
       await skipBlockWithLinkage(block.id);
-      await loadTasks();
       toast.success("已跳过");
     } catch (e) {
       toast.error(String(e));
@@ -123,7 +121,6 @@ export function TimeBlockCard({ block, dayStart }: TimeBlockCardProps) {
   const handleMoveBack = async () => {
     try {
       const result = await moveBackToTask(block.id);
-      await loadTasks();
       toast.success(
         result.taskStatusUpdatedTo === "todo"
           ? "已移回待办列表"

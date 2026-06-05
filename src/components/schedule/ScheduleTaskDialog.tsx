@@ -5,7 +5,6 @@ import { toast } from "sonner";
 import { format, addMinutes } from "date-fns";
 import { useUiStore } from "@/store/uiStore";
 import { useTaskStore } from "@/store/taskStore";
-import { useTimeBlockStore } from "@/store/timeBlockStore";
 import { ScheduleService } from "@/services/ScheduleService";
 import { cn } from "@/lib/utils";
 
@@ -23,8 +22,7 @@ export function ScheduleTaskDialog() {
     closeScheduleDialog,
   } = useUiStore();
 
-  const { tasks, loadTasks } = useTaskStore();
-  const { refreshBlocks } = useTimeBlockStore();
+  const { tasks, scheduleTask } = useTaskStore();
 
   const task = scheduleForTaskId
     ? tasks.find((t) => t.id === scheduleForTaskId)
@@ -110,14 +108,13 @@ export function ScheduleTaskDialog() {
 
     setSubmitting(true);
     try {
-      await scheduleService.scheduleTaskToTimeBlock({
+      await scheduleTask({
         taskId: scheduleForTaskId,
         title: title.trim(),
         startTime: startISO,
         endTime: endISO,
       });
 
-      await Promise.all([loadTasks(), refreshBlocks()]);
       toast.success("任务已安排到日程");
       closeScheduleDialog();
     } catch (e) {
