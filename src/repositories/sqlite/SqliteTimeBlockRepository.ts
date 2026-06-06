@@ -65,7 +65,8 @@ export class SqliteTimeBlockRepository implements ITimeBlockRepository {
     options: { excludeDeleted?: boolean } = {}
   ): Promise<TimeBlock | null> {
     const db = await getDb();
-    const excludeDeleted = options.excludeDeleted === true;
+    // Default: exclude soft-deleted rows (consistent with findByTaskId / findByDateRange)
+    const excludeDeleted = options.excludeDeleted !== false;
     const rows = await db.select<Record<string, unknown>[]>(
       `SELECT * FROM time_blocks WHERE id = $1${excludeDeleted ? " AND deleted_at IS NULL" : ""}`,
       [id]
@@ -183,11 +184,11 @@ export class SqliteTimeBlockRepository implements ITimeBlockRepository {
 
     params.push(id);
     await db.execute(
-      `UPDATE time_blocks SET ${fields.join(", ")} WHERE id = $${idx}`,
+      `UPDATE time_blocks SET ${fields.join(", ")} WHERE id = $${idx} AND deleted_at IS NULL`,
       params
     );
 
-    const block = await this.findById(id);
+    const block = await this.findById(id, { excludeDeleted: false });
     if (!block) throw new Error("时间块不存在");
     return block;
   }

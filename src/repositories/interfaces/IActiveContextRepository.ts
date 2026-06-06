@@ -24,4 +24,9 @@ export interface IActiveContextRepository {
    * 返回受影响的行数。
    */
   invalidateByConversation(conversationId: string): Promise<number>;
+  /**
+   * B1: 把引用指定 task 的所有 status='active' 的 active_context 行标为 'invalidated'。
+   * 返回受影响的行数。
+   */
+  invalidateByActiveTaskId(taskId: string): Promise<number>;
 }

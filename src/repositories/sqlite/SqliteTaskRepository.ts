@@ -3,8 +3,8 @@ import type { ITaskRepository } from "@/repositories/interfaces/ITaskRepository"
 import type {
   Task,
   CreateTaskInput,
-  UpdateTaskInput,
   TaskFilter,
+  TaskPatch,
   TaskStatus,
 } from "@/types/task.types";
 
@@ -44,7 +44,8 @@ export class SqliteTaskRepository implements ITaskRepository {
     }
 
     if (!filter?.includeArchived) {
-      sql += " AND archived_at IS NULL";
+      // Double-guard: exclude both by archived_at timestamp and status field
+      sql += " AND archived_at IS NULL AND status != 'archived'";
     }
 
     if (filter?.status) {
@@ -69,7 +70,8 @@ export class SqliteTaskRepository implements ITaskRepository {
     options: { excludeDeleted?: boolean } = {}
   ): Promise<Task | null> {
     const db = await getDb();
-    const excludeDeleted = options.excludeDeleted === true;
+    // Default: exclude soft-deleted rows (consistent with findAll)
+    const excludeDeleted = options.excludeDeleted !== false;
     const rows = await db.select<Record<string, unknown>[]>(
       `SELECT * FROM tasks WHERE id = $1${excludeDeleted ? " AND deleted_at IS NULL" : ""}`,
       [id]
@@ -108,7 +110,7 @@ export class SqliteTaskRepository implements ITaskRepository {
     return task;
   }
 
-  async update(id: string, data: UpdateTaskInput): Promise<Task> {
+  async update(id: string, data: TaskPatch): Promise<Task> {
     const db = await getDb();
     const now = new Date().toISOString();
 
@@ -139,6 +141,18 @@ export class SqliteTaskRepository implements ITaskRepository {
     if (data.status !== undefined) {
       fields.push(`status = $${idx++}`);
       params.push(data.status);
+      // Enforce double-truth: archived_at must be in sync with status='archived'
+      if (data.archived_at === undefined) {
+        if (data.status === "archived") {
+          // Caller didn't supply archived_at — auto-set to now
+          fields.push(`archived_at = $${idx++}`);
+          params.push(now);
+        } else {
+          // Switching away from archived — auto-clear
+          fields.push(`archived_at = $${idx++}`);
+          params.push(null);
+        }
+      }
     }
     if (data.category !== undefined) {
       fields.push(`category = $${idx++}`);
@@ -167,11 +181,11 @@ export class SqliteTaskRepository implements ITaskRepository {
 
     params.push(id);
     await db.execute(
-      `UPDATE tasks SET ${fields.join(", ")} WHERE id = $${idx}`,
+      `UPDATE tasks SET ${fields.join(", ")} WHERE id = $${idx} AND deleted_at IS NULL`,
       params
     );
 
-    const task = await this.findById(id);
+    const task = await this.findById(id, { excludeDeleted: false });
     if (!task) throw new Error("任务不存在");
     return task;
   }

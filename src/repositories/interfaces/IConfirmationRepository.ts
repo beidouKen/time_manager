@@ -12,4 +12,6 @@ export interface IConfirmationRepository {
   expireOld(beforeDate: string): Promise<number>;
   /** C5: 批量把会话下 status='pending' 的 confirmation 改为 'invalidated'；返回影响行数 */
   invalidateByConversation(conversationId: string): Promise<number>;
+  /** B1: 把关联指定 task 的 status='pending' 的 confirmation 改为 'invalidated'；返回影响行数 */
+  invalidateByRelatedTask(taskId: string): Promise<number>;
 }

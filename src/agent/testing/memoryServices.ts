@@ -111,13 +111,17 @@ export class MemoryTaskService extends TaskService {
     const existing = await this.getTaskById(id);
     if (!existing) throw new Error("task not found");
     const now = new Date().toISOString();
-    return this.updateTask(id, {
+    const patch: Partial<Task> = {
       status,
+      updated_at: now,
       ...(status === "done" ? { completed_at: existing.completed_at ?? now } : {}),
-      ...(status !== "done" && status !== "archived" ? { completed_at: null } : {}),
-      ...(status !== "archived" ? { archived_at: null } : {}),
-      ...(status !== "deferred" ? { deferred_until: null } : {}),
-    });
+      ...(status !== "done" && status !== "archived" ? { completed_at: undefined } : {}),
+      ...(status !== "archived" ? { archived_at: undefined } : {}),
+      ...(status !== "deferred" ? { deferred_until: undefined } : {}),
+    };
+    const updated: Task = { ...existing, ...patch };
+    this.tasks = this.tasks.map((t) => (t.id === id ? updated : t));
+    return updated;
   }
 
   override async completeTask(
@@ -179,10 +183,15 @@ export class MemoryTaskService extends TaskService {
     if (existing.status !== "done" && existing.status !== "cancelled") {
       throw new Error("only done or cancelled tasks can be archived");
     }
-    return this.updateTask(id, {
+    const now = new Date().toISOString();
+    const updated: Task = {
+      ...existing,
       status: "archived",
-      archived_at: opts.archivedAt ?? new Date().toISOString(),
-    });
+      archived_at: opts.archivedAt ?? now,
+      updated_at: now,
+    };
+    this.tasks = this.tasks.map((t) => (t.id === id ? updated : t));
+    return updated;
   }
 
   override async unarchiveTask(id: string): Promise<Task> {
@@ -410,6 +419,18 @@ export class MemoryConfirmationRepository implements IConfirmationRepository {
     let count = 0;
     this.records = this.records.map((r) => {
       if (r.conversation_id === conversationId && r.status === "pending") {
+        count++;
+        return { ...r, status: "invalidated" as ConfirmationStatus };
+      }
+      return r;
+    });
+    return count;
+  }
+
+  async invalidateByRelatedTask(taskId: string): Promise<number> {
+    let count = 0;
+    this.records = this.records.map((r) => {
+      if (r.related_task_id === taskId && r.status === "pending") {
         count++;
         return { ...r, status: "invalidated" as ConfirmationStatus };
       }
@@ -826,6 +847,19 @@ export class MemoryActiveContextRepository implements IActiveContextRepository {
     let count = 0;
     this.records = this.records.map((r) => {
       if (r.conversation_id === conversationId && r.status === "active") {
+        count++;
+        return { ...r, status: "invalidated" as ActiveContextStatus, updated_at: now };
+      }
+      return r;
+    });
+    return count;
+  }
+
+  async invalidateByActiveTaskId(taskId: string): Promise<number> {
+    const now = new Date().toISOString();
+    let count = 0;
+    this.records = this.records.map((r) => {
+      if (r.active_task_id === taskId && r.status === "active") {
         count++;
         return { ...r, status: "invalidated" as ActiveContextStatus, updated_at: now };
       }

@@ -1,5 +1,7 @@
 import { SqliteActiveContextRepository } from "@/repositories/sqlite/SqliteActiveContextRepository";
+import { SqliteTaskRepository } from "@/repositories/sqlite/SqliteTaskRepository";
 import type { IActiveContextRepository } from "@/repositories/interfaces/IActiveContextRepository";
+import type { ITaskRepository } from "@/repositories/interfaces/ITaskRepository";
 import type {
   ActiveContext,
   SemanticEventDomain,
@@ -9,9 +11,24 @@ import type { PendingProposalSnapshot } from "@/agent/types";
 
 export class ActiveContextService {
   private repo: IActiveContextRepository;
+  private taskRepo: ITaskRepository;
 
-  constructor(repo?: IActiveContextRepository) {
+  constructor(repo?: IActiveContextRepository, taskRepo?: ITaskRepository) {
     this.repo = repo ?? new SqliteActiveContextRepository();
+    this.taskRepo = taskRepo ?? new SqliteTaskRepository();
+  }
+
+  /** B2: 验证 task_id 对应的任务存在且未删除/未归档，返回 false 则不应写入 */
+  private async _isTaskValid(taskId: string | undefined): Promise<boolean> {
+    if (!taskId) return true;
+    try {
+      const task = await this.taskRepo.findById(taskId, { excludeDeleted: true });
+      if (!task) return false;
+      if (task.archived_at || task.status === "archived") return false;
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   // ── 内部：lazy expiry ─────────────────────────────────────────────────────
@@ -36,13 +53,19 @@ export class ActiveContextService {
     expires_at?: string;
   }): Promise<ActiveContext> {
     const expiresAt = input.expires_at ?? this.defaultExpiresAt();
+
+    // B2: Only store active_task_id if the task is alive
+    const validTaskId = (await this._isTaskValid(input.related_task_id))
+      ? input.related_task_id
+      : undefined;
+
     return this.repo.create({
       conversation_id: input.conversation_id,
       active_confirmation_id: input.confirmation_id,
       active_turn_id: input.turn_id,
       active_domain: input.active_domain,
       active_intent: input.active_intent,
-      active_task_id: input.related_task_id,
+      active_task_id: validTaskId,
       active_time_block_id: input.related_time_block_id,
       expires_at: expiresAt,
       status: "active",
@@ -108,11 +131,15 @@ export class ActiveContextService {
     }
   ): Promise<ActiveContext> {
     await this.expireStaleNow();
+
+    // B2: Only write active_task_id if the task actually exists and is not archived/deleted
+    const validTaskId = (await this._isTaskValid(hint.task_id)) ? hint.task_id : undefined;
+
     const active = await this.repo.findActiveByConversation(conversationId);
     const patch = {
       active_domain: "time_management",
       active_intent: hint.intent ?? "ui_action",
-      active_task_id: hint.task_id ?? null,
+      active_task_id: validTaskId ?? null,
       active_time_block_id: hint.time_block_id ?? null,
       expires_at: this.defaultExpiresAt(),
     };
@@ -183,6 +210,14 @@ export class ActiveContextService {
    */
   async invalidateByConversation(conversationId: string): Promise<number> {
     return this.repo.invalidateByConversation(conversationId);
+  }
+
+  /**
+   * B1: 失效所有引用指定任务的活跃 context（任务变更时调用）。
+   * 确保任务完成/删除/归档/延期后，Agent 的 active context 不再指向已无效的任务。
+   */
+  async invalidateByRelatedTask(taskId: string): Promise<number> {
+    return this.repo.invalidateByActiveTaskId(taskId);
   }
 
   /** lazy expiry：把 expires_at < now 且 status='active' 的标记为 'expired'。 */

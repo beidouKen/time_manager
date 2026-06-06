@@ -3,12 +3,15 @@ import { SqliteTimeBlockRepository } from "@/repositories/sqlite/SqliteTimeBlock
 import type { ITaskRepository } from "@/repositories/interfaces/ITaskRepository";
 import type { ITimeBlockRepository } from "@/repositories/interfaces/ITimeBlockRepository";
 import { TimeBlockService } from "@/services/TimeBlockService";
+import { ConfirmationService } from "@/services/ConfirmationService";
+import { ActiveContextService } from "@/services/ActiveContextService";
 import type {
   Task,
   CreateTaskInput,
   UpdateTaskInput,
   TaskFilter,
   TaskStatus,
+  TaskPatch,
 } from "@/types/task.types";
 import { CreateTaskSchema, UpdateTaskSchema } from "@/types/task.types";
 
@@ -16,11 +19,32 @@ export class TaskService {
   private repo: ITaskRepository;
   private blockRepo: ITimeBlockRepository;
   private timeBlockService: TimeBlockService;
+  private confirmService: ConfirmationService;
+  private activeContextService: ActiveContextService;
 
-  constructor(repo?: ITaskRepository, blockRepo?: ITimeBlockRepository) {
+  constructor(
+    repo?: ITaskRepository,
+    blockRepo?: ITimeBlockRepository,
+    confirmService?: ConfirmationService,
+    activeContextService?: ActiveContextService
+  ) {
     this.repo = repo ?? new SqliteTaskRepository();
     this.blockRepo = blockRepo ?? new SqliteTimeBlockRepository();
     this.timeBlockService = new TimeBlockService(this.blockRepo);
+    this.confirmService = confirmService ?? new ConfirmationService();
+    this.activeContextService = activeContextService ?? new ActiveContextService();
+  }
+
+  /** B1: 失效关联该任务的陈旧 pending confirmation 和 active context */
+  private async _invalidateTaskContext(taskId: string): Promise<void> {
+    try {
+      await Promise.all([
+        this.confirmService.invalidateByRelatedTask(taskId),
+        this.activeContextService.invalidateByRelatedTask(taskId),
+      ]);
+    } catch (e) {
+      console.warn("[TaskService] invalidateTaskContext failed:", e);
+    }
   }
 
   async getTasks(filter?: TaskFilter): Promise<Task[]> {
@@ -48,13 +72,14 @@ export class TaskService {
     const existing = await this.repo.findById(id, { excludeDeleted: true });
     if (!existing) throw new Error("任务不存在");
     const now = new Date().toISOString();
-    return this.repo.update(id, {
+    const patch: TaskPatch = {
       status,
       ...(status === "done" ? { completed_at: existing.completed_at ?? now } : {}),
       ...(status !== "done" && status !== "archived" ? { completed_at: null } : {}),
       ...(status !== "archived" ? { archived_at: null } : {}),
       ...(status !== "deferred" ? { deferred_until: null } : {}),
-    });
+    };
+    return this.repo.update(id, patch);
   }
 
   async deleteTask(id: string): Promise<void> {
@@ -85,6 +110,8 @@ export class TaskService {
       }
       throw taskDeleteErr;
     }
+
+    await this._invalidateTaskContext(id);
   }
 
   async getActiveTasks(): Promise<Task[]> {
@@ -109,7 +136,23 @@ export class TaskService {
       archived_at: null,
       deferred_until: null,
     });
+
+    // Cancel future scheduled blocks
     await this.timeBlockService.batchCancelByTaskId(id, { onlyFuture: true });
+
+    // Also mark any currently in_progress block as done (eliminates task-done/block-in_progress drift)
+    const allBlocks = await this.blockRepo.findByTaskId(id);
+    const inProgressBlocks = allBlocks.filter(
+      (b) => !b.deleted_at && b.status === "in_progress"
+    );
+    for (const block of inProgressBlocks) {
+      await this.blockRepo.update(block.id, {
+        status: "done",
+        completed_at: completedAt,
+      });
+    }
+
+    await this._invalidateTaskContext(id);
     return task;
   }
 
@@ -159,6 +202,7 @@ export class TaskService {
       archived_at: null,
     });
     await this.timeBlockService.batchCancelByTaskId(id, { onlyFuture: true });
+    await this._invalidateTaskContext(id);
     return task;
   }
 
@@ -185,10 +229,14 @@ export class TaskService {
       throw new Error("只有已完成或已取消任务可以归档");
     }
 
-    return this.repo.update(id, {
+    const task = await this.repo.update(id, {
       status: "archived",
       archived_at: opts.archivedAt ?? new Date().toISOString(),
     });
+    // Cancel any remaining future scheduled blocks (e.g. done task with future blocks)
+    await this.timeBlockService.batchCancelByTaskId(id, { onlyFuture: true });
+    await this._invalidateTaskContext(id);
+    return task;
   }
 
   async unarchiveTask(id: string): Promise<Task> {

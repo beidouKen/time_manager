@@ -170,4 +170,17 @@ export class SqliteActiveContextRepository implements IActiveContextRepository {
     return (result as { rowsAffected?: number; changes?: number }).rowsAffected ??
       (result as { changes?: number }).changes ?? 0;
   }
+
+  async invalidateByActiveTaskId(taskId: string): Promise<number> {
+    const db = await getDb();
+    const now = new Date().toISOString();
+    const result = await db.execute(
+      `UPDATE active_contexts
+       SET status = 'invalidated', updated_at = $1
+       WHERE active_task_id = $2 AND status = 'active'`,
+      [now, taskId],
+    );
+    return (result as { rowsAffected?: number; changes?: number }).rowsAffected ??
+      (result as { changes?: number }).changes ?? 0;
+  }
 }

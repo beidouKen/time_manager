@@ -479,6 +479,13 @@ export class TimeManagementAgent {
         "4. 将类似性质的小任务集中处理，减少上下文切换成本。\n" +
         "5. 每天结束前回顾完成情况，为次日做好规划。\n" +
         "\n如需我帮你把某个任务安排进时间轴，直接告诉我任务名称和时间即可。";
+    } else if (actionPlan.params.taskNotFound) {
+      // V4.2+: mark_task_completed / defer_task 找不到任务
+      const keyword = String(actionPlan.params.keyword ?? "该任务");
+      finalResponseMessage = `未找到任务「${keyword}」，请告诉我具体的任务名称或重新选择。`;
+    } else if (actionPlan.params.noMatch) {
+      // B9: 批量操作没有匹配项
+      finalResponseMessage = String(actionPlan.params.noMatchText ?? "未找到匹配的任务，无需操作。");
     } else if (actionPlan.kind === "batch_action") {
       finalResponseMessage = `已收到批量操作请求（${actionPlan.summary}），请确认是否继续。`;
     } else if (actionPlan.kind === "defer_task") {

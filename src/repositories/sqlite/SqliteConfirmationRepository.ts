@@ -12,7 +12,7 @@ export class SqliteConfirmationRepository implements IConfirmationRepository {
     const id = crypto.randomUUID();
     const now = new Date().toISOString();
     const expiresAt =
-      data.expires_at ?? new Date(Date.now() + 30_000).toISOString();
+      data.expires_at ?? new Date(Date.now() + 5 * 60 * 1000).toISOString();
 
     await db.execute(
       `INSERT INTO pending_confirmations
@@ -110,6 +110,17 @@ export class SqliteConfirmationRepository implements IConfirmationRepository {
        SET status = 'invalidated'
        WHERE conversation_id = $1 AND status = 'pending'`,
       [conversationId]
+    );
+    return result.rowsAffected;
+  }
+
+  async invalidateByRelatedTask(taskId: string): Promise<number> {
+    const db = await getDb();
+    const result = await db.execute(
+      `UPDATE pending_confirmations
+       SET status = 'invalidated'
+       WHERE related_task_id = $1 AND status = 'pending'`,
+      [taskId]
     );
     return result.rowsAffected;
   }

@@ -3,6 +3,7 @@ import type { ActiveContext } from "@/types/agent.types";
 
 interface ActiveContextBannerOptions {
   activeContext?: ActiveContext | null;
+  activeTaskTitle?: string | null;
   pendingConfirmation?: {
     confirmationId?: string;
     toolName?: string;
@@ -45,7 +46,11 @@ export function buildActiveContextBannerText(
 
   const activeContext = options.activeContext;
   if (activeContext?.active_task_id) {
-    parts.push(`关注任务：${activeContext.active_task_id}`);
+    // C4: Show task title if available, fallback to shortened ID
+    const displayName =
+      options.activeTaskTitle ??
+      activeContext.active_task_id.slice(0, 8) + "…";
+    parts.push(`关注任务：${displayName}`);
   }
   if (activeContext?.active_time_block_id) {
     parts.push(`关注时间块：${activeContext.active_time_block_id}`);

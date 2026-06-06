@@ -57,6 +57,8 @@ export function ChatMessage({ message }: Props) {
   const isLLM = message.metadata?.source === "llm";
   const traceMode = trace?.mode;
   const isError = traceMode === "error";
+  // C7: tool execution failure (resultType = 'failure')
+  const isToolFailure = message.metadata?.resultType === "failure" && !isUser;
 
   // 兼容旧字段（无 trace 时降级）
   const llmResponseType = trace
@@ -67,7 +69,7 @@ export function ChatMessage({ message }: Props) {
   // 气泡样式
   const bubbleStyle = (() => {
     if (isUser) return "bg-blue-600 text-white rounded-br-sm";
-    if (isError) return "bg-red-50 text-red-800 border border-red-200 rounded-bl-sm";
+    if (isError || isToolFailure) return "bg-red-50 text-red-800 border border-red-200 rounded-bl-sm";
     if (llmResponseType === "clarification") {
       return "bg-amber-50 text-gray-800 border border-amber-200 rounded-bl-sm";
     }
@@ -91,7 +93,7 @@ export function ChatMessage({ message }: Props) {
         )}
       >
         {/* 错误前置图标 */}
-        {isError && !isUser && (
+        {(isError || isToolFailure) && !isUser && (
           <span className="mr-1 text-red-500">⚠</span>
         )}
 
@@ -106,6 +108,18 @@ export function ChatMessage({ message }: Props) {
         )}
 
         {message.content}
+
+        {/* C7: 工具执行失败时显示复制错误内容按钮 */}
+        {isToolFailure && (
+          <div className="flex gap-2 mt-2 pt-2 border-t border-red-200">
+            <button
+              onClick={() => navigator.clipboard.writeText(message.content)}
+              className="px-2 py-0.5 text-xs text-red-600 border border-red-300 rounded hover:bg-red-100"
+            >
+              复制错误
+            </button>
+          </div>
+        )}
 
         {/* 危险操作确认按钮：仅在 pending 状态下显示（V3.7 P0-1） */}
         {isPendingConfirmation && confirmationId && message.role === "assistant" && (

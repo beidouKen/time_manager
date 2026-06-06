@@ -38,10 +38,12 @@ function hasTodayActiveBlock(taskId: string, blocks: TimeBlock[], day: Date): bo
 function Section({
   icon: Icon,
   title,
+  count,
   children,
 }: {
   icon: typeof PlayCircle;
   title: string;
+  count?: number;
   children: ReactNode;
 }) {
   return (
@@ -49,6 +51,11 @@ function Section({
       <div className="flex items-center gap-1.5 text-xs font-medium text-gray-500 mb-1.5">
         <Icon size={13} />
         <span>{title}</span>
+        {count !== undefined && count > 0 && (
+          <span className="ml-auto text-[10px] font-semibold bg-gray-100 text-gray-600 rounded-full px-1.5 py-0.5 leading-none">
+            {count}
+          </span>
+        )}
       </div>
       <div className="space-y-1">{children}</div>
     </section>
@@ -110,26 +117,26 @@ export function TodaySections() {
 
   return (
     <div className="grid grid-cols-5 border-b border-gray-100 bg-white">
-      <Section icon={PlayCircle} title="进行中">
+      <Section icon={PlayCircle} title="进行中" count={currentBlocks.length}>
         {currentBlocks.slice(0, 3).map((block) => <BlockLine key={block.id} block={block} />)}
         {currentBlocks.length === 0 && <EmptyLine />}
       </Section>
-      <Section icon={Clock3} title="即将开始">
+      <Section icon={Clock3} title="即将开始" count={upcomingBlocks.length}>
         {upcomingBlocks.slice(0, 3).map((block) => <BlockLine key={block.id} block={block} />)}
         {upcomingBlocks.length === 0 && <EmptyLine />}
       </Section>
-      <Section icon={RotateCcw} title="今日待处理">
+      <Section icon={RotateCcw} title="今日待处理" count={dueTodoTasks.length}>
         {dueTodoTasks.slice(0, 3).map((task) => <TaskLine key={task.id} task={task} />)}
         {dueTodoTasks.length === 0 && <EmptyLine />}
       </Section>
-      <Section icon={CheckCircle2} title="已完成">
+      <Section icon={CheckCircle2} title="已完成" count={completedTasks.length + completedBlocks.length}>
         {completedTasks.slice(0, 2).map((task) => <TaskLine key={task.id} task={task} />)}
         {completedBlocks.slice(0, Math.max(0, 3 - completedTasks.length)).map((block) => (
           <BlockLine key={block.id} block={block} />
         ))}
         {completedTasks.length + completedBlocks.length === 0 && <EmptyLine />}
       </Section>
-      <Section icon={SkipForward} title="跳过/延后">
+      <Section icon={SkipForward} title="跳过/延后" count={skippedOrDelayedBlocks.length + deferredTasks.length}>
         {skippedOrDelayedBlocks.slice(0, 2).map((block) => <BlockLine key={block.id} block={block} />)}
         {deferredTasks.slice(0, Math.max(0, 3 - skippedOrDelayedBlocks.length)).map((task) => (
           <TaskLine key={task.id} task={task} />

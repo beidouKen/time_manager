@@ -230,11 +230,24 @@ export class ActionPlanner implements PlannerPort {
       case "batch_delete_tasks": {
         const { dateRange } = frame;
         const actions = await this.buildBatchDeleteActions(dateRange);
-        // dateRange 已提供但匹配为空 → 返回空 actions[] 并提示无需操作
+
+        // B9: Empty actions → direct response, no confirmation popup
+        if (actions.length === 0) {
+          const noMatchText = dateRange
+            ? `${dateRange.sourceText ?? "指定范围"}内未找到活跃任务，无需操作`
+            : "未找到可删除的活跃任务";
+          return {
+            ...base,
+            kind: "direct_response",
+            params: { currentDatetime: context.currentDatetime, noMatch: true, noMatchText },
+            summary: noMatchText,
+            traceLabel: "batch_delete_tasks:empty_no_confirmation",
+            replayKey: `batch_delete:empty:${dateRange?.from ?? ""}`,
+          };
+        }
+
         const summaryText = dateRange
-          ? actions.length === 0
-            ? `${dateRange.sourceText ?? ""}范围内未找到活跃任务`
-            : `批量删除${dateRange.sourceText ?? ""}活跃任务（共 ${actions.length} 个）`
+          ? `批量删除${dateRange.sourceText ?? ""}活跃任务（共 ${actions.length} 个）`
           : `批量删除全部活跃任务（共 ${actions.length} 个）`;
         return {
           ...base,
@@ -402,6 +415,50 @@ export class ActionPlanner implements PlannerPort {
           replayKey: `request_advice:${context.currentDatetime.slice(0, 10)}`,
         };
 
+      // V4.2+: 完成任务（路由到 mark_task_completed Tool）
+      case "mark_task_completed": {
+        const taskId =
+          context.lastCreatedTaskId ?? context.lastMentionedTaskIds[0] ?? null;
+        const keyword = frame.objectReferences[0]?.keyword;
+        const resolvedTaskId =
+          taskId ?? (await this.findTaskIdByKeyword(keyword));
+        const title = frame.extractedTitle ?? keyword ?? "该任务";
+
+        if (!resolvedTaskId) {
+          return {
+            ...base,
+            kind: "direct_response",
+            params: { currentDatetime: context.currentDatetime, taskNotFound: true, keyword: title },
+            summary: "mark_task_completed:not_found",
+            traceLabel: "mark_task_completed:not_found",
+            replayKey: `complete:not_found:${title}`,
+          };
+        }
+
+        return {
+          ...base,
+          kind: "tool",
+          toolName: "mark_task_completed",
+          params: { taskId: resolvedTaskId, title },
+          summary: `完成任务「${title}」`,
+          refreshHints: { tasks: true, timeline: true },
+          traceLabel: "mark_task_completed:tool",
+          replayKey: `complete:${resolvedTaskId}`,
+        };
+      }
+
+      // V4.2+: 查看今日日程（只读，路由到 get_today_plan Tool）
+      case "query_today_schedule":
+        return {
+          ...base,
+          kind: "tool",
+          toolName: "get_today_plan",
+          params: { currentDatetime: context.currentDatetime },
+          summary: "查看今日日程",
+          traceLabel: "query_today_schedule:get_today_plan",
+          replayKey: `query_today_schedule:${context.currentDatetime.slice(0, 10)}`,
+        };
+
       default:
         return {
           ...base,
@@ -508,21 +565,13 @@ export class ActionPlanner implements PlannerPort {
   ): SinglePlanAction[] {
     if (!taskId) return [];
 
-    if (targetTime) {
-      return [
-        {
-          toolName: "update_task",
-          params: { taskId, deadline: targetTime },
-          summary: `将「${title}」截止时间更新为 ${targetTime.slice(0, 10)}`,
-        },
-      ];
-    }
-
+    // Unified path: always use DeferTaskTool → TaskService.deferTask
+    // This sets status=deferred + cancels future blocks (unlike the old update_task path)
     return [
       {
-        toolName: "update_task",
-        params: { taskId, status: "todo" },
-        summary: `将「${title}」标记为待办（稍后安排）`,
+        toolName: "defer_task",
+        params: { taskId, ...(targetTime ? { until: targetTime } : {}) },
+        summary: `将「${title}」标记为延期${targetTime ? `，延期到 ${targetTime.slice(0, 10)}` : ""}`,
       },
     ];
   }

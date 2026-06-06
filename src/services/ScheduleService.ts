@@ -1,7 +1,7 @@
-import { SqliteTaskRepository } from "@/repositories/sqlite/SqliteTaskRepository";
 import { SqliteTimeBlockRepository } from "@/repositories/sqlite/SqliteTimeBlockRepository";
-import type { ITaskRepository } from "@/repositories/interfaces/ITaskRepository";
 import type { ITimeBlockRepository } from "@/repositories/interfaces/ITimeBlockRepository";
+import { TaskService } from "@/services/TaskService";
+import { TimeBlockService } from "@/services/TimeBlockService";
 import type { TimeBlock } from "@/types/timeblock.types";
 import { getDayRange } from "@/lib/dateUtils";
 import { detectConflicts, type ConflictResult } from "@/lib/conflictDetector";
@@ -25,12 +25,17 @@ export interface MoveBackResult {
 }
 
 export class ScheduleService {
-  private taskRepo: ITaskRepository;
+  private taskService: TaskService;
+  private timeBlockService: TimeBlockService;
   private blockRepo: ITimeBlockRepository;
 
-  constructor(taskRepo?: ITaskRepository, blockRepo?: ITimeBlockRepository) {
-    this.taskRepo = taskRepo ?? new SqliteTaskRepository();
+  constructor(
+    taskService?: TaskService,
+    blockRepo?: ITimeBlockRepository
+  ) {
     this.blockRepo = blockRepo ?? new SqliteTimeBlockRepository();
+    this.taskService = taskService ?? new TaskService();
+    this.timeBlockService = new TimeBlockService(this.blockRepo);
   }
 
   /**
@@ -54,8 +59,8 @@ export class ScheduleService {
     const { taskId, title, startTime, endTime, initialStatus } = input;
     const isBackfill = initialStatus === "done";
 
-    // Validate task exists
-    const task = await this.taskRepo.findById(taskId, { excludeDeleted: true });
+    // Validate task exists (via TaskService)
+    const task = await this.taskService.getTaskById(taskId);
     if (!task) throw new Error("任务不存在");
     // V3.8+: 补记模式允许对任何状态的任务追加历史时间块
     if (
@@ -79,8 +84,8 @@ export class ScheduleService {
       throw new Error(`时间冲突：与「${conflictTitles}」重叠，请调整时间`);
     }
 
-    // Create time block
-    let block = await this.blockRepo.create({
+    // Create time block via TimeBlockService
+    let block = await this.timeBlockService.createTimeBlock({
       task_id: taskId,
       title,
       start_time: startTime,
@@ -90,19 +95,18 @@ export class ScheduleService {
     });
 
     if (isBackfill) {
-      block = await this.blockRepo.update(block.id, {
+      block = await this.timeBlockService.updateTimeBlock(block.id, {
         status: "done",
         completed_at: new Date().toISOString(),
       });
     }
 
-    // V3.8+: 补记模式 → 将任务标记为已完成；普通安排 → 标记为 scheduled
-    await this.taskRepo.update(taskId, {
-      status: isBackfill ? "done" : "scheduled",
-      completed_at: isBackfill ? new Date().toISOString() : null,
-      archived_at: null,
-      deferred_until: null,
-    });
+    // V3.8+: 补记模式 → TaskService.completeTask；普通安排 → updateTaskStatus('scheduled')
+    if (isBackfill) {
+      await this.taskService.completeTask(taskId, { completedAt: new Date().toISOString() });
+    } else {
+      await this.taskService.updateTaskStatus(taskId, "scheduled");
+    }
 
     return block;
   }
@@ -112,7 +116,7 @@ export class ScheduleService {
    * Soft-deletes the TimeBlock and updates task status back to 'todo' if no other blocks remain.
    */
   async moveTimeBlockBackToTask(timeBlockId: string): Promise<MoveBackResult> {
-    const block = await this.blockRepo.findById(timeBlockId, { excludeDeleted: true });
+    const block = await this.timeBlockService.getBlockById(timeBlockId);
     if (!block) throw new Error("时间块不存在");
 
     // Guard: only task-type blocks with a task_id can be moved back
@@ -133,15 +137,15 @@ export class ScheduleService {
 
     const taskId = block.task_id;
 
-    // Soft-delete the time block
-    await this.blockRepo.softDelete(timeBlockId);
+    // Soft-delete the time block via TimeBlockService
+    await this.timeBlockService.deleteTimeBlock(timeBlockId);
 
     // Count remaining active time blocks for this task
-    const remainingCount = await this.blockRepo.countActiveByTaskId(taskId);
+    const remainingCount = await this.timeBlockService.countActiveByTaskId(taskId);
 
-    // Determine new task status
+    // Determine new task status and update via TaskService
     const newTaskStatus = remainingCount > 0 ? "scheduled" : "todo";
-    await this.taskRepo.update(taskId, { status: newTaskStatus });
+    await this.taskService.updateTaskStatus(taskId, newTaskStatus);
 
     return {
       timeBlockId,

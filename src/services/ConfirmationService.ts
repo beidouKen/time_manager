@@ -86,4 +86,12 @@ export class ConfirmationService {
   async invalidateByConversation(conversationId: string): Promise<number> {
     return this.repo.invalidateByConversation(conversationId);
   }
+
+  /**
+   * B1: 失效所有关联指定任务的 pending 确认（任务变更时调用）。
+   * 确保任务完成/删除/归档/延期后，陈旧的 pending proposal 立即失效。
+   */
+  async invalidateByRelatedTask(taskId: string): Promise<number> {
+    return this.repo.invalidateByRelatedTask(taskId);
+  }
 }
