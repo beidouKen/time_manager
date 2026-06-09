@@ -5,7 +5,7 @@ import type {
   SinglePlanAction,
 } from "@/agent/types";
 import { formatDateKey } from "@/agent/experience/dateFormatting";
-import type { PlannerPort } from "@/agent/experience/PlannerPort";
+import type { PlannerExtras, PlannerPort } from "@/agent/experience/PlannerPort";
 import { TaskService } from "@/services/TaskService";
 
 const DEFAULT_DURATION_MINUTES = 30;
@@ -16,7 +16,8 @@ export class ActionPlanner implements PlannerPort {
 
   async plan(
     frame: SemanticFrame,
-    context: AgentExperienceContext
+    context: AgentExperienceContext,
+    _extras?: PlannerExtras
   ): Promise<ExperienceActionPlan> {
     const base = {
       id: crypto.randomUUID(),

@@ -16,15 +16,17 @@
 // - 不直接访问 Service / Repository
 // ============================================================
 
-import type { LLMClient } from "@/agent/llm/LLMClient";
+import type { LLMClient, LLMMessage } from "@/agent/llm/LLMClient";
 import { LLMError } from "@/agent/llm/LLMClient";
 import { buildSystemPrompt, formatContextBlock } from "@/agent/llm/prompts";
+import { buildRagPromptBlock } from "@/agent/llm/ragContext";
 import type { LLMContext } from "@/agent/llm/contextBuilder";
 import {
   parseLLMExperienceResponse,
   type LLMExperiencePlanResponse,
 } from "@/agent/llm/experienceSchemas";
-import type { PlannerPort } from "@/agent/experience/PlannerPort";
+import type { PlannerExtras, PlannerPort } from "@/agent/experience/PlannerPort";
+import type { RagAdapter } from "@/agent/memory/RagAdapter";
 import type {
   AgentExperienceContext,
   ExperienceActionPlan,
@@ -56,16 +58,46 @@ export class LLMUnavailableError extends Error {
   }
 }
 
+// ─── RAG 注入元数据（供 CompositePlanner / TimeManagementAgent 读取） ───────
+
+export interface RagInjectionMeta {
+  injected: boolean;
+  snippetCount: number;
+  query?: string;
+}
+
+export interface LLMExperiencePlannerOptions {
+  /**
+   * V3.8+: 可选 RAG 适配器。若提供，则在调用 LLM.chat() 之前先用
+   * RagAdapter 检索相关 snippets，并以受控 system block 注入 messages。
+   * 不提供时行为完全与旧版等价。
+   *
+   * 这是 RAG 工具化前的过渡能力，不是长期目标架构。
+   * 长期目标是让 LLM/Agent 通过 rag_retrieve tool 主动检索知识，
+   * 再基于 tool observation 继续规划 task/schedule/timeblock 工具。
+   */
+  ragAdapter?: RagAdapter;
+}
+
 // ─── LLMExperiencePlanner ────────────────────────────────────────────────────
 
 export class LLMExperiencePlanner implements PlannerPort {
   private validator: PlanSafetyValidator;
+  private ragAdapter: RagAdapter | undefined;
+
+  /**
+   * V3.8+: 最近一次 plan() 调用的 RAG 注入元数据。
+   * 仅供 trace / probe 读取，不影响主链路。
+   */
+  lastRagMeta: RagInjectionMeta | undefined = undefined;
 
   constructor(
     private client: LLMClient,
-    router: ToolRouter
+    router: ToolRouter,
+    options?: LLMExperiencePlannerOptions
   ) {
     this.validator = new PlanSafetyValidator(router);
+    this.ragAdapter = options?.ragAdapter;
   }
 
   isAvailable(): boolean {
@@ -74,8 +106,12 @@ export class LLMExperiencePlanner implements PlannerPort {
 
   async plan(
     frame: SemanticFrame,
-    context: AgentExperienceContext
+    context: AgentExperienceContext,
+    extras?: PlannerExtras
   ): Promise<ExperienceActionPlan> {
+    // 重置 RAG meta，避免上一次结果泄漏到本次 trace
+    this.lastRagMeta = { injected: false, snippetCount: 0 };
+
     if (!this.client.isAvailable()) {
       throw new LLMUnavailableError("disabled", "LLM 客户端不可用（未配置 API key 或已禁用）");
     }
@@ -88,8 +124,22 @@ export class LLMExperiencePlanner implements PlannerPort {
     const llmContext = this.buildLLMContext(context);
     const contextBlock = formatContextBlock(llmContext);
 
-    const messages = [
-      { role: "system" as const, content: systemPrompt },
+    // V3.8+: RAG-before-LLM 注入
+    const ragQuery = this.buildRagQuery(frame, context, extras);
+    const ragResult = await buildRagPromptBlock(this.ragAdapter, ragQuery);
+    if (ragResult.injected) {
+      this.lastRagMeta = {
+        injected: true,
+        snippetCount: ragResult.snippetCount,
+        query: ragResult.query,
+      };
+    }
+
+    const messages: LLMMessage[] = [
+      { role: "system", content: systemPrompt },
+      ...(ragResult.injected
+        ? [{ role: "system" as const, content: ragResult.systemBlock }]
+        : []),
       ...context.recentMessages
         .slice(-6)
         .map((m) => ({
@@ -147,6 +197,46 @@ export class LLMExperiencePlanner implements PlannerPort {
   }
 
   // ─── 辅助方法 ──────────────────────────────────────────────────────────────
+
+  /**
+   * V3.8+: 为 RAG 检索构造 query。
+   *
+   * 优先级（取第一个非空值）：
+   * 1. extras.userInput（最语义化）
+   * 2. frame.extractedTitle
+   * 3. context.recentMessages 中最后一条 role=user 的消息
+   * 4. 拼接 frame.timeExpressions / durationExpressions / objectReferences 的 sourceText
+   *
+   * 严格不使用 currentDatetime，避免污染检索。
+   */
+  private buildRagQuery(
+    frame: SemanticFrame,
+    context: AgentExperienceContext,
+    extras: PlannerExtras | undefined
+  ): string {
+    const fromInput = extras?.userInput?.trim();
+    if (fromInput) return fromInput.slice(0, 200);
+
+    const fromTitle = frame.extractedTitle?.trim();
+    if (fromTitle) return fromTitle.slice(0, 200);
+
+    const lastUserMsg = [...context.recentMessages]
+      .reverse()
+      .find((m) => m.role === "user")?.content?.trim();
+    if (lastUserMsg) return lastUserMsg.slice(0, 200);
+
+    const composite = [
+      ...frame.objectReferences.map((r) => r.sourceText),
+      ...frame.timeExpressions.map((t) => t.sourceText),
+      ...frame.durationExpressions.map((d) => d.sourceText),
+    ]
+      .filter(Boolean)
+      .join(" ")
+      .trim();
+    if (composite) return composite.slice(0, 200);
+
+    return "";
+  }
 
   private buildLLMContext(context: AgentExperienceContext): LLMContext {
     const currentDate = context.currentDatetime.slice(0, 10);

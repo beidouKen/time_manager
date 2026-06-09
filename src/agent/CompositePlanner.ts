@@ -10,7 +10,7 @@
 // 提供 lastFallbackReason 属性，供 AgentTrace.errorKind 记录。
 // ============================================================
 
-import type { PlannerPort } from "@/agent/experience/PlannerPort";
+import type { PlannerExtras, PlannerPort } from "@/agent/experience/PlannerPort";
 import { ActionPlanner } from "@/agent/experience/ActionPlanner";
 import {
   LLMExperiencePlanner,
@@ -22,6 +22,7 @@ import type {
   SemanticFrame,
 } from "@/agent/types";
 import type { LLMUnavailableKind } from "@/agent/llm/LLMExperiencePlanner";
+import type { RagInjectionMeta } from "@/agent/llm/LLMExperiencePlanner";
 
 export class CompositePlanner implements PlannerPort {
   lastUsedPlanner: "llm" | "rule" = "rule";
@@ -32,13 +33,23 @@ export class CompositePlanner implements PlannerPort {
     private fallback: ActionPlanner
   ) {}
 
+  /**
+   * V3.8+: 透传 llmPlanner.lastRagMeta，供 TimeManagementAgent 写入 AgentTrace。
+   * 仅在最近一次 plan() 走 LLM 路径时有意义。
+   */
+  get lastRagMeta(): RagInjectionMeta | undefined {
+    if (this.lastUsedPlanner !== "llm") return undefined;
+    return this.llmPlanner?.lastRagMeta;
+  }
+
   async plan(
     frame: SemanticFrame,
-    context: AgentExperienceContext
+    context: AgentExperienceContext,
+    extras?: PlannerExtras
   ): Promise<ExperienceActionPlan> {
     if (this.llmPlanner?.isAvailable()) {
       try {
-        const plan = await this.llmPlanner.plan(frame, context);
+        const plan = await this.llmPlanner.plan(frame, context, extras);
         this.lastUsedPlanner = "llm";
         this.lastFallbackReason = undefined;
         return plan;
@@ -56,6 +67,6 @@ export class CompositePlanner implements PlannerPort {
     }
 
     this.lastUsedPlanner = "rule";
-    return this.fallback.plan(frame, context);
+    return this.fallback.plan(frame, context, extras);
   }
 }

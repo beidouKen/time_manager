@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "agent:probe": "node scripts/agent-probe.mjs",
     "test": "vitest run",
     "preview": "vite preview",
     "tauri": "tauri"

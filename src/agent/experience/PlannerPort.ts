@@ -14,9 +14,20 @@
 
 import type { AgentExperienceContext, ExperienceActionPlan, SemanticFrame } from "@/agent/types";
 
+/**
+ * V3.8+: planner 可选透传额外信号。
+ * - userInput: 原始用户输入，供 RAG 等上下文构建层构造 query。
+ *
+ * 这是一个可选 prop，现有实现可以忽略；新增字段保持向后兼容。
+ */
+export interface PlannerExtras {
+  userInput?: string;
+}
+
 export interface PlannerPort {
   plan(
     frame: SemanticFrame,
-    context: AgentExperienceContext
+    context: AgentExperienceContext,
+    extras?: PlannerExtras
   ): Promise<ExperienceActionPlan>;
 }

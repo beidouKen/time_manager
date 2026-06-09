@@ -198,6 +198,25 @@ export class AgentService {
   private handlers: Map<AgentDomain, AgentHandler>;
 
   // Phase 1+: 可选适配器（mock 或未来真实实现）
+  //
+  // ─── Memory / RAG 架构说明（V3.8+ 工具化预留） ───────────────────────────
+  //
+  // memoryAdapter：
+  // - 当前仍服务于 RecommendationHandler 的隐式建议链路（后置注脚）。
+  // - 长期目标：通过 memory_retrieve / memory_record 工具暴露给 Agent，
+  //   而不是散落在业务代码里的隐式状态。
+  // - memory_retrieve：只读低风险工具（见 src/agent/tools/memory/memoryRetrieveTool.ts）。
+  // - memory_record：涉及长期状态写入，未来需去重/置信度/确认策略，当前不注册。
+  //
+  // ragAdapter：
+  // - 当前还服务于 ragContext 的过渡式 RAG-before-LLM prompt 注入
+  //   （见 src/agent/llm/ragContext.ts → LLMExperiencePlanner.plan()）。
+  // - 长期目标：通过 rag_retrieve 工具暴露给 Agent 主动调用
+  //   （见 src/agent/tools/rag/ragRetrieveTool.ts），不再扩大隐式 prompt 注入。
+  //
+  // 本阶段只预留接口与注释，不切换主链路。详见：
+  // docs/V3.8/RAG_AND_MEMORY_TOOLIZATION_NOTES.md
+  //
   readonly memoryAdapter: MemoryAdapter | undefined;
   readonly ragAdapter: RagAdapter | undefined;
   readonly notificationAdapter: NotificationAdapter | undefined;
@@ -239,7 +258,12 @@ export class AgentService {
       if (options.llmClient !== null) {
         const client = options.llmClient ?? this.createDefaultLLMClient();
         if (client) {
-          llmPlanner = new LLMExperiencePlanner(client, this.router);
+          // V3.8+: 注入 ragAdapter，让 LLMExperiencePlanner 在调用 client.chat()
+          // 之前用 RAG 检索 snippets 并注入到 messages。
+          // 注意：DomainRoutingService 不接 ragAdapter，避免影响路由稳定性。
+          llmPlanner = new LLMExperiencePlanner(client, this.router, {
+            ragAdapter: this.ragAdapter,
+          });
         }
       }
       this.plannerPort = new CompositePlanner(llmPlanner, rulePlanner);
@@ -315,6 +339,35 @@ export class AgentService {
     this.router.register(new GetTodayPlanTool(this.timeBlockService, this.taskService));
     this.router.register(new ExplainTaskTool(this.taskService, this.timeBlockService));
     this.router.register(new ExplainScheduleTool(this.timeBlockService));
+
+    // ─── 未注册的 Tool 化预留（V3.8+） ─────────────────────────────────────
+    // 当前不注册以下工具：
+    // - RagRetrieveTool     (src/agent/tools/rag/ragRetrieveTool.ts)
+    // - MemoryRetrieveTool  (src/agent/tools/memory/memoryRetrieveTool.ts)
+    // - MemoryRecordTool    (src/agent/tools/memory/memoryRecordTool.ts)
+    //
+    // 也不把它们加入 prompts.ts 的 TOOL_DESCRIPTIONS 工具白名单，
+    // 避免 LLM 当前阶段就开始主动调用知识 / 记忆工具。
+    //
+    // 原因：
+    // - 当前 LLMExperiencePlanner 仍是单轮 JSON plan，不具备稳定的
+    //   tool -> observation -> replan 循环。
+    // - 如果暴露 rag_retrieve / memory_retrieve，LLM 可能只检索 RAG/Memory
+    //   就结束，无法继续基于结果调用 schedule_task / get_today_plan 等工具，
+    //   反而降低时间管理主链路稳定性。
+    // - memory_record 涉及长期状态写入，需要更严格的去重 / 置信度 /
+    //   用户可见性 / confirmation 策略，未落地前不应让 LLM 随意写。
+    //
+    // 当前 RAG 上下文走的是过渡链路：
+    //   src/agent/llm/ragContext.ts → LLMExperiencePlanner.plan() 内的 system block 注入
+    // 当前 Memory 仍以 memoryAdapter 形式服务于 RecommendationHandler 的隐式建议链路。
+    //
+    // 后续工具化路线（不在本次范围）：
+    //   this.router.register(new RagRetrieveTool(this.ragAdapter));
+    //   this.router.register(new MemoryRetrieveTool(this.memoryAdapter));
+    //   this.router.register(new MemoryRecordTool(this.memoryAdapter));
+    //
+    // 详见 docs/V3.8/RAG_AND_MEMORY_TOOLIZATION_NOTES.md
   }
 
   // ─── 主入口：处理用户输入（V3.5 LLM-first，无 fallback） ───────────────────

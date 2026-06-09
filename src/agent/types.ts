@@ -458,6 +458,20 @@ export interface AgentTrace {
    * V5+: 建议类响应的分类。
    */
   suggestionKind?: "suggestion" | "confirmation_required" | "executable_action";
+  /**
+   * V3.8+: 是否在 LLMExperiencePlanner.chat() 调用前注入了 RAG 上下文。
+   * 用于 probe / dev 观测；不影响主链路行为。
+   */
+  ragContextInjected?: boolean;
+  /**
+   * V3.8+: 实际注入到 LLM prompt 中的 RAG snippet 数量（截断后）。
+   */
+  ragSnippetCount?: number;
+  /**
+   * V3.8+: 用于 RAG 检索的 query 文本（已截断），仅用于 trace。
+   * 不进入用户最终回复。
+   */
+  ragQuery?: string;
 }
 
 // ─── V3.5 AgentMessage ──────────────────────────────────────────────────────

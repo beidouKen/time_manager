@@ -97,7 +97,13 @@ export class TimeManagementAgent {
     semanticFrame: SemanticFrame;
   }): Promise<TimeManagementHandleResult> {
     const { userInput, context, semanticFrame } = args;
-    const rawPlan = await this.deps.plannerPort.plan(semanticFrame, context);
+    // V3.8+: 透传 userInput 给 planner，供 RAG 上下文构建层使用
+    const rawPlan = await this.deps.plannerPort.plan(semanticFrame, context, {
+      userInput,
+    });
+
+    // V3.8+: 读取 planner 的 RAG 注入元数据（仅 CompositePlanner / LLMExperiencePlanner 暴露）
+    const ragMeta = this.readRagMeta();
 
     // V3.7: 所有 planner 输出都经过 PlanSafetyValidator 统一校验
     const safetyResult = this.safetyValidator.validate(rawPlan);
@@ -129,6 +135,7 @@ export class TimeManagementAgent {
         toolResults: [],
         finalResponse: fallbackResponse,
         planSummary: rawPlan.summary,
+        ...this.spreadRagMeta(ragMeta),
       };
       return {
         response: {
@@ -206,6 +213,7 @@ export class TimeManagementAgent {
             riskLevel: policyRisk,
             toolName: actionPlan.toolName,
           },
+          ...this.spreadRagMeta(ragMeta),
         };
 
         const metadata: ChatMessageMetadata = {
@@ -403,6 +411,7 @@ export class TimeManagementAgent {
       toolResults,
       finalResponse,
       planSummary: actionPlan.summary,
+      ...this.spreadRagMeta(ragMeta),
     };
 
     const primaryResult = toolResults[0];
@@ -461,6 +470,37 @@ export class TimeManagementAgent {
       return composite.lastUsedPlanner === "llm" ? "llm" : "experience";
     }
     return "experience";
+  }
+
+  /**
+   * V3.8+: 从 plannerPort 读取本次 plan 的 RAG 注入元数据。
+   *
+   * 防御性读取：
+   * - StubPlanner / 自定义实现没有 lastRagMeta → 返回 undefined。
+   * - 注入失败 / 无命中 → planner 内部已置为 { injected: false, snippetCount: 0 }。
+   */
+  private readRagMeta():
+    | { injected: boolean; snippetCount: number; query?: string }
+    | undefined {
+    const planner = this.deps.plannerPort as Partial<{
+      lastRagMeta: { injected: boolean; snippetCount: number; query?: string };
+    }>;
+    return planner.lastRagMeta;
+  }
+
+  /**
+   * V3.8+: 把 RAG meta 展开为 AgentTrace 可选字段。
+   * 无注入信号时返回空对象，避免污染 trace。
+   */
+  private spreadRagMeta(
+    meta: ReturnType<TimeManagementAgent["readRagMeta"]>
+  ): Pick<AgentTrace, "ragContextInjected" | "ragSnippetCount" | "ragQuery"> {
+    if (!meta) return {};
+    return {
+      ragContextInjected: meta.injected,
+      ragSnippetCount: meta.snippetCount,
+      ragQuery: meta.query,
+    };
   }
 
   private composeRecommendationMessage(
