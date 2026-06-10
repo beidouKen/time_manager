@@ -262,6 +262,9 @@ export class ContextAssembler {
       eventIds: relevantEvents.map((e) => e.id),
     };
 
+    // V3.9 Context OS four-segment mapping documented in
+    // docs/V3.9_Agent Intelligence & Semantic Reliability/V3.9.4-context-os-mapping.md
+    // (TurnContext / ConversationFocus / OperationalContext / RecentActionContext).
     return {
       currentUserInput: input.userInput,
       conversationSummary,

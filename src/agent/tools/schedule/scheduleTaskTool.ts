@@ -1,14 +1,33 @@
+import { z } from "zod";
 import { BaseTool } from "@/agent/tools/BaseTool";
+import type { ToolManifest } from "@/agent/schemas";
 import type { ToolResult } from "@/agent/types";
 import { TaskService } from "@/services/TaskService";
 import type { TimeBlockService } from "@/services/TimeBlockService";
 import { ScheduleService } from "@/services/ScheduleService";
 
 export class ScheduleTaskTool extends BaseTool {
-  name = "schedule_task";
-  description = "为任务安排时间块（可自动寻找空闲时间）";
-  requiresConfirmation = false;
-  riskLevel = "low" as const;
+  // Both task and timeblock may be created — businessSideEffects covers both.
+  // failureRecovery=compensate because the tool rolls back the task if timeblock
+  // creation fails (see execute body).
+  readonly manifest: ToolManifest = {
+    name: "schedule_task",
+    skill: "time_management",
+    description: "为任务安排时间块（可自动寻找空闲时间）",
+    inputSchema: z.object({ start_time: z.string(), end_time: z.string() }).passthrough(),
+    outputSchema: z.any(),
+    readOnly: false,
+    businessSideEffects: ["task", "timeblock"],
+    observabilitySideEffects: ["agent_trace_step", "semantic_event"],
+    riskLevel: "low",
+    requiresConfirmation: false,
+    reversible: true,
+    failureRecovery: "compensate",
+    batchAware: false,
+    idempotent: false,
+    auditLevel: "trace",
+    permissions: ["write:tasks", "write:timeblocks"],
+  };
 
   private taskService: TaskService;
   private scheduleService: ScheduleService;

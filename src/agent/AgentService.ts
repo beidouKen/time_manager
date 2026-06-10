@@ -12,8 +12,11 @@ import {
 import { formatDateKey } from "@/agent/experience/dateFormatting";
 import { ResponseBoundary } from "@/agent/experience/ResponseBoundary";
 import type { ResponseKind } from "@/agent/experience/ResponseComposer";
+import type { RendererOutput } from "@/agent/experience/responseRenderers";
 import { SemanticFrameParser } from "@/agent/experience/SemanticFrameParser";
 import { DomainRoutingService } from "@/agent/router/DomainRoutingService";
+import { TaskReadModelService } from "@/agent/read-model/TaskReadModelService";
+import { RecentActionReader } from "@/agent/recent-action/RecentActionReader";
 import { TimeManagementAgent } from "@/agent/time-management/TimeManagementAgent";
 import type { AgentHandler } from "@/agent/handlers/AgentHandler";
 import { ExternalInfoHandler } from "@/agent/handlers/ExternalInfoHandler";
@@ -58,6 +61,18 @@ import { ContextAssembler } from "@/agent/context/ContextAssembler";
 import type { WorkingMemoryPacket } from "@/agent/context/WorkingMemoryPacket";
 import { ContextTraceService } from "@/services/ContextTraceService";
 import type { RecordStepInput } from "@/services/ContextTraceService";
+import {
+  ConfirmationGuardrail,
+  formatGuardrailEvidenceForTrace,
+  GuardrailRunner,
+  InputIntentGuardrail,
+  PastTimeGuardrail,
+  PlanSchemaGuardrail,
+  ReadWriteBoundaryGuardrail,
+  ResponseFallbackGuardrail,
+  ToolPermissionGuardrail,
+} from "@/agent/guardrails";
+import { PlanSafetyValidator } from "@/agent/validators/PlanSafetyValidator";
 
 import { AvailabilityProvider } from "@/agent/time-management/scheduling/AvailabilityProvider";
 import { RecommendationPlanner } from "@/agent/time-management/scheduling/RecommendationPlanner";
@@ -67,6 +82,8 @@ import { UpdateTaskTool } from "@/agent/tools/task/updateTaskTool";
 import { DeleteTaskTool } from "@/agent/tools/task/deleteTaskTool";
 import { ListTasksTool } from "@/agent/tools/task/listTasksTool";
 import { MarkTaskCompletedTool } from "@/agent/tools/task/markTaskCompletedTool";
+import { DeferTaskTool } from "@/agent/tools/task/deferTaskTool";
+import { ArchiveTaskTool } from "@/agent/tools/task/archiveTaskTool";
 import { CreateTimeBlockTool } from "@/agent/tools/timeblock/createTimeBlockTool";
 import { UpdateTimeBlockTool } from "@/agent/tools/timeblock/updateTimeBlockTool";
 import { DeleteTimeBlockTool } from "@/agent/tools/timeblock/deleteTimeBlockTool";
@@ -77,6 +94,8 @@ import { RescheduleDayTool } from "@/agent/tools/schedule/rescheduleDayTool";
 import { DetectConflictsTool } from "@/agent/tools/schedule/detectConflictsTool";
 import { GetFreeSlotsTool } from "@/agent/tools/schedule/getFreeSlotsTool";
 import { GetTodayPlanTool } from "@/agent/tools/schedule/getTodayPlanTool";
+import { GetCurrentFocusTool } from "@/agent/tools/schedule/getCurrentFocusTool";
+import { GetRecentActionsTool } from "@/agent/tools/schedule/getRecentActionsTool";
 import { ExplainTaskTool } from "@/agent/tools/explain/explainTaskTool";
 import { ExplainScheduleTool } from "@/agent/tools/explain/explainScheduleTool";
 
@@ -111,6 +130,7 @@ interface PlanConflictInfo {
 interface ExecutePlanOptionResult {
   success: boolean;
   message: string;
+  confirmationId?: string;
   actionLogIds?: string[];
   metadata?: ChatMessageMetadata;
   conflictInfo?: PlanConflictInfo;
@@ -238,11 +258,13 @@ export class AgentService {
   private activeContextService: ActiveContextService;
   private taskService: TaskService;
   private timeBlockService: TimeBlockService;
+  private taskReadModelService: TaskReadModelService;
   private scheduleService: ScheduleService;
   /** C4: 统一上下文组装器 */
   private contextAssembler: ContextAssembler;
   /** C6: trace step 服务（可选，null 时不写入） */
   private contextTraceService: ContextTraceService | null;
+  private guardrailRunner: GuardrailRunner;
 
   // V3：LLM 相关组件
   private experienceContextBuilder: ConversationContextBuilder;
@@ -273,6 +295,10 @@ export class AgentService {
     this.activeContextService = options.activeContextService ?? new ActiveContextService();
     this.taskService = options.taskService ?? new TaskService();
     this.timeBlockService = options.timeBlockService ?? new TimeBlockService();
+    this.taskReadModelService = new TaskReadModelService(
+      this.taskService,
+      this.timeBlockService,
+    );
     this.scheduleService = options.scheduleService ?? new ScheduleService();
 
     this.contextAssembler = new ContextAssembler(
@@ -284,6 +310,16 @@ export class AgentService {
       this.timeBlockService
     );
     this.contextTraceService = options.contextTraceService ?? null;
+    this.guardrailRunner = new GuardrailRunner();
+    this.guardrailRunner.register(new InputIntentGuardrail());
+    this.guardrailRunner.register(
+      new PlanSchemaGuardrail(new PlanSafetyValidator(this.router))
+    );
+    this.guardrailRunner.register(new ToolPermissionGuardrail(this.router));
+    this.guardrailRunner.register(new ReadWriteBoundaryGuardrail());
+    this.guardrailRunner.register(new PastTimeGuardrail());
+    this.guardrailRunner.register(new ConfirmationGuardrail());
+    this.guardrailRunner.register(new ResponseFallbackGuardrail());
 
     this.experienceContextBuilder = new ConversationContextBuilder();
     this.semanticFrameParser = new SemanticFrameParser();
@@ -314,6 +350,7 @@ export class AgentService {
     this.timeManagementAgent = new TimeManagementAgent({
       taskService: this.taskService,
       timeBlockService: this.timeBlockService,
+      taskReadModelService: this.taskReadModelService,
       router: this.router,
       logService: this.logService,
       plannerPort: this.plannerPort,
@@ -321,6 +358,10 @@ export class AgentService {
       experienceContextBuilder: this.experienceContextBuilder,
       responseBoundary: this.responseBoundary,
       confirmationService: this.confirmService,
+      guardrailRunner: this.guardrailRunner,
+      // V3.9.0 TEMP BRIDGE: pass trace/event services for RecentActionReader (B2)
+      contextTraceService: this.contextTraceService,
+      semanticEventService: this.semanticEventService,
     });
     // V3.7: 为只读域创建 LLMChatExecutor（与 time_management 共用同一个 LLM client）
     const resolvedLLMClient = options.llmClient !== null
@@ -408,8 +449,10 @@ export class AgentService {
     this.router.register(new CreateTaskTool(this.taskService));
     this.router.register(new UpdateTaskTool(this.taskService));
     this.router.register(new DeleteTaskTool(this.taskService));
-    this.router.register(new ListTasksTool(this.taskService));
+    this.router.register(new ListTasksTool(this.taskReadModelService));
     this.router.register(new MarkTaskCompletedTool(this.taskService));
+    this.router.register(new DeferTaskTool(this.taskService));
+    this.router.register(new ArchiveTaskTool(this.taskService));
     this.router.register(new CreateTimeBlockTool(this.timeBlockService));
     this.router.register(new UpdateTimeBlockTool(this.timeBlockService));
     this.router.register(new DeleteTimeBlockTool(this.timeBlockService));
@@ -421,8 +464,14 @@ export class AgentService {
     this.router.register(new RescheduleDayTool(this.timeBlockService, this.taskService));
     this.router.register(new DetectConflictsTool(this.scheduleService));
     this.router.register(new GetFreeSlotsTool(this.timeBlockService));
-    this.router.register(new GetTodayPlanTool(this.timeBlockService, this.taskService));
-    this.router.register(new ExplainTaskTool(this.taskService, this.timeBlockService));
+    this.router.register(new GetTodayPlanTool(this.taskReadModelService));
+    this.router.register(new GetCurrentFocusTool(this.taskReadModelService));
+    this.router.register(
+      new GetRecentActionsTool(
+        new RecentActionReader(this.contextTraceService, this.semanticEventService),
+      ),
+    );
+    this.router.register(new ExplainTaskTool(this.taskReadModelService));
     this.router.register(new ExplainScheduleTool(this.timeBlockService));
   }
 
@@ -557,6 +606,26 @@ export class AgentService {
     }
   }
 
+  private toGuardrailTraceSnapshot(
+    report: import("@/agent/guardrails").GuardrailRunReport
+  ): Record<string, unknown> {
+    return {
+      stage: report.stage,
+      finalDecision: report.finalDecision,
+      firstBlocker: report.firstBlocker ?? null,
+      results: report.results.map((result) => {
+        const formatted = formatGuardrailEvidenceForTrace(result.evidence);
+        return {
+          name: result.name,
+          decision: result.decision,
+          reason: result.reason ?? null,
+          latencyMs: result.latencyMs,
+          ...formatted,
+        };
+      }),
+    };
+  }
+
   async processInput(
     userInput: string,
     context?: ProcessInputContext
@@ -604,11 +673,92 @@ export class AgentService {
     const effectiveUserMessageId = context?.userMessageId ?? crypto.randomUUID();
 
     try {
-      const response = await this._processInputInner(userInput, context, {
+      let response = await this._processInputInner(userInput, context, {
         conversationId,
         turnId: turn?.id,
         messageId: effectiveUserMessageId,
       });
+      const responseTrace = response.metadata?.agentTrace;
+      const postResponseReport = await this.guardrailRunner.runAll(
+        "post_response",
+        {
+          stage: "post_response",
+          now: new Date(
+            responseTrace?.contextSnapshot?.currentDatetime ??
+              new Date().toISOString()
+          ),
+          conversationId,
+          turnId: turn?.id,
+          messageId: effectiveUserMessageId,
+          userInput,
+          semanticFrame: responseTrace?.semanticFrame,
+          experienceContext: responseTrace?.contextSnapshot,
+          plan: responseTrace?.actionPlan,
+          responseMessage: response.message,
+          responseKind: response.metadata?.responseKind,
+          metadata: response.metadata,
+          toolResults: responseTrace?.toolResults,
+        }
+      );
+      if (conversationId && turn?.id) {
+        await this.recordTraceSteps([{
+          turn_id: turn.id,
+          conversation_id: conversationId,
+          message_id: effectiveUserMessageId,
+          step_type: "guardrail",
+          step_order: 90,
+          output_snapshot: this.toGuardrailTraceSnapshot(postResponseReport),
+        }]);
+      }
+      if (postResponseReport.finalDecision === "block") {
+        const blocker = postResponseReport.results.find(
+          (result) => result.decision === "block"
+        );
+        const blockedContext =
+          responseTrace?.contextSnapshot ??
+          this.experienceContextBuilder.build(
+            context,
+            this.getConversationMemorySnapshot()
+          );
+        const blockedFrame =
+          responseTrace?.semanticFrame ??
+          this.semanticFrameParser.parse(userInput);
+        const blockedPlan =
+          responseTrace?.actionPlan ??
+          this.buildRouterPlan(
+            blockedFrame.userGoal,
+            blockedContext.currentDatetime
+          );
+        const blockedResponse = this.responseBoundary.finalizeRich({
+          context: blockedContext,
+          frame: blockedFrame,
+          plan: blockedPlan,
+          result: {
+            domain: responseTrace?.domain ?? "general_chat",
+            responseKind: "blocked",
+            blocked: {
+              guardrailName:
+                postResponseReport.firstBlocker ??
+                "ResponseFallbackGuardrail",
+              reason: blocker?.reason,
+              nextStep: "补充更具体的对象、范围或时间后再试",
+            },
+          },
+        });
+        response = {
+          ...response,
+          message: blockedResponse.message,
+          metadata: {
+            ...response.metadata,
+            responseKind: blockedResponse.responseKind,
+            responseBranch: blockedResponse.responseBranch,
+            genericFallbackUsed: blockedResponse.genericFallbackUsed,
+            guardrailBlocked:
+              postResponseReport.firstBlocker ??
+              "ResponseFallbackGuardrail",
+          },
+        };
+      }
       // C2: 写入 SemanticEvent（在 completeTurn 前）
       if (conversationId) {
         // 检测是否为细化推荐路径（user 有 pendingProposal 且 response 产出新 proposal）
@@ -670,6 +820,28 @@ export class AgentService {
           await this.turnService.completeTurn(turn.id, context?.assistantMessageId ?? "pending");
         } catch { /* ignore */ }
       }
+
+      // V3.9.0: minimal response trace step (3 fields only — §7.1 hard limit).
+      // responseKind / semanticType are populated by TMA when the relevant path
+      // runs; recentActionsCount is written by the RecentActionReader path (B2).
+      if (conversationId && turn?.id) {
+        await this.recordTraceSteps([{
+          turn_id: turn.id,
+          conversation_id: conversationId,
+          message_id: effectiveUserMessageId,
+          step_type: "response",
+          step_order: 99,
+          output_snapshot: {
+            responseKind: response.metadata?.responseKind ?? null,
+            responseBranch: response.metadata?.responseBranch ?? null,
+            genericFallbackUsed:
+              response.metadata?.genericFallbackUsed ?? false,
+            semanticType: response.metadata?.semanticType ?? null,
+            recentActionsCount: 0, // set by RecentActionReader in B2 phase
+          },
+        }]);
+      }
+
       return {
         ...response,
         metadata: {
@@ -937,12 +1109,13 @@ export class AgentService {
 
     const frame = this.buildRouterFrame(route.domain, userInput);
     const plan = this.buildRouterPlan(frame.userGoal, experienceContext.currentDatetime);
-    const message = this.responseBoundary.finalize({
+    const rendered = this.responseBoundary.finalizeRich({
       context: experienceContext,
       frame,
       plan,
       result: handlerResult,
     });
+    const message = rendered.message;
 
     const log = await this.logService.logRequest(userInput, route.domain);
     await this.logService.logSuccess(log.id, { domain: route.domain });
@@ -986,6 +1159,9 @@ export class AgentService {
         source: "llm",
         confidence: route.confidence,
         agentTrace: trace,
+        responseKind: rendered.responseKind,
+        responseBranch: rendered.responseBranch,
+        genericFallbackUsed: rendered.genericFallbackUsed,
       },
     };
   }
@@ -1023,12 +1199,12 @@ export class AgentService {
 
   // ─── Router 路径下边界消息辅助 ─────────────────────────────────────────────
 
-  private composeBoundaryMessage(
+  private composeBoundaryResponse(
     userInput: string,
     context: ProcessInputContext | undefined,
     responseKind: ResponseKind,
     toolResults: AgentToolResult[] = []
-  ): string {
+  ): RendererOutput {
     const experienceContext = this.experienceContextBuilder.build(
       context,
       this.getConversationMemorySnapshot()
@@ -1045,7 +1221,7 @@ export class AgentService {
       createdAt: new Date().toISOString(),
     };
 
-    return this.responseBoundary.finalize({
+    return this.responseBoundary.finalizeRich({
       context: experienceContext,
       frame: semanticFrame,
       plan,
@@ -1057,16 +1233,33 @@ export class AgentService {
     });
   }
 
-  private buildStaleConfirmationResponse(confirmationId?: string): AgentResponse {
+  private withRenderedMetadata(
+    metadata: ChatMessageMetadata,
+    rendered: RendererOutput
+  ): ChatMessageMetadata {
     return {
-      message: this.composeBoundaryMessage("", undefined, "confirmation_stale"),
+      ...metadata,
+      responseKind: rendered.responseKind,
+      responseBranch: rendered.responseBranch,
+      genericFallbackUsed: rendered.genericFallbackUsed,
+    };
+  }
+
+  private buildStaleConfirmationResponse(confirmationId?: string): AgentResponse {
+    const rendered = this.composeBoundaryResponse(
+      "",
+      undefined,
+      "confirmation_stale"
+    );
+    return {
+      message: rendered.message,
       intent: { intent: "unknown", confidence: 0, args: {}, rawInput: "" },
-      metadata: {
+      metadata: this.withRenderedMetadata({
         confirmationId,
         alreadyProcessed: true,
         resultType: "already_processed",
         source: "chat",
-      },
+      }, rendered),
     };
   }
 
@@ -1176,9 +1369,15 @@ export class AgentService {
 
     const confirmation = await this.confirmService.getById(confirmationId);
     if (!confirmation) {
+      const rendered = this.composeBoundaryResponse(
+        "",
+        undefined,
+        "confirmation_missing"
+      );
       return {
-        message: this.composeBoundaryMessage("", undefined, "confirmation_missing"),
+        message: rendered.message,
         intent: { intent: "unknown", confidence: 0, args: {}, rawInput: "" },
+        metadata: this.withRenderedMetadata({}, rendered),
       };
     }
 
@@ -1220,7 +1419,60 @@ export class AgentService {
     }
 
     // 单 tool 执行（原路径）
-    const result = await this.router.execute(confirmation.tool_name, args);
+    // V3.9.2: inject __confirmationId so ToolRouter governance allows execution
+    const result = await this.router.execute(confirmation.tool_name, {
+      ...args,
+      __confirmationId: confirmationId,
+    });
+
+    if (result.requiresConfirmation) {
+      const fallbackConfirmationId =
+        await this.createToolRouterFallbackConfirmation({
+          actionType: confirmation.action_type,
+          toolName: confirmation.tool_name,
+          toolArgs: args,
+          description: confirmation.description,
+          conversationId: confirmation.conversation_id,
+          turnId: confirmation.turn_id,
+          messageId: confirmation.message_id,
+          relatedTaskId: confirmation.related_task_id,
+          relatedTimeBlockId: confirmation.related_time_block_id,
+        });
+      await this.logService.logSuccess(log.id, {
+        kind: "pending_confirmation",
+        confirmationId: fallbackConfirmationId,
+        source: "tool_router_fallback",
+      });
+      const rendered = this.composeBoundaryResponse(
+        "",
+        undefined,
+        "confirmation_required"
+      );
+      const metadata = this.withRenderedMetadata({
+        intent: confirmation.action_type,
+        toolName: confirmation.tool_name,
+        actionLogId: log.id,
+        confirmationId: fallbackConfirmationId,
+        resultType: "pending_confirmation",
+        source: "chat",
+      }, rendered);
+      return {
+        message: rendered.message,
+        intent: {
+          intent: confirmation.action_type as IntentType,
+          confidence: 1,
+          args,
+          rawInput: "",
+        },
+        toolResult: {
+          ...result,
+          confirmationId: fallbackConfirmationId,
+        },
+        confirmationId: fallbackConfirmationId,
+        actionLogId: log.id,
+        metadata,
+      };
+    }
 
     if (result.success) {
       await this.logService.logSuccess(log.id, result.data);
@@ -1247,7 +1499,13 @@ export class AgentService {
       await this.logService.logFailure(log.id, result.error ?? result.message);
     }
 
-    const metadata: ChatMessageMetadata = {
+    const rendered = this.composeBoundaryResponse(
+      "",
+      undefined,
+      result.success ? "tool_success" : "tool_failure",
+      [result]
+    );
+    const metadata = this.withRenderedMetadata({
       intent: confirmation.action_type,
       toolName: confirmation.tool_name,
       actionLogId: log.id,
@@ -1256,7 +1514,7 @@ export class AgentService {
       relatedTimeBlockId: result.relatedTimeBlockId,
       resultType: result.success ? "success" : "failure",
       source: "chat",
-    };
+    }, rendered);
     const refreshHints = this.buildConfirmationRefreshHints(
       confirmation.tool_name,
       args,
@@ -1264,12 +1522,7 @@ export class AgentService {
     );
 
     return {
-      message: this.composeBoundaryMessage(
-        "",
-        undefined,
-        result.success ? "tool_success" : "tool_failure",
-        [result]
-      ),
+      message: rendered.message,
       intent: {
         intent: confirmation.action_type as IntentType,
         confidence: 1,
@@ -1685,20 +1938,29 @@ export class AgentService {
     });
     await this.logService.logCancelled(log.id);
 
-    const metadata: ChatMessageMetadata = {
+    const rendered = this.composeBoundaryResponse(
+      "",
+      undefined,
+      "confirmation_rejected"
+    );
+    const metadata = this.withRenderedMetadata({
       intent: confirmation?.action_type,
       toolName,
       actionLogId: log.id,
       confirmationId,
       resultType: "rejected",
       source: "chat",
-    };
+    }, rendered);
+
+    // B6: Build refreshHints on reject so UI task list / timeline sync after user cancels
+    const refreshHints = this.buildRefreshHintsForToolName(toolName, toolArgs);
 
     return {
-      message: this.composeBoundaryMessage("", undefined, "confirmation_rejected"),
+      message: rendered.message,
       intent: { intent: "unknown", confidence: 0, args: {}, rawInput: "" },
       actionLogId: log.id,
       metadata,
+      refreshHints,
     };
   }
 
@@ -1718,8 +1980,66 @@ export class AgentService {
         action.toolName,
         action.params
       );
-      const result = await this.router.execute(action.toolName, action.params);
+      // V3.9.2: inject __confirmationId so ToolRouter governance allows execution
+      const result = await this.router.execute(action.toolName, {
+        ...action.params,
+        __confirmationId: confirmationId,
+      });
       toolResults.push(result);
+
+      if (result.requiresConfirmation) {
+        const parentConfirmation =
+          await this.confirmService.getById(confirmationId);
+        const fallbackConfirmationId =
+          await this.createToolRouterFallbackConfirmation({
+            actionType:
+              parentConfirmation?.action_type ?? action.toolName,
+            toolName: action.toolName,
+            toolArgs: action.params,
+            description: action.summary,
+            conversationId: parentConfirmation?.conversation_id,
+            turnId: parentConfirmation?.turn_id,
+            messageId: parentConfirmation?.message_id,
+            relatedTaskId:
+              typeof action.params.taskId === "string"
+                ? action.params.taskId
+                : undefined,
+          });
+        await this.logService.logSuccess(parentLogId, {
+          kind: "pending_confirmation",
+          confirmationId: fallbackConfirmationId,
+          source: "tool_router_fallback",
+        });
+        const rendered = this.composeBoundaryResponse(
+          "",
+          undefined,
+          "confirmation_required"
+        );
+        const metadata = this.withRenderedMetadata({
+          toolName: action.toolName,
+          actionLogId: parentLogId,
+          confirmationId: fallbackConfirmationId,
+          resultType: "pending_confirmation",
+          source: "chat",
+        }, rendered);
+        return {
+          message: rendered.message,
+          intent: {
+            intent: "unknown",
+            confidence: 1,
+            args: action.params,
+            rawInput: "",
+          },
+          toolResult: {
+            ...result,
+            confirmationId: fallbackConfirmationId,
+          },
+          confirmationId: fallbackConfirmationId,
+          actionLogId: parentLogId,
+          metadata,
+          refreshHints,
+        };
+      }
 
       if (!result.success) {
         // short-circuit：第一个失败就停止
@@ -1727,20 +2047,21 @@ export class AgentService {
           parentLogId,
           result.error ?? result.message
         );
-        const metadata: ChatMessageMetadata = {
+        const rendered = this.composeBoundaryResponse(
+          "",
+          undefined,
+          "tool_failure",
+          toolResults
+        );
+        const metadata = this.withRenderedMetadata({
           toolName: action.toolName,
           actionLogId: parentLogId,
           confirmationId,
           resultType: "failure",
           source: "chat",
-        };
+        }, rendered);
         return {
-          message: this.composeBoundaryMessage(
-            "",
-            undefined,
-            "tool_failure",
-            toolResults
-          ),
+          message: rendered.message,
           intent: { intent: "unknown", confidence: 1, args: {}, rawInput: "" },
           toolResult: result,
           actionLogId: parentLogId,
@@ -1756,20 +2077,21 @@ export class AgentService {
       executedActions: toolResults.length,
     });
 
-    const metadata: ChatMessageMetadata = {
+    const rendered = this.composeBoundaryResponse(
+      "",
+      undefined,
+      "tool_success",
+      toolResults
+    );
+    const metadata = this.withRenderedMetadata({
       actionLogId: parentLogId,
       confirmationId,
       resultType: "success",
       source: "chat",
-    };
+    }, rendered);
 
     return {
-      message: this.composeBoundaryMessage(
-        "",
-        undefined,
-        "tool_success",
-        toolResults
-      ),
+      message: rendered.message,
       intent: { intent: "unknown", confidence: 1, args: {}, rawInput: "" },
       toolResult: toolResults[toolResults.length - 1],
       actionLogId: parentLogId,
@@ -1862,6 +2184,14 @@ export class AgentService {
         if (task.id && typeof task.id === "string") return;
       }
     }
+  }
+
+  /** B6: Build refresh hints purely from toolName (used on reject path, no success check) */
+  private buildRefreshHintsForToolName(
+    toolName: string,
+    args: Record<string, unknown>
+  ): AgentRefreshHints | undefined {
+    return this.buildConfirmationRefreshHints(toolName, args, { success: true, message: "" });
   }
 
   private buildConfirmationRefreshHints(
@@ -2056,6 +2386,44 @@ export class AgentService {
     }
 
     const result = await this.router.execute(actionOption.toolName, actionOption.params);
+    if (result.requiresConfirmation) {
+      const confirmationId =
+        await this.createToolRouterFallbackConfirmation({
+          actionType: actionOption.toolName,
+          toolName: actionOption.toolName,
+          toolArgs: actionOption.params,
+          description: actionOption.summary,
+          relatedTaskId:
+            typeof actionOption.params.taskId === "string"
+              ? actionOption.params.taskId
+              : undefined,
+          relatedTimeBlockId:
+            typeof actionOption.params.timeBlockId === "string"
+              ? actionOption.params.timeBlockId
+              : undefined,
+        });
+      const pendingResult = {
+        success: false,
+        message: "该操作需要确认后才能执行。",
+        confirmationId,
+      };
+      const actionLogId = await this.logProposalEvent(
+        "proposal_confirmation_required",
+        actionOption,
+        pendingResult
+      );
+      if (actionLogId) actionLogIds.push(actionLogId);
+      return {
+        ...pendingResult,
+        actionLogIds,
+        metadata: {
+          toolName: actionOption.toolName,
+          confirmationId,
+          resultType: "pending_confirmation",
+          source: "system",
+        },
+      };
+    }
     const eventName = result.success
       ? "proposal_action_executed"
       : "proposal_action_failed";
@@ -2109,6 +2477,34 @@ export class AgentService {
         summary: action.summary ?? option.summary,
       },
     };
+  }
+
+  private async createToolRouterFallbackConfirmation(args: {
+    actionType: string;
+    toolName: string;
+    toolArgs: Record<string, unknown>;
+    description?: string;
+    conversationId?: string;
+    turnId?: string;
+    messageId?: string;
+    relatedTaskId?: string;
+    relatedTimeBlockId?: string;
+  }): Promise<string> {
+    const manifest = this.router.getManifest(args.toolName);
+    const pending = await this.confirmService.createConfirmation({
+      action_type: args.actionType,
+      tool_name: args.toolName,
+      tool_args_json: JSON.stringify(args.toolArgs),
+      risk_level: manifest?.riskLevel ?? "medium",
+      description: args.description,
+      conversation_id: args.conversationId,
+      turn_id: args.turnId,
+      message_id: args.messageId,
+      related_task_id: args.relatedTaskId,
+      related_time_block_id: args.relatedTimeBlockId,
+      metadata_json: JSON.stringify({ source: "tool_router_fallback" }),
+    });
+    return pending.id;
   }
 
   private async precheckPlanAction(option: PlanOption): Promise<PlanPrecheckResult> {
@@ -2241,6 +2637,7 @@ export class AgentService {
   private async logProposalEvent(
     eventName:
       | "proposal_confirmed"
+      | "proposal_confirmation_required"
       | "proposal_action_executed"
       | "proposal_action_failed"
       | "proposal_conflict_blocked",

@@ -1,12 +1,28 @@
+import { z } from "zod";
 import { BaseTool } from "@/agent/tools/BaseTool";
+import type { ToolManifest } from "@/agent/schemas";
 import type { ToolResult } from "@/agent/types";
 import { TaskService } from "@/services/TaskService";
 
 export class MarkTaskCompletedTool extends BaseTool {
-  name = "mark_task_completed";
-  description = "将一个任务标记为已完成";
-  requiresConfirmation = false;
-  riskLevel = "low" as const;
+  readonly manifest: ToolManifest = {
+    name: "mark_task_completed",
+    skill: "time_management",
+    description: "将一个任务标记为已完成",
+    inputSchema: z.object({ taskId: z.string() }),
+    outputSchema: z.any(),
+    readOnly: false,
+    businessSideEffects: ["task"],
+    observabilitySideEffects: ["agent_trace_step", "semantic_event"],
+    riskLevel: "low",
+    requiresConfirmation: false,
+    reversible: true,
+    failureRecovery: "manual",
+    batchAware: false,
+    idempotent: true,
+    auditLevel: "trace",
+    permissions: ["write:tasks"],
+  };
 
   private taskService: TaskService;
 

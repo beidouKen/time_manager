@@ -1,12 +1,29 @@
+import { z } from "zod";
 import { BaseTool } from "@/agent/tools/BaseTool";
+import type { ToolManifest } from "@/agent/schemas";
 import type { ToolResult } from "@/agent/types";
 import { TaskService } from "@/services/TaskService";
 
 export class ArchiveTaskTool extends BaseTool {
-  name = "archive_task";
-  description = "将一个已完成或已取消的任务归档";
-  requiresConfirmation = false;
-  riskLevel = "low" as const;
+  // V3.9.2: requiresConfirmation=true per HIL matrix (action_archive_task → always)
+  readonly manifest: ToolManifest = {
+    name: "archive_task",
+    skill: "time_management",
+    description: "将一个已完成或已取消的任务归档",
+    inputSchema: z.object({ taskId: z.string() }),
+    outputSchema: z.any(),
+    readOnly: false,
+    businessSideEffects: ["task"],
+    observabilitySideEffects: ["agent_trace_step", "semantic_event"],
+    riskLevel: "medium",
+    requiresConfirmation: true,
+    reversible: true,
+    failureRecovery: "manual",
+    batchAware: false,
+    idempotent: true,
+    auditLevel: "trace+semantic_event",
+    permissions: ["write:tasks"],
+  };
 
   private taskService: TaskService;
 

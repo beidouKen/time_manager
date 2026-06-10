@@ -1,13 +1,29 @@
+import { z } from "zod";
 import { BaseTool } from "@/agent/tools/BaseTool";
+import type { ToolManifest } from "@/agent/schemas";
 import type { ToolResult } from "@/agent/types";
 import { TaskService } from "@/services/TaskService";
 import type { UpdateTaskInput } from "@/types/task.types";
 
 export class UpdateTaskTool extends BaseTool {
-  name = "update_task";
-  description = "更新一个已有任务的信息";
-  requiresConfirmation = false;
-  riskLevel = "low" as const;
+  readonly manifest: ToolManifest = {
+    name: "update_task",
+    skill: "time_management",
+    description: "更新一个已有任务的信息",
+    inputSchema: z.object({ taskId: z.string() }).passthrough(),
+    outputSchema: z.any(),
+    readOnly: false,
+    businessSideEffects: ["task"],
+    observabilitySideEffects: ["agent_trace_step", "semantic_event"],
+    riskLevel: "low",
+    requiresConfirmation: false,
+    reversible: true,
+    failureRecovery: "manual",
+    batchAware: false,
+    idempotent: true,
+    auditLevel: "trace",
+    permissions: ["write:tasks"],
+  };
 
   private taskService: TaskService;
 

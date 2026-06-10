@@ -1,4 +1,26 @@
+// ============================================================
+// ToolRouter.ts — V3.9.2 Tool Governance
+//
+// Minimal governance layer added in V3.9.2:
+//   1. getManifest(name) — expose manifest for callers that need policy info.
+//   2. ROUTER_INTERNAL_KEYS — stripped from args before tool.execute() so that
+//      tools remain pure business logic with no awareness of governance keys.
+//   3. Destructive tool guard — if a tool declares requiresConfirmation=true
+//      and args does NOT contain __confirmationId, router returns a structured
+//      "requiresConfirmation" response instead of executing.
+//      Confirmed path: AgentService.confirmAction injects __confirmationId;
+//      the router detects it, strips it, and allows execution.
+// ============================================================
+
 import type { AgentToolResult, ToolDefinition, ToolResult } from "@/agent/types";
+import type { BaseTool } from "@/agent/tools/BaseTool";
+import type { ToolManifest } from "@/agent/schemas";
+
+/**
+ * Internal governance keys that ToolRouter injects / consumes and MUST be
+ * stripped from args before any tool.execute() call.
+ */
+const ROUTER_INTERNAL_KEYS = new Set(["__confirmationId"]);
 
 export class ToolRouter {
   private tools: Map<string, ToolDefinition> = new Map();
@@ -21,13 +43,25 @@ export class ToolRouter {
   }
 
   /**
-   * V2.5：执行指定工具并返回 AgentToolResult。
+   * V3.9.2: expose the manifest for a registered tool (if available).
+   * Callers can use this for policy decisions without executing the tool.
+   */
+  getManifest(name: string): ToolManifest | undefined {
+    const tool = this.tools.get(name);
+    if (!tool) return undefined;
+    return (tool as BaseTool).manifest;
+  }
+
+  /**
+   * Execute a tool with governance enforcement:
    *
-   * 统一容错处理：
-   * 1. tool not found → success: false
-   * 2. tool.execute 内部 throw（含 BaseTool.requireParam）→ success: false
-   * 3. Service 层异常 → success: false
-   * 4. 正常返回 → normalizeResult 提取关联实体 ID
+   * - If the tool requires confirmation AND `args.__confirmationId` is absent
+   *   → return a structured "blocked" response (not an error) so callers can
+   *   surface a confirmation prompt to the user.
+   * - If `args.__confirmationId` is present → strip it before calling execute.
+   * - All ROUTER_INTERNAL_KEYS are always stripped before execute.
+   * - Unknown tool → success: false
+   * - execute throw → success: false
    */
   async execute(
     toolName: string,
@@ -42,9 +76,28 @@ export class ToolRouter {
       };
     }
 
+    // V3.9.2: manifest-based governance check
+    const manifest = (tool as BaseTool).manifest;
+    if (manifest?.requiresConfirmation) {
+      const hasConfirmation = typeof args.__confirmationId === "string" &&
+        args.__confirmationId.length > 0;
+      if (!hasConfirmation) {
+        return {
+          success: false,
+          requiresConfirmation: true,
+          message: `工具 "${toolName}" 需要用户确认后才能执行`,
+          error: `Tool "${toolName}" requires confirmation`,
+          toolName,
+        };
+      }
+    }
+
+    // Strip all router-internal keys before delegating to tool business logic
+    const cleanArgs = stripInternalKeys(args);
+
     let raw: ToolResult;
     try {
-      raw = await tool.execute(args);
+      raw = await tool.execute(cleanArgs);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       return {
@@ -106,4 +159,18 @@ export class ToolRouter {
 
     return result;
   }
+}
+
+// ─── helpers ──────────────────────────────────────────────────────────────────
+
+function stripInternalKeys(
+  args: Record<string, unknown>
+): Record<string, unknown> {
+  const clean: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(args)) {
+    if (!ROUTER_INTERNAL_KEYS.has(key)) {
+      clean[key] = value;
+    }
+  }
+  return clean;
 }

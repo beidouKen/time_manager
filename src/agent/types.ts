@@ -10,10 +10,20 @@
 //    用户输入到工具结果的完整链路
 // ============================================================
 
+// V3.9.1a: user-intent layer contract (Intent) lives in src/agent/schemas/.
+// See legacyIntentBridge below for the one-to-many partial mapping.
+import type { Intent, ResponseKind } from "@/agent/schemas";
+
 /**
- * Chat Agent 支持的用户意图类型。
- * 命名约定：snake_case，与 IntentParser 规则、INTENT_TO_TOOL 映射、
- * ToolRouter 注册的 tool name 保持一致。
+ * Legacy execution/tool intent — 工具名层（与 ToolRouter 注册名 1:1）。
+ *
+ * V3.9.1a 起，user-intent 层契约改在 `src/agent/schemas/IntentTaxonomy.ts`
+ * 的 `Intent` 中表达。`IntentType` 与 `Intent` 是不同抽象层，不要求对齐：
+ *   - IntentType: 工具名层 → "list_tasks" / "delete_task" / ...
+ *   - Intent:     用户意图层 → "query_unscheduled_tasks" / "action_delete_task" / ...
+ *
+ * 真正收敛（删除 IntentType）的工作留给 V3.9.1b（ExperienceActionPlan.ts）/
+ * V3.9.3（Guardrails）/ V3.9.7（Response）。V3.9.1a 保持双轨并存。
  */
 export type IntentType =
   | "create_task"
@@ -85,6 +95,8 @@ export interface AgentToolResult {
   relatedTimeBlockId?: string;
   /** 是否需要确认（ToolRouter 在拦截确认时填充） */
   requiresConfirmation?: boolean;
+  /** 被拦截的工具名（requiresConfirmation=true 时填充，供上层路由用） */
+  toolName?: string;
   /** 若 requiresConfirmation=true，对应的 confirmation 记录 ID */
   confirmationId?: string;
 }
@@ -197,8 +209,13 @@ export interface AgentHandlerResult {
   domain: AgentDomain;
   message?: string;
   responseKind?: string;
+  responseBranch?: string;
+  genericFallbackUsed?: boolean;
   toolResults?: AgentToolResult[];
   queryBlocks?: import("@/types/timeblock.types").TimeBlock[];
+  queryTasks?: Array<{ title: string; status: string }>;
+  recentActions?: Array<{ summary: string; source: string }>;
+  blocked?: { guardrailName: string; reason?: string; nextStep?: string };
   refreshHints?: AgentRefreshHints;
   metadata?: Partial<ChatMessageMetadata>;
   trace?: Partial<AgentTrace>;
@@ -221,7 +238,27 @@ export type SemanticUserGoal =
   | "update_recent_duration"
   // V4.1+: 查询任务列表 / 请求时间管理建议（区别于创建/安排意图）
   | "query_tasks"
-  | "request_advice";
+  | "request_advice"
+  // V4.2+: 完成任务 / 查看今日日程（防止被 create 规则吞掉）
+  | "mark_task_completed"
+  | "query_today_schedule"
+  // V3.9.0: query recent agent actions ("你刚刚干了什么")
+  | "recent_action_query"
+  // V3.9.5: unified read-model query intents
+  | "query_scheduled_tasks"
+  | "query_completed_tasks"
+  | "query_current_focus"
+  | "query_task_schedule_status"
+  | "query_tomorrow_schedule"
+  | "query_recent_action";
+
+export type SemanticType =
+  | "task"
+  | "event"
+  | "activity"
+  | "routine_candidate";
+
+export type EventSubKind = "lesson" | "meeting" | "general";
 
 export interface SemanticFrame {
   userGoal: SemanticUserGoal;
@@ -240,7 +277,10 @@ export interface SemanticFrame {
     sourceText: string;
     minutes: number;
   }>;
-  constraints: Record<string, unknown>;
+  constraints: Record<string, unknown> & {
+    semanticType?: SemanticType;
+    eventSubKind?: EventSubKind;
+  };
   userTone?: string;
   urgency?: "low" | "normal" | "high";
   missingInfo: string[];
@@ -318,7 +358,9 @@ export interface ExperienceActionPlan {
     | "request_recommendation"
     | "suggestion"
     | "defer_task"
-    | "batch_action";
+    | "batch_action"
+    // V3.9.0 TEMP BRIDGE: past-time absolute clarification path
+    | "clarification_past_time";
   userGoal: SemanticUserGoal;
   toolName?: string;
   params: Record<string, unknown>;
@@ -399,6 +441,11 @@ export interface AgentActionPlan {
  * 注意：本表是 V2.5 的"声明式策略"，AgentService 根据它判断是否走确认流程。
  * 若 Tool 自身 requiresConfirmation=true（如 DeleteTaskTool），也走确认流程，
  * 两者取并集。
+ *
+ * @deprecated V3.9.2 — 由 src/agent/schemas/HilPolicyMatrix.ts 中的
+ * HIL_POLICY_MATRIX 取代（22 个 Intent 维度，含 reversible/batchAware/preview）。
+ * 新代码请使用 getHilPolicy(intent) 或 legacyHilDecision(intentType)。
+ * 本字段在 V3.9.3 Guardrails 阶段彻底移除。
  */
 export const CONFIRMATION_POLICY: Record<IntentType, RiskLevel> = {
   // 查询类：无害
@@ -429,6 +476,40 @@ export const CONFIRMATION_POLICY: Record<IntentType, RiskLevel> = {
   // 兜底
   unknown: "safe",
 };
+
+/**
+ * V3.9.1a Bridge — Legacy IntentType → V3.9 Intent[]（user-intent 层）。
+ *
+ * 映射语义：
+ *   - 方向：legacy tool-name layer key → new user-intent layer value[]
+ *   - 一对多：一个 legacy tool name 可由多种用户意图触发
+ *     （例 list_tasks 可由三种 query 意图产生）
+ *   - partial：仅当语义清晰时填写；留白表示该 tool 在 user-intent 层
+ *     尚无 well-defined 对应（多步组合 / 待 V3.9.1b 明文化）
+ *
+ * 用途：仅供 schema 测试做锚点断言，不被业务代码消费。
+ * 退役时机：V3.9.1b ExperienceActionPlan.ts 完成后删除。
+ */
+export const legacyIntentBridge = {
+  list_tasks: [
+    "query_unscheduled_tasks",
+    "query_scheduled_tasks",
+    "query_completed_tasks",
+  ],
+  get_today_plan: ["query_today_schedule"],
+  create_task: ["action_create_task"],
+  schedule_task: ["action_schedule_task"],
+  reschedule_day: ["action_reschedule"],
+  mark_task_completed: ["action_mark_completed"],
+  delete_task: ["action_delete_task"],
+  delete_time_block: ["action_cancel_schedule"],
+  // list_time_blocks / detect_conflicts / get_free_slots / explain_task / explain_schedule:
+  //   留白 — 属 query_* / clarification 范畴，待 V3.9.1b 与 PlanKind 映射一并明文化
+  // create_time_block / move_time_block / update_task / bind_task_to_time_block:
+  //   留白 — 多由 action_create_and_schedule / action_reschedule 多步组合触发
+  // unknown:
+  //   留白 — 走 low_signal / clarification_request
+} as const satisfies Partial<Record<IntentType, readonly Intent[]>>;
 
 /**
  * RiskLevel → DB schema 的 LegacyRiskLevel 的映射。
@@ -497,6 +578,24 @@ export interface ChatMessageMetadata {
   quickActions?: Array<
     "backfill_today" | "schedule_tomorrow" | "schedule_other_day" | "cancel"
   >;
+  // ── V3.9.0 观测面（最小 bridge，V3.9.7 Response Productization 时迁移） ──
+  /**
+   * V3.9.0 TEMP BRIDGE: abstract 8-value ResponseKind from @/agent/schemas.
+   * Populated by AgentService after compose; erased at compile time (type-only).
+   * Full wiring deferred to V3.9.7 Response Productization.
+   */
+  responseKind?: ResponseKind;
+  /** V3.9.7: local renderer branch label retained for response trace. */
+  responseBranch?: string;
+  /** V3.9.7: true only when ErrorRenderer used its generic error fallback. */
+  genericFallbackUsed?: boolean;
+  /**
+   * V3.9.0 TEMP BRIDGE: semantic dimension of the user input.
+   * Does NOT change DB schema — lives only in trace / metadata.
+   */
+  semanticType?: "task" | "event" | "activity" | "routine_candidate";
+  /** V3.9.3: post-response guardrail that replaced the visible response. */
+  guardrailBlocked?: string;
 }
 
 // ─── V3.7 SinglePlanAction（batch/defer 分解后的原子操作） ──────────────────

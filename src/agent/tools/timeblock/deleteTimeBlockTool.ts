@@ -1,12 +1,29 @@
+import { z } from "zod";
 import { BaseTool } from "@/agent/tools/BaseTool";
+import type { ToolManifest } from "@/agent/schemas";
 import type { ToolResult } from "@/agent/types";
 import { TimeBlockService } from "@/services/TimeBlockService";
 
 export class DeleteTimeBlockTool extends BaseTool {
-  name = "delete_time_block";
-  description = "Delete a time block";
-  requiresConfirmation = true;
-  riskLevel = "medium" as const;
+  // V3.9.2: requiresConfirmation=true per HIL matrix (action_cancel_schedule → always)
+  readonly manifest: ToolManifest = {
+    name: "delete_time_block",
+    skill: "time_management",
+    description: "Delete a time block",
+    inputSchema: z.object({ timeBlockId: z.string() }).passthrough(),
+    outputSchema: z.any(),
+    readOnly: false,
+    businessSideEffects: ["timeblock"],
+    observabilitySideEffects: ["agent_trace_step", "semantic_event"],
+    riskLevel: "medium",
+    requiresConfirmation: true,
+    reversible: true,
+    failureRecovery: "manual",
+    batchAware: false,
+    idempotent: false,
+    auditLevel: "trace+semantic_event",
+    permissions: ["write:timeblocks"],
+  };
 
   private timeBlockService: TimeBlockService;
 

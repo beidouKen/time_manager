@@ -1,4 +1,6 @@
+import { z } from "zod";
 import { BaseTool } from "@/agent/tools/BaseTool";
+import type { ToolManifest } from "@/agent/schemas";
 import type { ToolResult } from "@/agent/types";
 import { TimeBlockService } from "@/services/TimeBlockService";
 import { TaskService } from "@/services/TaskService";
@@ -6,10 +8,25 @@ import { rescheduleDay } from "@/lib/scheduler";
 import { formatTime } from "@/lib/dateUtils";
 
 export class RescheduleDayTool extends BaseTool {
-  name = "reschedule_day";
-  description = "重新排列一天中的未完成任务（需确认）";
-  requiresConfirmation = true;
-  riskLevel = "high" as const;
+  // V3.9.2: riskLevel=high, requiresConfirmation=true per HIL matrix (reschedule_day → always+preview)
+  readonly manifest: ToolManifest = {
+    name: "reschedule_day",
+    skill: "time_management",
+    description: "重新排列一天中的未完成任务（需确认）",
+    inputSchema: z.object({ date: z.string().optional() }),
+    outputSchema: z.any(),
+    readOnly: false,
+    businessSideEffects: ["timeblock"],
+    observabilitySideEffects: ["agent_trace_step", "semantic_event"],
+    riskLevel: "high",
+    requiresConfirmation: true,
+    reversible: true,
+    failureRecovery: "manual",
+    batchAware: true,
+    idempotent: false,
+    auditLevel: "trace+semantic_event",
+    permissions: ["write:timeblocks"],
+  };
 
   private timeBlockService: TimeBlockService;
   private taskService: TaskService;

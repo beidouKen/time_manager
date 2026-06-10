@@ -35,6 +35,14 @@ export class AgentDomainRouter {
       return "time_management";
     }
 
+    // V3.9.0: recent_action_query → time_management domain (B2)
+    if (
+      /(你|你刚|你刚刚|你刚才).*(干|做|执行|操作|做了什么|干了什么)/.test(input) ||
+      /(刚刚|刚才).*(做了|干了|做了什么|干了什么)/.test(input)
+    ) {
+      return "time_management";
+    }
+
     if (/(太慢|没用|不对|不好用|投诉|反馈|问题很多)/.test(input)) {
       return "feedback_or_complaint";
     }

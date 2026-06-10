@@ -1,59 +1,95 @@
+import { z } from "zod";
+import { TaskReadModelService } from "@/agent/read-model/TaskReadModelService";
+import type { ToolManifest } from "@/agent/schemas";
 import { BaseTool } from "@/agent/tools/BaseTool";
 import type { ToolResult } from "@/agent/types";
+import { formatDuration, formatTime } from "@/lib/dateUtils";
 import { TaskService } from "@/services/TaskService";
 import { TimeBlockService } from "@/services/TimeBlockService";
-import { formatTime, formatDuration } from "@/lib/dateUtils";
+import type { Task } from "@/types/task.types";
 
 export class ExplainTaskTool extends BaseTool {
-  name = "explain_task";
-  description = "解释一个任务的状态和排期信息";
-  requiresConfirmation = false;
-  riskLevel = "low" as const;
+  readonly manifest: ToolManifest = {
+    name: "explain_task",
+    skill: "time_management",
+    description: "Explain a task's status and schedule information.",
+    inputSchema: z.object({ taskId: z.string() }),
+    outputSchema: z.any(),
+    readOnly: true,
+    businessSideEffects: [],
+    observabilitySideEffects: ["agent_trace_step"],
+    riskLevel: "low",
+    requiresConfirmation: false,
+    reversible: true,
+    batchAware: false,
+    idempotent: true,
+    auditLevel: "trace",
+    permissions: ["read:tasks", "read:timeblocks"],
+  };
 
-  private taskService: TaskService;
-  private timeBlockService: TimeBlockService;
+  private readonly readModel: TaskReadModelService;
 
-  constructor(taskService?: TaskService, timeBlockService?: TimeBlockService) {
+  constructor(readModel?: TaskReadModelService);
+  constructor(taskService?: TaskService, timeBlockService?: TimeBlockService);
+  constructor(
+    first?: TaskReadModelService | TaskService,
+    timeBlockService?: TimeBlockService,
+  ) {
     super();
-    this.taskService = taskService ?? new TaskService();
-    this.timeBlockService = timeBlockService ?? new TimeBlockService();
+    this.readModel =
+      first instanceof TaskReadModelService
+        ? first
+        : new TaskReadModelService(
+            first ?? new TaskService(),
+            timeBlockService ?? new TimeBlockService(),
+          );
   }
 
   async execute(args: Record<string, unknown>): Promise<ToolResult> {
     try {
       const taskId = args.taskId as string;
-      if (!taskId) return this.failure("缺少任务 ID");
+      if (!taskId) return this.failure("Missing task id.");
 
-      const task = await this.taskService.getTaskById(taskId);
-      if (!task) return this.failure("任务不存在");
+      const task = await this.findTask(taskId);
+      if (!task) return this.failure("Task not found.");
 
-      const blocks = await this.timeBlockService.getBlocksByTaskId(taskId);
-      const activeBlocks = blocks.filter((b) => !b.deleted_at);
+      const { scheduled, blocks } = await this.readModel.isTaskScheduled(taskId);
 
       const parts: string[] = [
-        `任务: ${task.title}`,
-        `状态: ${task.status}`,
-        `优先级: ${task.priority}`,
+        `Task: ${task.title}`,
+        `Status: ${task.status}`,
+        `Priority: ${task.priority}`,
       ];
 
-      if (task.deadline) parts.push(`截止日期: ${task.deadline}`);
-      if (task.estimated_duration_minutes)
-        parts.push(`预计时长: ${formatDuration(task.estimated_duration_minutes)}`);
+      if (task.deadline) parts.push(`Deadline: ${task.deadline}`);
+      if (task.estimated_duration_minutes) {
+        parts.push(
+          `Estimated duration: ${formatDuration(task.estimated_duration_minutes)}`,
+        );
+      }
 
-      if (activeBlocks.length > 0) {
-        parts.push(`\n已安排 ${activeBlocks.length} 个时间块:`);
-        activeBlocks.forEach((b, i) => {
+      if (scheduled && blocks.length > 0) {
+        parts.push(`\nScheduled in ${blocks.length} time block(s):`);
+        blocks.forEach((block, index) => {
           parts.push(
-            `  ${i + 1}. ${formatTime(b.start_time)}-${formatTime(b.end_time)}（${b.status}）`
+            `  ${index + 1}. ${formatTime(block.start_time)}-${formatTime(block.end_time)} (${block.status})`,
           );
         });
       } else {
-        parts.push("\n尚未安排时间块");
+        parts.push("\nNo active schedule blocks.");
       }
 
-      return this.success(parts.join("\n"), { task, timeBlocks: activeBlocks });
-    } catch (e) {
-      return this.failure(String(e));
+      return this.success(parts.join("\n"), { task, timeBlocks: blocks, scheduled });
+    } catch (error) {
+      return this.failure(String(error));
     }
+  }
+
+  private async findTask(taskId: string): Promise<Task | null> {
+    const tasks = [
+      ...(await this.readModel.getActiveTasks()),
+      ...(await this.readModel.getCompletedTasks()),
+    ];
+    return tasks.find((task) => task.id === taskId) ?? null;
   }
 }

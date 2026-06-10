@@ -1,12 +1,29 @@
+import { z } from "zod";
 import { BaseTool } from "@/agent/tools/BaseTool";
+import type { ToolManifest } from "@/agent/schemas";
 import type { ToolResult } from "@/agent/types";
 import { TaskService } from "@/services/TaskService";
 
 export class DeleteTaskTool extends BaseTool {
-  name = "delete_task";
-  description = "删除一个任务（软删除，同时联动删除关联时间块）";
-  requiresConfirmation = true;
-  riskLevel = "high" as const;
+  // V3.9.2: ToolManifest — template B (destructive, always requiresConfirmation)
+  readonly manifest: ToolManifest = {
+    name: "delete_task",
+    skill: "time_management",
+    description: "删除一个任务（软删除，同时联动删除关联时间块）",
+    inputSchema: z.object({ taskId: z.string() }),
+    outputSchema: z.object({ success: z.boolean() }),
+    readOnly: false,
+    businessSideEffects: ["task", "timeblock"],
+    observabilitySideEffects: ["agent_trace_step", "semantic_event"],
+    riskLevel: "high",
+    requiresConfirmation: true,
+    reversible: true,
+    failureRecovery: "manual",
+    batchAware: false,
+    idempotent: false,
+    auditLevel: "trace+semantic_event",
+    permissions: ["write:tasks", "write:timeblocks"],
+  };
 
   private taskService: TaskService;
 

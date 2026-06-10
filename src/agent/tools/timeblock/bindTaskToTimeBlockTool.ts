@@ -1,13 +1,33 @@
+import { z } from "zod";
 import { BaseTool } from "@/agent/tools/BaseTool";
+import type { ToolManifest } from "@/agent/schemas";
 import type { ToolResult } from "@/agent/types";
 import { ScheduleService } from "@/services/ScheduleService";
 import type { ScheduleTaskInput } from "@/services/ScheduleService";
 
 export class BindTaskToTimeBlockTool extends BaseTool {
-  name = "bind_task_to_time_block";
-  description = "Schedule a task into a time block";
-  requiresConfirmation = false;
-  riskLevel = "low" as const;
+  readonly manifest: ToolManifest = {
+    name: "bind_task_to_time_block",
+    skill: "time_management",
+    description: "Schedule a task into a time block",
+    inputSchema: z.object({
+      taskId: z.string(),
+      startTime: z.string(),
+      endTime: z.string(),
+    }).passthrough(),
+    outputSchema: z.any(),
+    readOnly: false,
+    businessSideEffects: ["timeblock"],
+    observabilitySideEffects: ["agent_trace_step", "semantic_event"],
+    riskLevel: "low",
+    requiresConfirmation: false,
+    reversible: true,
+    failureRecovery: "manual",
+    batchAware: false,
+    idempotent: false,
+    auditLevel: "trace",
+    permissions: ["write:timeblocks"],
+  };
 
   private scheduleService: ScheduleService;
 

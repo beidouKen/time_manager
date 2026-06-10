@@ -1,12 +1,28 @@
+import { z } from "zod";
 import { BaseTool } from "@/agent/tools/BaseTool";
+import type { ToolManifest } from "@/agent/schemas";
 import type { ToolResult } from "@/agent/types";
 import { TaskService } from "@/services/TaskService";
 
 export class DeferTaskTool extends BaseTool {
-  name = "defer_task";
-  description = "将一个任务标记为延期（deferred），可选设置延期到某具体时间";
-  requiresConfirmation = false;
-  riskLevel = "low" as const;
+  readonly manifest: ToolManifest = {
+    name: "defer_task",
+    skill: "time_management",
+    description: "将一个任务标记为延期（deferred），可选设置延期到某具体时间",
+    inputSchema: z.object({ taskId: z.string(), until: z.string().optional() }),
+    outputSchema: z.any(),
+    readOnly: false,
+    businessSideEffects: ["task"],
+    observabilitySideEffects: ["agent_trace_step", "semantic_event"],
+    riskLevel: "low",
+    requiresConfirmation: false,
+    reversible: true,
+    failureRecovery: "manual",
+    batchAware: true,
+    idempotent: false,
+    auditLevel: "trace",
+    permissions: ["write:tasks"],
+  };
 
   private taskService: TaskService;
 

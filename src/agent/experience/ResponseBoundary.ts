@@ -1,4 +1,8 @@
-import { ResponseComposer, type ResponseKind } from "@/agent/experience/ResponseComposer";
+import {
+  ResponseComposer,
+  type ResponseKind,
+} from "@/agent/experience/ResponseComposer";
+import type { RendererOutput } from "@/agent/experience/responseRenderers";
 import type {
   AgentExperienceContext,
   AgentHandlerResult,
@@ -6,7 +10,7 @@ import type {
   SemanticFrame,
 } from "@/agent/types";
 
-interface FinalizeInput {
+export interface FinalizeInput {
   context: AgentExperienceContext;
   frame: SemanticFrame;
   plan: ExperienceActionPlan;
@@ -19,37 +23,41 @@ const INTERNAL_NAME_PATTERN =
 export class ResponseBoundary {
   private composer = new ResponseComposer();
 
-  finalize(input: FinalizeInput): string {
-    const explicitMessage = input.result.message?.trim();
-    const raw =
-      explicitMessage && explicitMessage.length > 0
-        ? explicitMessage
-        : this.composeWithKind(input);
-
-    return this.sanitize(raw);
-  }
-
-  private composeWithKind(input: FinalizeInput): string {
-    const kind = this.toResponseKind(input.result.responseKind);
-    return this.composer.compose({
+  finalizeRich(input: FinalizeInput): RendererOutput {
+    const rendered = this.composer.compose({
       context: input.context,
       frame: input.frame,
       plan: input.plan,
       toolResults: input.result.toolResults ?? [],
       queryBlocks: input.result.queryBlocks,
-      responseKind: kind,
+      queryTasks: input.result.queryTasks,
+      recentActions: input.result.recentActions,
+      blocked: input.result.blocked,
+      responseKind: input.result.responseKind as
+        | ResponseKind
+        | import("@/agent/schemas").ResponseKind
+        | undefined,
+      responseBranch: input.result.responseBranch,
+      message: input.result.message,
     });
+
+    return {
+      ...rendered,
+      message: this.sanitize(rendered.message),
+    };
   }
 
-  private toResponseKind(value?: string): ResponseKind | undefined {
-    if (!value) return undefined;
-    return value as ResponseKind;
+  finalize(input: FinalizeInput): string {
+    return this.finalizeRich(input).message;
+  }
+
+  composeWithKind(_kind: ResponseKind, message: string): string {
+    return this.sanitize(message);
   }
 
   private sanitize(message: string): string {
     let text = message.trim();
 
-    // Unwrap markdown-fenced JSON: ```json\n{...}\n```
     const fencedJsonMatch = text.match(/^```(?:json)?\s*\n([\s\S]*?)\n```\s*$/);
     if (fencedJsonMatch) {
       try {
@@ -59,11 +67,10 @@ export class ResponseBoundary {
           text = extracted.trim();
         }
       } catch {
-        // keep original
+        // Keep the original text when it is not valid JSON.
       }
     }
 
-    // Unwrap bare JSON object
     if (text.startsWith("{") && text.endsWith("}")) {
       try {
         const parsed = JSON.parse(text) as { message?: unknown; reply?: unknown };
@@ -72,16 +79,11 @@ export class ResponseBoundary {
           text = extracted.trim();
         }
       } catch {
-        // keep original
+        // Keep the original text when it is not valid JSON.
       }
     }
 
-    // Remove internal names
     text = text.replace(INTERNAL_NAME_PATTERN, "").replace(/\s{2,}/g, " ").trim();
-
-    // Collapse 3+ consecutive newlines to a single blank line
-    text = text.replace(/\n{3,}/g, "\n\n");
-
-    return text;
+    return text.replace(/\n{3,}/g, "\n\n");
   }
 }

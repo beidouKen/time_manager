@@ -12,6 +12,29 @@ import { TimeBlockService } from "@/services/TimeBlockService";
 const DEFAULT_DURATION_MINUTES = 30;
 const REMINDER_DEFAULT_DURATION_MINUTES = 10;
 
+/**
+ * V3.9.0 TEMP BRIDGE — B3: local helper only (hard constraint).
+ * Do NOT move to src/agent/guardrails/ — that is deferred to V3.9.3.
+ * Returns true when `isoStr` represents a moment already in the past.
+ */
+function isPastAbsoluteTime(isoStr: string, currentDatetime: string): boolean {
+  const targetMs = new Date(isoStr).getTime();
+  const nowMs = new Date(currentDatetime).getTime();
+  return Number.isFinite(targetMs) && Number.isFinite(nowMs) && targetMs < nowMs;
+}
+
+/**
+ * V3.9.0 TEMP BRIDGE — B3: classify semantic dimension from title/input.
+ * Does NOT change DB schema — result lives only in plan.params and trace/metadata.
+ */
+function detectSemanticType(
+  title: string
+): "task" | "event" | "activity" | "routine_candidate" {
+  if (/活动|运动|锻炼|健身|体育/.test(title)) return "activity";
+  if (/课|会议|讲座|报告|讨论会|课程/.test(title)) return "event";
+  return "task";
+}
+
 export class ActionPlanner implements PlannerPort {
   private timeBlockService: TimeBlockService;
 
@@ -106,6 +129,29 @@ export class ActionPlanner implements PlannerPort {
         const title = frame.extractedTitle ?? "新任务";
         const scheduleKind = absoluteStart ? "absolute" : "start_now";
 
+        // V3.9.0 TEMP BRIDGE — B3: past absolute time guard (local helper only).
+        // Must NOT create guardrails module. Deferred to V3.9.3 Guardrails Layer.
+        if (absoluteStart && isPastAbsoluteTime(absoluteStart.iso!, context.currentDatetime)) {
+          const semanticType = (frame.constraints.semanticType as "task" | "event" | "activity" | "routine_candidate" | undefined)
+            ?? detectSemanticType(title);
+          return {
+            ...base,
+            kind: "clarification_past_time",
+            params: {
+              title,
+              semanticType,
+              eventSubKind: frame.constraints.eventSubKind,
+              originalTimeIso: absoluteStart.iso,
+              originalTimeLabel: absoluteStart.sourceText,
+            },
+            requiresConfirmation: false,
+            riskLevel: "safe" as const,
+            summary: "过去时间安排，需确认",
+            traceLabel: "create_and_schedule_task:past_time_clarification",
+            replayKey: `past_time_clarification:${title}:${absoluteStart.iso}`,
+          };
+        }
+
         return {
           ...base,
           kind: "tool",
@@ -138,6 +184,28 @@ export class ActionPlanner implements PlannerPort {
         );
         const timelineDate = formatDateKey(new Date(startTime));
         const title = frame.extractedTitle ?? "提醒";
+
+        // V3.9.0 TEMP BRIDGE — B3: past absolute time guard for create_reminder.
+        if (anchorExpr?.iso && isPastAbsoluteTime(anchorExpr.iso, context.currentDatetime)) {
+          const semanticType = (frame.constraints.semanticType as "task" | "event" | "activity" | "routine_candidate" | undefined)
+            ?? detectSemanticType(title);
+          return {
+            ...base,
+            kind: "clarification_past_time",
+            params: {
+              title,
+              semanticType,
+              eventSubKind: frame.constraints.eventSubKind,
+              originalTimeIso: anchorExpr.iso,
+              originalTimeLabel: anchorExpr.sourceText,
+            },
+            requiresConfirmation: false,
+            riskLevel: "safe" as const,
+            summary: "过去时间提醒，需确认",
+            traceLabel: "create_reminder:past_time_clarification",
+            replayKey: `past_time_clarification:${title}:${anchorExpr.iso}`,
+          };
+        }
 
         return {
           ...base,
@@ -401,6 +469,20 @@ export class ActionPlanner implements PlannerPort {
           replayKey: `query_tasks:${context.currentDatetime.slice(0, 10)}`,
         };
 
+      // V3.9.0 TEMP BRIDGE — B2: recent agent action query (read-only)
+      case "recent_action_query":
+        return {
+          ...base,
+          kind: "direct_response",
+          params: {
+            currentDatetime: context.currentDatetime,
+            isRecentActionQuery: true,
+          },
+          summary: "查询最近动作",
+          traceLabel: "recent_action_query:read",
+          replayKey: `recent_action_query:${context.currentDatetime.slice(0, 16)}`,
+        };
+
       // V4.1+: 时间管理建议（只读，直接返回文案）
       case "request_advice":
         return {
@@ -457,6 +539,89 @@ export class ActionPlanner implements PlannerPort {
           summary: "查看今日日程",
           traceLabel: "query_today_schedule:get_today_plan",
           replayKey: `query_today_schedule:${context.currentDatetime.slice(0, 10)}`,
+        };
+
+      // V3.9.5: 已安排的任务列表（只读）
+      case "query_scheduled_tasks":
+        return {
+          ...base,
+          kind: "tool",
+          toolName: "list_tasks",
+          params: { filter: "scheduled" },
+          summary: "列出已安排任务",
+          traceLabel: "query_scheduled_tasks:list",
+          replayKey: `query_scheduled_tasks:${context.currentDatetime.slice(0, 10)}`,
+        };
+
+      // V3.9.5: 已完成任务列表（只读）
+      case "query_completed_tasks":
+        return {
+          ...base,
+          kind: "tool",
+          toolName: "list_tasks",
+          params: { filter: "completed" },
+          summary: "列出已完成任务",
+          traceLabel: "query_completed_tasks:list",
+          replayKey: `query_completed_tasks:${context.currentDatetime.slice(0, 10)}`,
+        };
+
+      // V3.9.5: 当前焦点时间块（只读）
+      case "query_current_focus":
+        return {
+          ...base,
+          kind: "tool",
+          toolName: "get_current_focus",
+          params: { now: context.currentDatetime },
+          summary: "查询当前焦点",
+          traceLabel: "query_current_focus:get",
+          replayKey: `query_current_focus:${context.currentDatetime.slice(0, 16)}`,
+        };
+
+      // V3.9.5: 任务排程状态查询（只读）
+      case "query_task_schedule_status": {
+        const taskId =
+          context.lastCreatedTaskId ?? context.lastMentionedTaskIds[0] ?? null;
+        const keyword = frame.objectReferences[0]?.keyword;
+        const resolvedTaskId = taskId ?? (await this.findTaskIdByKeyword(keyword));
+        return {
+          ...base,
+          kind: "tool",
+          toolName: "explain_task",
+          params: { taskId: resolvedTaskId ?? keyword ?? "", keyword },
+          summary: "查询任务排程状态",
+          traceLabel: "query_task_schedule_status:explain",
+          replayKey: `query_task_schedule_status:${resolvedTaskId ?? keyword ?? "unknown"}`,
+        };
+      }
+
+      // V3.9.5: 明日日程（只读，路由到 get_today_plan 并带明日日期）
+      case "query_tomorrow_schedule": {
+        const tomorrow = new Date(context.currentDatetime);
+        tomorrow.setDate(tomorrow.getDate() + 1);
+        return {
+          ...base,
+          kind: "tool",
+          toolName: "get_today_plan",
+          params: { currentDatetime: tomorrow.toISOString() },
+          summary: "查看明日日程",
+          traceLabel: "query_tomorrow_schedule:get_today_plan",
+          replayKey: `query_tomorrow_schedule:${tomorrow.toISOString().slice(0, 10)}`,
+        };
+      }
+
+      // V3.9.5: 最近动作（只读，路由到 get_recent_actions Tool）
+      case "query_recent_action":
+        return {
+          ...base,
+          kind: "tool",
+          toolName: "get_recent_actions",
+          params: {
+            conversationId: context.conversationId,
+            limit: 3,
+          },
+          summary: "查询最近动作",
+          traceLabel: "query_recent_action:get",
+          replayKey: `query_recent_action:${context.currentDatetime.slice(0, 16)}`,
         };
 
       default:

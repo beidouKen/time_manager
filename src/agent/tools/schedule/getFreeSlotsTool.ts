@@ -1,8 +1,12 @@
+import { z } from "zod";
 import { BaseTool } from "@/agent/tools/BaseTool";
+import type { ToolManifest } from "@/agent/schemas";
 import type { ToolResult } from "@/agent/types";
 import { TimeBlockService } from "@/services/TimeBlockService";
+import { findFreeSlots } from "@/lib/scheduler";
 import { formatTime } from "@/lib/dateUtils";
 
+/** Exported for re-use in scheduler.ts and other modules. */
 export interface FreeSlot {
   start: string;
   end: string;
@@ -10,10 +14,26 @@ export interface FreeSlot {
 }
 
 export class GetFreeSlotsTool extends BaseTool {
-  name = "get_free_slots";
-  description = "查找指定日期的空闲时间段";
-  requiresConfirmation = false;
-  riskLevel = "low" as const;
+  readonly manifest: ToolManifest = {
+    name: "get_free_slots",
+    skill: "time_management",
+    description: "查找指定日期的空闲时间段",
+    inputSchema: z.object({
+      date: z.string().optional(),
+      minDurationMinutes: z.number().optional(),
+    }),
+    outputSchema: z.array(z.any()),
+    readOnly: true,
+    businessSideEffects: [],
+    observabilitySideEffects: ["agent_trace_step"],
+    riskLevel: "low",
+    requiresConfirmation: false,
+    reversible: true,
+    batchAware: false,
+    idempotent: true,
+    auditLevel: "trace",
+    permissions: ["read:timeblocks"],
+  };
 
   private timeBlockService: TimeBlockService;
 
@@ -25,8 +45,8 @@ export class GetFreeSlotsTool extends BaseTool {
   async execute(args: Record<string, unknown>): Promise<ToolResult> {
     try {
       const dateStr = args.date as string | undefined;
+      const minMinutes = (args.minDurationMinutes ?? 30) as number;
       const date = dateStr ? new Date(dateStr) : new Date();
-      const minDuration = (args.minDurationMinutes as number) ?? 30;
 
       const dayStart = new Date(date);
       dayStart.setHours(8, 0, 0, 0);
@@ -34,63 +54,21 @@ export class GetFreeSlotsTool extends BaseTool {
       dayEnd.setHours(22, 0, 0, 0);
 
       const blocks = await this.timeBlockService.getBlocksForDate(date);
-      const activeBlocks = blocks
-        .filter(
-          (b) =>
-            b.status !== "cancelled" &&
-            b.status !== "skipped" &&
-            !b.deleted_at
-        )
-        .sort((a, b) => a.start_time.localeCompare(b.start_time));
-
-      const freeSlots: FreeSlot[] = [];
-      let cursor = dayStart.toISOString();
-
-      for (const block of activeBlocks) {
-        if (block.start_time > cursor) {
-          const gapMinutes =
-            (new Date(block.start_time).getTime() -
-              new Date(cursor).getTime()) /
-            60000;
-          if (gapMinutes >= minDuration) {
-            freeSlots.push({
-              start: cursor,
-              end: block.start_time,
-              durationMinutes: Math.round(gapMinutes),
-            });
-          }
-        }
-        if (block.end_time > cursor) {
-          cursor = block.end_time;
-        }
-      }
-
-      // Check gap after last block
-      if (cursor < dayEnd.toISOString()) {
-        const gapMinutes =
-          (dayEnd.getTime() - new Date(cursor).getTime()) / 60000;
-        if (gapMinutes >= minDuration) {
-          freeSlots.push({
-            start: cursor,
-            end: dayEnd.toISOString(),
-            durationMinutes: Math.round(gapMinutes),
-          });
-        }
-      }
+      const freeSlots = findFreeSlots(blocks, dayStart, dayEnd, minMinutes);
 
       if (freeSlots.length === 0) {
-        return this.success("没有找到满足条件的空闲时间段", []);
+        return this.success("当天没有满足最小时长的空闲时间段", []);
       }
 
       const summary = freeSlots
         .map(
-          (s, i) =>
-            `${i + 1}. ${formatTime(s.start)}-${formatTime(s.end)}（${s.durationMinutes}分钟）`
+          (s: FreeSlot, i: number) =>
+            `${i + 1}. ${formatTime(s.start)}-${formatTime(s.end)}（${s.durationMinutes} 分钟）`
         )
         .join("\n");
 
       return this.success(
-        `找到 ${freeSlots.length} 个空闲时段:\n${summary}`,
+        `共 ${freeSlots.length} 个空闲时间段:\n${summary}`,
         freeSlots
       );
     } catch (e) {

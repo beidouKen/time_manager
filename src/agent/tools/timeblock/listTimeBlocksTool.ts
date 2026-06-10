@@ -1,13 +1,28 @@
+import { z } from "zod";
 import { BaseTool } from "@/agent/tools/BaseTool";
+import type { ToolManifest } from "@/agent/schemas";
 import type { ToolResult } from "@/agent/types";
 import { TimeBlockService } from "@/services/TimeBlockService";
 import { formatTime } from "@/lib/dateUtils";
 
 export class ListTimeBlocksTool extends BaseTool {
-  name = "list_time_blocks";
-  description = "列出指定日期的时间块";
-  requiresConfirmation = false;
-  riskLevel = "low" as const;
+  readonly manifest: ToolManifest = {
+    name: "list_time_blocks",
+    skill: "time_management",
+    description: "列出指定日期的时间块",
+    inputSchema: z.object({ date: z.string().optional() }),
+    outputSchema: z.array(z.any()),
+    readOnly: true,
+    businessSideEffects: [],
+    observabilitySideEffects: ["agent_trace_step"],
+    riskLevel: "low",
+    requiresConfirmation: false,
+    reversible: true,
+    batchAware: false,
+    idempotent: true,
+    auditLevel: "trace",
+    permissions: ["read:timeblocks"],
+  };
 
   private timeBlockService: TimeBlockService;
 

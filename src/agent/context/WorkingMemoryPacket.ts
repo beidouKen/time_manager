@@ -10,6 +10,12 @@
 // - 只读数据结构，组装后不变
 // - 不含业务判断逻辑
 // - 软删除 / 失效的消息和事件不进入此结构
+//
+// V3.9 四段上下文术语映射（详见 V3.9.4-context-os-mapping.md）：
+// - TurnContext      → currentUserInput, sourceIds.{turnId, conversationId}, assembledAt
+// - ConversationFocus → activeContextSummary
+// - OperationalContext → activeContextSummary (status) + pendingConfirmationSummary
+// - RecentActionContext → conversationSummary, relevantEvents
 // ============================================================
 
 // ─── PacketSlice 摘要（写入 AgentTrace.workingMemorySnapshot） ─────────────

@@ -1,4 +1,9 @@
-import type { SemanticFrame, SemanticUserGoal } from "@/agent/types";
+import type {
+  EventSubKind,
+  SemanticFrame,
+  SemanticType,
+  SemanticUserGoal,
+} from "@/agent/types";
 
 const DEFAULT_DURATION_MINUTES = 30;
 
@@ -38,6 +43,7 @@ export class SemanticFrameParser {
     const timeAnchor = this.parseTimeAnchor(normalized);
     const dateRange = this.parseDateRange(normalized);
     const timeOfDay = timeAnchor ? undefined : this.parseTimeOfDay(normalized);
+    const semantic = this.detectSemanticType(normalized);
 
     // ── V3.8+ Past Time Disambiguation ──────────────────────────────────────
     const possibleBackfill = BACKFILL_RE.test(normalized);
@@ -83,7 +89,17 @@ export class SemanticFrameParser {
       durationExpressions: duration
         ? [{ sourceText: `${duration}分钟`, minutes: duration }]
         : [],
-      constraints: timeOfDay ? { timeOfDay } : {},
+      constraints: {
+        ...(timeOfDay ? { timeOfDay } : {}),
+        ...(semantic.type !== "task"
+          ? {
+              semanticType: semantic.type,
+              ...(semantic.eventSubKind
+                ? { eventSubKind: semantic.eventSubKind }
+                : {}),
+            }
+          : {}),
+      },
       userTone: "neutral",
       urgency: startNow ? "high" : "normal",
       missingInfo: [],
@@ -189,6 +205,15 @@ export class SemanticFrameParser {
       return "query_tasks";
     }
 
+    // V3.9.0: 查询最近 agent 动作（"你刚刚干了什么" 类问题）
+    if (
+      /(你|你刚|你刚刚|你刚才).*(干|做|执行|操作|做了什么|做了什么|干了什么)/.test(input) ||
+      /(刚刚|刚才).*(做了|干了|做了什么|干了什么)/.test(input) ||
+      /你.*最近.*做了/.test(input)
+    ) {
+      return "recent_action_query";
+    }
+
     // V4.1+: 时间管理建议（优先于创建意图，防止"番茄工作法建议"被误解为创建）
     if (
       /(建议|方法|策略|技巧|番茄|效率|时间管理|怎么安排|如何安排|怎么规划|如何规划|专注力|拖延|优先级|帮我分析|分析一下|评估)/.test(
@@ -206,6 +231,52 @@ export class SemanticFrameParser {
       /(任务|这个|它|这件事?).*(完成|做完|搞定了)$/.test(input)
     ) {
       return "mark_task_completed";
+    }
+
+    // V3.9.5: 已安排任务列表（有时间块关联的任务）
+    if (
+      /(已安排|已排程|排了什么|排了哪些|有哪些.*已.*安排|已经安排了).*(任务|待办)/.test(input) ||
+      /(任务|待办).*(已安排|已排程|有时间|排上了)/.test(input)
+    ) {
+      return "query_scheduled_tasks";
+    }
+
+    // V3.9.5: 已完成任务
+    if (
+      /(已完成|完成了哪些|完成了什么|哪些.*完成|做完了什么|做了什么|完成的任务)/.test(input)
+    ) {
+      return "query_completed_tasks";
+    }
+
+    // V3.9.5: 当前焦点
+    if (
+      /(现在.*做什么|当前.*焦点|当前.*任务|正在做什么|进行中的任务|当前焦点)/.test(input)
+    ) {
+      return "query_current_focus";
+    }
+
+    // V3.9.5: 任务排程状态（某个具体任务是否已安排）
+    if (
+      /(.*任务.*安排了吗|.*任务.*排上了吗|.*任务.*有时间安排吗|什么时候.*做|安排在什么时候)/.test(input)
+    ) {
+      return "query_task_schedule_status";
+    }
+
+    // V3.9.5: 明日日程（需要明确的"查看"语境，避免把"帮我明天安排X"误判为查询）
+    if (
+      /(看下|看看|帮我看|看一下|查看|瞧).*(明天|明日).*(安排|计划|日程)/.test(input) ||
+      /(明天|明日).*(安排|计划|日程).*(是什么|有哪些|有什么|怎么样|如何|吗)/.test(input) ||
+      /^(明天|明日).*(安排|计划|日程)\s*$/.test(input)
+    ) {
+      return "query_tomorrow_schedule";
+    }
+
+    // V3.9.5: 最近动作（使用 get_recent_actions 工具路径）
+    if (
+      /(刚才|最近|刚刚|刚做了什么|最近.*做了|做了哪些).*(做了什么|做了哪些|操作|动作|记录)/.test(input) ||
+      /刚才.*做了什么|刚刚.*操作/.test(input)
+    ) {
+      return "query_recent_action";
     }
 
     // V4.2+: 查看今日日程意图（优先于创建意图，防止"看下安排"被误解为创建）
@@ -319,7 +390,7 @@ export class SemanticFrameParser {
 
     // Chinese hour words
     const chineseHourMap: Record<string, number> = {
-      一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8,
+      一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8,
       九: 9, 十: 10, 十一: 11, 十二: 12,
     };
 
@@ -457,6 +528,40 @@ export class SemanticFrameParser {
 
     const keywordMatch = input.match(/(.+?任务)/);
     return keywordMatch?.[1]?.trim();
+  }
+
+  detectSemanticType(
+    input: string
+  ): { type: SemanticType; eventSubKind?: EventSubKind } {
+    if (/每天|每周|每日|每晚|每早|坚持|养成|习惯|定期|周期/u.test(input)) {
+      return { type: "routine_candidate" };
+    }
+
+    if (
+      /数学课|英语课|语文课|物理课|化学课|编程课|网课|辅导课|课程|上课/u.test(
+        input
+      )
+    ) {
+      return { type: "event", eventSubKind: "lesson" };
+    }
+
+    if (
+      /晨会|例会|周会|月会|项目会|复盘会|一对一|站会|周例会|会议|讨论会|报告会|分享会|讲座|review|standup/iu.test(
+        input
+      )
+    ) {
+      return { type: "event", eventSubKind: "meeting" };
+    }
+
+    if (
+      /早饭|午饭|晚饭|吃饭|喝水|喝咖啡|早餐|午餐|晚餐|跑步|散步|游泳|骑车|瑜伽|健步|洗澡|休息|午休|睡觉|冥想|健身|锻炼|运动|体育|活动/u.test(
+        input
+      )
+    ) {
+      return { type: "activity" };
+    }
+
+    return { type: "task" };
   }
 
   getDurationOrDefault(frame: SemanticFrame): number {

@@ -74,10 +74,21 @@ actions 格式（batch_action / defer_task 时必填）：
   ...
 ]
 
+params 中可选的语义提示字段：
+- "semanticType": "task" | "activity" | "event" | "routine_candidate"
+  系统会用确定性规则自动推断，仅在你有高置信度时填写
+- "eventSubKind": "lesson" | "meeting" | "general"
+  仅在 semanticType=event 时有意义
+
 userGoal 可选值：
 ask_current_time | create_and_schedule_task | create_reminder | delete_task | query_schedule |
 general_chat | unsupported_intent | query_schedule_range | batch_delete_tasks |
 batch_reschedule_day | defer_task | update_recent_duration
+
+语义示例：
+- "吃早饭" → params.semanticType="activity"
+- "数学课" → params.semanticType="event", params.eventSubKind="lesson"
+- "每天跑步" → params.semanticType="routine_candidate"
 `.trim();
 
 /**

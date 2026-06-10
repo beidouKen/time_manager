@@ -1,69 +1,90 @@
+import { z } from "zod";
+import { TaskReadModelService } from "@/agent/read-model/TaskReadModelService";
+import type { ToolManifest } from "@/agent/schemas";
 import { BaseTool } from "@/agent/tools/BaseTool";
 import type { ToolResult } from "@/agent/types";
-import { TimeBlockService } from "@/services/TimeBlockService";
-import { TaskService } from "@/services/TaskService";
 import { formatTime } from "@/lib/dateUtils";
+import { TaskService } from "@/services/TaskService";
+import { TimeBlockService } from "@/services/TimeBlockService";
 
 export class GetTodayPlanTool extends BaseTool {
-  name = "get_today_plan";
-  description = "获取今日的完整计划（时间块 + 未安排任务）";
-  requiresConfirmation = false;
-  riskLevel = "low" as const;
+  readonly manifest: ToolManifest = {
+    name: "get_today_plan",
+    skill: "time_management",
+    description: "Get today's schedule and unscheduled active tasks.",
+    inputSchema: z.object({
+      date: z.string().optional(),
+      timezone: z.string().optional(),
+    }),
+    outputSchema: z.any(),
+    readOnly: true,
+    businessSideEffects: [],
+    observabilitySideEffects: ["agent_trace_step"],
+    riskLevel: "low",
+    requiresConfirmation: false,
+    reversible: true,
+    batchAware: false,
+    idempotent: true,
+    auditLevel: "trace",
+    permissions: ["read:timeblocks", "read:tasks"],
+  };
 
-  private timeBlockService: TimeBlockService;
-  private taskService: TaskService;
+  private readonly readModel: TaskReadModelService;
 
-  constructor(timeBlockService?: TimeBlockService, taskService?: TaskService) {
+  constructor(readModel?: TaskReadModelService);
+  constructor(timeBlockService?: TimeBlockService, taskService?: TaskService);
+  constructor(
+    first?: TaskReadModelService | TimeBlockService,
+    taskService?: TaskService,
+  ) {
     super();
-    this.timeBlockService = timeBlockService ?? new TimeBlockService();
-    this.taskService = taskService ?? new TaskService();
+    this.readModel =
+      first instanceof TaskReadModelService
+        ? first
+        : new TaskReadModelService(
+            taskService ?? new TaskService(),
+            first ?? new TimeBlockService(),
+          );
   }
 
   async execute(args: Record<string, unknown>): Promise<ToolResult> {
     try {
       const dateStr = args.date as string | undefined;
       const date = dateStr ? new Date(dateStr) : new Date();
-
-      const blocks = await this.timeBlockService.getBlocksForDate(date);
-      const activeBlocks = blocks.filter(
-        (b) => b.status !== "cancelled" && b.status !== "skipped"
+      const timezone = String(
+        args.timezone ?? Intl.DateTimeFormat().resolvedOptions().timeZone,
       );
 
-      const unscheduledTasks = await this.taskService.getTasks({
-        status: ["todo"],
-        excludeDeleted: true,
-      });
+      const [blocks, unscheduledTasks] = await Promise.all([
+        this.readModel.getTodaySchedule(date, timezone),
+        this.readModel.getUnscheduledTasks(),
+      ]);
 
-      const parts: string[] = [];
-
-      if (activeBlocks.length > 0) {
-        parts.push("【今日时间安排】");
-        activeBlocks.forEach((b, i) => {
-          const statusMark = b.status === "done" ? "✓" : "○";
-          parts.push(
-            `${statusMark} ${i + 1}. ${formatTime(b.start_time)}-${formatTime(b.end_time)} ${b.title}`
-          );
-        });
+      let summary = "";
+      if (blocks.length > 0) {
+        summary +=
+          "[Schedule]\n" +
+          blocks
+            .map(
+              (block, index) =>
+                `${index + 1}. ${formatTime(block.start_time)}-${formatTime(block.end_time)} ${block.title}`,
+            )
+            .join("\n");
       } else {
-        parts.push("今日暂无时间安排");
+        summary += "No schedule blocks for today.";
       }
 
       if (unscheduledTasks.length > 0) {
-        parts.push(`\n【待安排任务】（${unscheduledTasks.length} 个）`);
-        unscheduledTasks.slice(0, 5).forEach((t, i) => {
-          parts.push(`  ${i + 1}. ${t.title}（${t.priority}）`);
-        });
-        if (unscheduledTasks.length > 5) {
-          parts.push(`  ...及其他 ${unscheduledTasks.length - 5} 个`);
-        }
+        summary +=
+          "\n\n[Unscheduled tasks]\n" +
+          unscheduledTasks
+            .map((task, index) => `${index + 1}. ${task.title}`)
+            .join("\n");
       }
 
-      return this.success(parts.join("\n"), {
-        timeBlocks: activeBlocks,
-        unscheduledTasks,
-      });
-    } catch (e) {
-      return this.failure(String(e));
+      return this.success(summary, { blocks, unscheduledTasks });
+    } catch (error) {
+      return this.failure(String(error));
     }
   }
 }

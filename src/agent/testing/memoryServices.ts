@@ -337,6 +337,25 @@ export class MemoryScheduleService extends ScheduleService {
     super();
   }
 
+  override async checkConflicts(
+    startTime: string,
+    endTime: string,
+    excludeId?: string
+  ): Promise<import("@/lib/conflictDetector").ConflictResult> {
+    const blocks = this.blocksMem.blocks.filter(
+      (b) =>
+        !b.deleted_at &&
+        b.status !== "cancelled" &&
+        b.status !== "skipped" &&
+        b.status !== "done" &&
+        b.id !== excludeId
+    );
+    const conflictingBlocks = blocks.filter(
+      (b) => b.start_time < endTime && b.end_time > startTime
+    );
+    return { hasConflict: conflictingBlocks.length > 0, conflictingBlocks };
+  }
+
   override async scheduleTaskToTimeBlock(input: {
     taskId: string;
     title: string;
